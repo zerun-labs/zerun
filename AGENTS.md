@@ -36,10 +36,12 @@ zerun/                      # crate root == repository root
 │   ├── syscalls.rs         # ★ ALL unsafe syscalls live here (mount/clone/pivot_root/caps/pipe)
 │   ├── namespace.rs        # parent/child orchestration: clone, error pipe, signals, wait
 │   ├── mounts.rs           # pivot_root sequence, pseudo-fs, masked/readonly paths, minimal /dev
-│   ├── cgroup.rs           # cgroups v2 driver (memory/cpu/pids)
+│   ├── cgroup.rs           # cgroups v2 driver (memory/cpu/pids) + subtree_control setup
 │   ├── security.rs         # no_new_privs -> capability drop -> seccomp orchestration
 │   ├── seccomp.rs          # default deny-by-default BPF allowlist (x86_64 table; extend per arch)
-│   └── mini_init.rs        # container PID1 mini-init (signal forwarding + orphan reaping)
+│   ├── mini_init.rs        # container PID1 mini-init (signal forwarding + orphan reaping)
+│   ├── store.rs            # state layout: data/run roots (rootful vs rootless), per-run overlay fs
+│   └── fsutil.rs           # recursive copy, force-remove (mode-000 overlay workdirs), atomic write
 ├── bench/                  # comparison harness (zerun/crun/runc); see bench/README.md
 ├── tests/                  # integration tests (added milestone by milestone)
 ├── AGENTS.md / README.md / LICENSE
@@ -94,7 +96,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 | Milestone | Scope | Status |
 |---|---|---|
 | M1 | Isolation executor: namespaces, pivot_root, pseudo-fs, mini-init, caps, bench | ✅ committed (ported from zerun-m1-skeleton) |
-| M2 | Default seccomp allowlist; OverlayFS read-only lowers + disk upper; layer whiteout materialization | 🚧 in progress: default seccomp allowlist done; overlay storage next |
+| M2 | Default seccomp allowlist; OverlayFS read-only lowers + disk upper; layer whiteout materialization | 🚧 in progress: seccomp done; per-run OverlayFS (disk upper, auto-cleanup) done; image layer whiteout materialization next |
 | M3 | OCI pull: multi-arch manifest list, Bearer token, diff_id double verification, mirror inheritance | ⏳ |
 | M4 | Netlink veth/bridge + nftables 4-chain NAT, host loopback, DNS/hosts | ⏳ |
 | M5 | Detached reaper, logs, ps/stop/logs/exec, crash reconcile | ⏳ |
@@ -118,6 +120,13 @@ cargo build --release --target x86_64-unknown-linux-musl
   restriction. cgroups v2 without delegation is skipped automatically.
 - `ZERUN_TRACE` stderr line format is parsed by bench/analyze.py — changing it requires updating
   the script.
+- cgroups v2 needs controllers enabled in the parent subtree_control: the intermediate
+  /sys/fs/cgroup/zerun cgroup enables cpu/memory/pids on demand (see cgroup.rs).
+- Capabilities are fully dropped, so a rootful container can only write paths whose ownership
+  it already matches (e.g. root-owned image files); files unpacked by an unprivileged user stay
+  read-only for the container root. Unpack images with the same identity that runs containers.
+- OverlayFS creates its internal work/work dir with mode 000: recursive cleanup must not descend
+  into it (see fsutil::remove_rec: rmdir first, readdir only when non-empty).
 - This dev machine is WSL2: `/mnt/c` is a 9P cross-filesystem and must never hold code/rootfs
   (overlay/pivot need native ext4; this repo is on /dev/sdd ext4). Kernel 6.18 with
   NF_TABLES/VETH/OVERLAY_FS/USER_NS enabled.

@@ -1,8 +1,11 @@
 //! Root migration and pseudo-filesystem setup (child side).
 //!
-//! Current stage: pivot_root sequence over an already-unpacked rootfs directory.
-//! OverlayFS layering of multiple lower dirs lands in M2.
+//! The child pivots into either a plain rootfs directory or an OverlayFS
+//! (lower = read-only image/rootfs, disk upper = container writes). When an
+//! overlay mount is not permitted (restricted rootless hosts), the fallback is
+//! a full copy of the lower into the per-run directory.
 use crate::error::{last_err, ZResult};
+use crate::fsutil;
 use crate::syscalls;
 use crate::trace;
 use libc::{
@@ -24,11 +27,27 @@ const MASKED_PATHS: &[&str] = &[
 
 const READONLY_PATHS: &[&str] = &["/proc/sys", "/proc/sysrq-trigger", "/proc/irq", "/proc/bus"];
 
+/// OverlayFS component directories for a per-container writable filesystem.
+#[derive(Debug, Clone)]
+pub struct OverlayPaths {
+    /// Read-only base (image rootfs or unpacked rootfs directory).
+    pub lower: PathBuf,
+    /// Container writes land here (disk).
+    pub upper: PathBuf,
+    /// Overlay workdir (kernel internal; same fs as upper).
+    pub work: PathBuf,
+    /// Mount point the child pivots into.
+    pub merged: PathBuf,
+}
+
 pub struct RootfsConfig<'a> {
+    /// Directory to pivot into (== overlay.merged when an overlay is used).
     pub rootfs: &'a Path,
     pub hostname: Option<&'a str>,
     /// rootless (NEWUSER) cannot mknod; bind-mount whitelisted host devices instead.
     pub rootless: bool,
+    /// When set, first make `rootfs` a writable overlay whose lower is read-only.
+    pub overlay: Option<&'a OverlayPaths>,
 }
 
 /// Full root migration + pseudo-filesystem assembly, run by the child inside the
@@ -40,6 +59,11 @@ pub fn setup_rootfs(cfg: &RootfsConfig) -> ZResult<()> {
     //    back to the host.
     syscalls::mount(Some(""), "/", None, MS_REC | MS_PRIVATE, None)?;
     trace::mark("child:mount:private-ok");
+
+    // 1b. Optional OverlayFS / copy-up so container writes never touch `lower`.
+    if let Some(ovl) = cfg.overlay {
+        setup_overlay(cfg.rootless, ovl)?;
+    }
 
     // 2. The new root must itself be a mount point: recursive bind onto itself.
     let rootfs_str = cfg.rootfs.to_string_lossy().to_string();
@@ -67,6 +91,42 @@ pub fn setup_rootfs(cfg: &RootfsConfig) -> ZResult<()> {
     }
     trace::mark("child:mount:done");
     Ok(())
+}
+
+/// Mount the per-container overlay (or copy the lower up as a fallback).
+/// Runs in the child after MS_PRIVATE: the mount is private to the child's
+/// namespace and disappears when the container exits.
+fn setup_overlay(rootless: bool, ovl: &OverlayPaths) -> ZResult<()> {
+    let data = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        ovl.lower.display(),
+        ovl.upper.display(),
+        ovl.work.display()
+    );
+    let merged = ovl.merged.to_string_lossy().to_string();
+    match syscalls::mount(
+        Some("overlay"),
+        &merged,
+        Some("overlay"),
+        0,
+        Some(data.as_str()),
+    ) {
+        Ok(()) => {
+            trace::mark("child:overlay:ok");
+            Ok(())
+        }
+        Err(e) if rootless => {
+            // Restricted rootless hosts may refuse overlay in a user namespace.
+            // Fall back to a plain copy so writes are still isolated.
+            eprintln!(
+                "zerun: warn: overlay mount denied ({e}); copying lower into the per-run fs instead"
+            );
+            fsutil::copy_dir_all(&ovl.lower, &ovl.merged)?;
+            trace::mark("child:overlay:copy-fallback");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Mount /proc, /dev, /dev/pts, /dev/shm, /dev/mqueue, /sys, cgroup2, /tmp.

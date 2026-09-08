@@ -19,8 +19,9 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   corrected `pivot_root(".", ".")` sequence, container pseudo-filesystems, minimal `/dev`,
   masked/readonly paths, capability dropping, cgroups v2 (memory/cpu/pids), optional
   built-in mini-init, and a reproducible benchmark harness.
-- **M2 — storage & security (in progress)**: default seccomp allowlist (done), OverlayFS
-  read-write mounts, OCI layer whiteout materialization.
+- **M2 — storage & security (in progress)**: default seccomp allowlist (done); per-run
+  OverlayFS with disk upper and automatic cleanup (done); OCI layer whiteout materialization
+  (next, together with the image engine).
 - **M3+** — OCI pull, kernel networking, detached lifecycle, distribution (see AGENTS.md).
 
 ## Highlights

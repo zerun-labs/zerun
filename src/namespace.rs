@@ -5,7 +5,7 @@
 //! execve (or run the built-in mini-init first).
 use crate::cgroup::{CgroupV2, ResourceLimits};
 use crate::error::ZResult;
-use crate::mounts::{setup_rootfs, RootfsConfig};
+use crate::mounts::{setup_rootfs, OverlayPaths, RootfsConfig};
 use crate::seccomp::SeccompMode;
 use crate::security;
 use crate::syscalls;
@@ -34,6 +34,8 @@ pub struct RunSpec {
     pub use_init: bool,
     pub limits: ResourceLimits,
     pub seccomp: SeccompMode,
+    /// Per-container writable filesystem; None = pivot directly into `rootfs`.
+    pub overlay: Option<OverlayPaths>,
     pub id: String,
 }
 
@@ -176,6 +178,7 @@ fn child_stage(
         rootfs: &spec.rootfs,
         hostname: spec.hostname.as_deref(),
         rootless,
+        overlay: spec.overlay.as_ref(),
     };
     setup_rootfs(&cfg)?;
 

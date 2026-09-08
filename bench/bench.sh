@@ -86,13 +86,13 @@ extract_internal_ns() {
 
 bench_zerun() {
   log "warming up zerun x$WARMUP ..."
-  for ((i=0;i<WARMUP;i++)); do "$ZERUN_BIN" run --rootfs "$ROOTFS" --net none -- /bin/true >/dev/null 2>&1 || true; done
+  for ((i=0;i<WARMUP;i++)); do "$ZERUN_BIN" run --rootfs "$ROOTFS" --net none --no-overlay -- /bin/true >/dev/null 2>&1 || true; done
   log "sampling zerun x$N ..."
   for ((i=0;i<N;i++)); do
     local trace_file="$WORK/trace"
     local s e internal ok=1
     s=$(now_ns)
-    trace=$(ZERUN_TRACE=1 "$ZERUN_BIN" run --rootfs "$ROOTFS" --net none -- /bin/true 2>"$trace_file") || ok=0
+    trace=$(ZERUN_TRACE=1 "$ZERUN_BIN" run --rootfs "$ROOTFS" --net none --no-overlay -- /bin/true 2>"$trace_file") || ok=0
     e=$(now_ns)
     internal=$(extract_internal_ns "$(cat "$trace_file")")
     echo "zerun,$i,$((e-s)),${internal:-},$ok" >> "$LAT_CSV"
@@ -177,7 +177,7 @@ bench_memory_peak() {
   # zerun: place the runner in the cgroup, then read peak after the run
   # (includes the transient peak of runtime + workload).
   echo $$ > "$cg/cgroup.procs" 2>/dev/null || true
-  "$ZERUN_BIN" run --rootfs "$ROOTFS" --net none -- /bin/true >/dev/null 2>&1 || true
+  "$ZERUN_BIN" run --rootfs "$ROOTFS" --net none --no-overlay -- /bin/true >/dev/null 2>&1 || true
   echo "zerun,$(cat "$cg/memory.peak" 2>/dev/null || echo NA)" >> "$MEM_CSV"
 
   # Step down memory.max to find the smallest value where /bin/true still runs.
@@ -186,7 +186,7 @@ bench_memory_peak() {
   local min_ok="NA"
   for sz in "${sizes[@]}"; do
     echo "$sz" > "$cg/memory.max" 2>/dev/null || continue
-    if "$ZERUN_BIN" run --rootfs "$ROOTFS" --net none -- /bin/true >/dev/null 2>&1; then
+    if "$ZERUN_BIN" run --rootfs "$ROOTFS" --net none --no-overlay -- /bin/true >/dev/null 2>&1; then
       min_ok="$sz"
     else
       break # smaller will certainly fail; stop stepping

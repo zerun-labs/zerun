@@ -23,15 +23,21 @@ pub struct CgroupV2 {
 
 impl CgroupV2 {
     /// Create the sub-hierarchy <cgroup2>/zerun/<id>.
+    ///
+    /// cgroups v2 requires every controller to be enabled in the parent's
+    /// subtree_control before the leaf gets the corresponding control files, so
+    /// the intermediate <cgroup2>/zerun level enables cpu/memory/pids on demand.
     pub fn create(id: &str, limits: &ResourceLimits) -> ZResult<Self> {
         let root = detect_cgroup2_root()?;
-        let path = root.join("zerun").join(id);
+        let parent = root.join("zerun");
+        let path = parent.join(id);
         fs::create_dir_all(&path).map_err(|e| {
             crate::zerr!(
                 "create cgroup {} failed: {e}. Hint: root or a delegated cgroup v2 subtree is required",
                 path.display()
             )
         })?;
+        enable_controllers(&parent, &["memory", "cpu", "pids"])?;
         let cg = CgroupV2 { path };
 
         if let Some(mem) = &limits.memory {
@@ -108,6 +114,37 @@ pub fn detect_cgroup2_root() -> ZResult<PathBuf> {
         "no cgroup v2 unified hierarchy found (/sys/fs/cgroup/cgroup.controllers missing). \
          Boot with cgroup v2 (systemd.unified_cgroup_hierarchy=1) or add a v1 adapter layer"
     ))
+}
+
+/// Enable `want` controllers on `parent`'s subtree_control (idempotent).
+/// Controllers the kernel does not expose are silently skipped so the function
+/// works across hosts with different controller sets.
+fn enable_controllers(parent: &Path, want: &[&str]) -> ZResult<()> {
+    let available = fs::read_to_string(parent.join("cgroup.controllers"))
+        .map_err(|e| crate::zerr!("read {}: {e}", parent.join("cgroup.controllers").display()))?;
+    let enabled = fs::read_to_string(parent.join("cgroup.subtree_control")).unwrap_or_default();
+    let mut to_enable: Vec<&str> = Vec::new();
+    for c in want {
+        if available.split_whitespace().any(|a| a == *c)
+            && !enabled.split_whitespace().any(|e| e.trim_start_matches('+') == *c)
+        {
+            to_enable.push(c);
+        }
+    }
+    if to_enable.is_empty() {
+        return Ok(());
+    }
+    let cmd = to_enable
+        .iter()
+        .map(|c| format!("+{c}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    fs::write(parent.join("cgroup.subtree_control"), cmd.as_bytes()).map_err(|e| {
+        crate::zerr!(
+            "enable controllers [{cmd}] on {} failed: {e}. Hint: root or a delegated cgroup v2 subtree is required",
+            parent.display()
+        )
+    })
 }
 
 /// Parse K/M/G size suffixes into bytes.

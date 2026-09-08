@@ -7,18 +7,22 @@
 //!   ./zerun doctor
 mod cgroup;
 mod error;
+mod fsutil;
 mod mini_init;
 mod mounts;
 mod namespace;
 mod seccomp;
 mod security;
+mod store;
 mod syscalls;
 mod trace;
 
 use cgroup::ResourceLimits;
+use mounts::OverlayPaths;
 use namespace::{NetMode, RunSpec};
 use seccomp::SeccompMode;
 use std::process::exit;
+use store::Store;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -60,6 +64,7 @@ struct RunArgs {
     net: NetMode,
     use_init: bool,
     seccomp: SeccompMode,
+    no_overlay: bool,
     argv: Vec<String>,
 }
 
@@ -107,6 +112,10 @@ fn cmd_run(args: &[String]) -> i32 {
                 };
                 i += 2;
             }
+            "--no-overlay" => {
+                a.no_overlay = true;
+                i += 1;
+            }
             "--" => {
                 a.argv = args[i + 1..].to_vec();
                 i = args.len();
@@ -138,9 +147,47 @@ fn cmd_run(args: &[String]) -> i32 {
     if a.argv.is_empty() {
         a.argv = vec!["/bin/sh".to_string()];
     }
+    let id = short_id();
+
+    // Prepare the per-run writable container filesystem (OverlayFS by default;
+    // --no-overlay keeps the legacy "pivot directly into the rootfs" behavior).
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = store.ensure_dirs() {
+        eprintln!("zerun: {e}");
+        return 1;
+    }
+    let container_fs = if a.no_overlay {
+        None
+    } else {
+        match store.prepare_container_fs(&id, &rootfs) {
+            Ok(fs) => Some(fs),
+            Err(e) => {
+                eprintln!("zerun: {e}");
+                return 1;
+            }
+        }
+    };
+    let (pivot_root, overlay) = match &container_fs {
+        Some(fs) => (
+            fs.root().to_path_buf(),
+            Some(OverlayPaths {
+                lower: fs.lower.clone(),
+                upper: fs.upper.clone(),
+                work: fs.work.clone(),
+                merged: fs.merged.clone(),
+            }),
+        ),
+        None => (rootfs, None),
+    };
 
     let spec = RunSpec {
-        rootfs,
+        rootfs: pivot_root,
         argv: a.argv,
         hostname: a.hostname,
         net: a.net,
@@ -151,10 +198,15 @@ fn cmd_run(args: &[String]) -> i32 {
             pids: a.pids,
         },
         seccomp: a.seccomp,
-        id: short_id(),
+        overlay,
+        id,
     };
 
-    match namespace::run_container(spec) {
+    let result = namespace::run_container(spec);
+    if let Some(fs) = container_fs {
+        store.cleanup_container_fs(&fs);
+    }
+    match result {
         Ok(code) => code,
         Err(e) => {
             eprintln!("zerun: {e}");
