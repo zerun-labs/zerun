@@ -19,10 +19,14 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   corrected `pivot_root(".", ".")` sequence, container pseudo-filesystems, minimal `/dev`,
   masked/readonly paths, capability dropping, cgroups v2 (memory/cpu/pids), optional
   built-in mini-init, and a reproducible benchmark harness.
-- **M2 — storage & security (in progress)**: default seccomp allowlist (done); per-run
-  OverlayFS with disk upper and automatic cleanup (done); OCI layer whiteout materialization
-  (next, together with the image engine).
-- **M3+** — OCI pull, kernel networking, detached lifecycle, distribution (see AGENTS.md).
+- **M2 — storage & security (done)**: deny-by-default seccomp allowlist; per-run OverlayFS
+  with disk upper and automatic cleanup; OCI whiteout materialization.
+- **M3 — OCI image engine (core done)**: `zerun pull / images / rmi`; Docker v2 pull with
+  Bearer token auth, multi-arch platform selection (`--platform`), compressed-blob and
+  diff_id double verification, and mirror inheritance from `/etc/docker/daemon.json` or
+  `ZERUN_REGISTRY_MIRRORS`; `zerun run IMAGE` auto-pulls and applies image
+  env/entrypoint/cmd/working-dir.
+- **M4+** — kernel networking, detached lifecycle, distribution (see AGENTS.md).
 
 ## Highlights
 
@@ -55,32 +59,58 @@ cargo build --release --target x86_64-unknown-linux-musl
 Cross targets (edge devices): `aarch64-unknown-linux-musl`, `armv7-unknown-linux-musleabihf`,
 `riscv64gc-unknown-linux-musl`.
 
-## Quick start (M1 stage)
+## Quick start
 
-Prepare a rootfs (example: Alpine minirootfs) and run a command inside it:
+### Image mode (M3, recommended)
+
+```bash
+cargo build --release
+
+# Rootful (recommended on real targets): run with sudo.
+sudo target/release/zerun run alpine echo hello
+
+# Rootless: run as the current user; the runtime auto-enters a user namespace.
+target/release/zerun pull alpine
+target/release/zerun run --init alpine /bin/sh -c 'echo hi; exit 7'; echo $?
+
+# Image lifecycle
+target/release/zerun images
+target/release/zerun rmi alpine
+```
+
+`run IMAGE` pulls the image automatically when it is not present locally; `-e NAME=V`
+sets environment variables, `--init` adds the built-in mini-init, and
+`--platform os/arch[/variant]` selects a specific architecture (default: host).
+
+Run options (current subset):
+
+```
+-m, --memory 64M     cgroup v2 memory.max (K/M/G suffixes)
+--cpus 0.5           cgroup v2 cpu.max (cores)
+--pids 256           cgroup v2 pids.max
+-h, --hostname H     container hostname (new UTS namespace)
+--net none|host      none = fresh netns with loopback only (default); host = share host net
+--init               run built-in mini-init (reap orphans, forward signals)
+--seccomp default|unconfined   seccomp policy (default: deny-by-default allowlist)
+--platform os/arch[/variant]   pull/run a specific platform
+-e, --env NAME[=VALUE]         set a container environment variable (image mode)
+--no-overlay        pivot directly into the rootfs (no writable upper layer)
+```
+
+`ZERUN_REGISTRY_MIRRORS` (comma-separated) and the `/etc/docker/daemon.json`
+`registry-mirrors` list are honored for `docker.io` pulls.
+
+### Legacy rootfs mode (M1/M2)
+
+Run a command inside a plain unpacked rootfs directory (no image engine):
 
 ```bash
 mkdir -p /tmp/zerun-test/rootfs
 curl -sSL https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz \
   | tar -xz -C /tmp/zerun-test/rootfs
 
-# Rootful (recommended on real targets): run with sudo.
 sudo target/release/zerun run --rootfs /tmp/zerun-test/rootfs --hostname box --init -- /bin/sh
-
-# Rootless: run as the current user; the runtime auto-enters a user namespace.
 target/release/zerun run --rootfs /tmp/zerun-test/rootfs --init -- /bin/echo hello
-```
-
-Run options (M1 subset):
-
-```
---rootfs DIR     unpacked container root filesystem directory (required for now)
---memory 64M     cgroup v2 memory.max (K/M/G suffixes)
---cpus 0.5       cgroup v2 cpu.max (cores)
---pids 256       cgroup v2 pids.max
---hostname H     container hostname (new UTS namespace)
---net none|host  none = new netns with loopback only (default); host = share host net
---init           run built-in mini-init (reap orphans, forward signals)
 ```
 
 `ZERUN_TRACE=1` prints per-stage nanosecond timings to stderr (parsed by `bench/analyze.py`).

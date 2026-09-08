@@ -41,11 +41,26 @@ zerun/                      # crate root == repository root
 │   ├── seccomp.rs          # default deny-by-default BPF allowlist (x86_64 table; extend per arch)
 │   ├── mini_init.rs        # container PID1 mini-init (signal forwarding + orphan reaping)
 │   ├── store.rs            # state layout: data/run roots (rootful vs rootless), per-run overlay fs
-│   └── fsutil.rs           # recursive copy, force-remove (mode-000 overlay workdirs), atomic write
+│   ├── fsutil.rs           # recursive copy, force-remove (mode-000 overlay workdirs), atomic write
+│   ├── workload.rs         # container env application + PATH argv[0] resolution
+│   └── image/              # M3 OCI image engine
+│       ├── name.rs         # image reference parsing (registry/name[:tag][@digest])
+│       ├── config.rs       # parsed OCI image config (env/entrypoint/cmd/workingdir)
+│       ├── manifest.rs     # schema2 manifest / multi-arch index + platform selection
+│       ├── unpack.rs       # layer tar application: whiteouts + path-traversal guards
+│       ├── store.rs        # content-addressed blobs, materialized rootfs, tag index, GC
+│       ├── registry.rs     # Docker v2 pull client: Bearer token, mirrors, retries
+│       └── pull.rs         # pull orchestration + run-time local image lookup
 ├── bench/                  # comparison harness (zerun/crun/runc); see bench/README.md
-├── tests/                  # integration tests (added milestone by milestone)
 ├── AGENTS.md / README.md / LICENSE
 ```
+
+> Image store layout (under the data root): `blobs/sha256/<hex>` raw registry
+> blobs; `rootfs/<config-digest-hex>` materialized read-only rootfs (shared by
+> every tag whose config digest matches); `images.json` tag index. Layers are
+> materialized per image-config digest rather than mounted as separate overlay
+> lowers: whiteouts are plain deletions during unpack, which works rootful and
+> rootless alike (no mknod needed).
 
 ## 3. Frequent commands
 
@@ -58,6 +73,12 @@ cargo fmt --check / cargo fmt
 # Dev smoke test (rootful requires sudo; this sandbox has passwordless sudo)
 sudo target/release/zerun doctor
 sudo target/release/zerun run --rootfs /tmp/zerun-test/rootfs --hostname box --init -- /bin/sh -c 'exit 42'; echo $?
+
+# Image-mode smoke test (M3): pull + run an OCI image
+target/release/zerun pull alpine
+target/release/zerun images
+target/release/zerun run alpine echo hi            # rootless
+sudo env ZERUN_DATA_ROOT=/tmp/zerun-root ./target/release/zerun run --init alpine /bin/sh -c 'exit 7'; echo $?
 
 # Prepare a minimal rootfs (Alpine minirootfs)
 mkdir -p /tmp/zerun-test/rootfs
@@ -90,14 +111,19 @@ cargo build --release --target x86_64-unknown-linux-musl
    environment limitations.
 6. **Docker-compatible top 20% CLI**: run/ps/stop/rm/logs/exec/pull/images/rmi/generate-service/
    doctor. No nested two-level subcommands, no resident HTTP API. Image format is 100% OCI.
+7. **Image-mode environment is explicit**: `run IMAGE` clears the inherited
+   environment and applies the image `config.Env` + `-e` overrides + PATH/HOME/HOSTNAME
+   defaults (built in `main.rs::build_image_env`). Legacy `--rootfs` mode keeps the
+   inherited environment. When the explicit env is set, bare argv[0] is resolved
+   against the container PATH before exec (`workload.rs`).
 
 ## 5. Milestones and status (keep current)
 
 | Milestone | Scope | Status |
 |---|---|---|
 | M1 | Isolation executor: namespaces, pivot_root, pseudo-fs, mini-init, caps, bench | ✅ committed (ported from zerun-m1-skeleton) |
-| M2 | Default seccomp allowlist; OverlayFS read-only lowers + disk upper; layer whiteout materialization | 🚧 in progress: seccomp done; per-run OverlayFS (disk upper, auto-cleanup) done; image layer whiteout materialization next |
-| M3 | OCI pull: multi-arch manifest list, Bearer token, diff_id double verification, mirror inheritance | ⏳ |
+| M2 | Default seccomp allowlist; OverlayFS read-only lowers + disk upper; layer whiteout materialization | ✅ committed: seccomp; per-run OverlayFS (disk upper, auto-cleanup); whiteout materialization (done as part of the M3 rootfs builder) |
+| M3 | OCI pull: multi-arch manifest list, Bearer token, diff_id double verification, mirror inheritance | ✅ core committed: `pull/images/rmi`; `run IMAGE` auto-pull + config env/cmd/entrypoint/cwd; multi-arch platform selection; diff_id double verification; mirror inheritance (env + /etc/docker/daemon.json). ⏳ still open: zstd layers, private-registry auth, `/etc/zerun/config.toml` |
 | M4 | Netlink veth/bridge + nftables 4-chain NAT, host loopback, DNS/hosts | ⏳ |
 | M5 | Detached reaper, logs, ps/stop/logs/exec, crash reconcile | ⏳ |
 | M6 | cargo-dist, install.sh, generate-service, AUR/Brew | ⏳ |
@@ -130,6 +156,21 @@ cargo build --release --target x86_64-unknown-linux-musl
 - This dev machine is WSL2: `/mnt/c` is a 9P cross-filesystem and must never hold code/rootfs
   (overlay/pivot need native ext4; this repo is on /dev/sdd ext4). Kernel 6.18 with
   NF_TABLES/VETH/OVERLAY_FS/USER_NS enabled.
+- The child clone stack is an anonymous mmap with a PROT_NONE guard page
+  (src/syscalls.rs). Do NOT "simplify" it back to `Box::new([0u8; 8MB])`: the array
+  literal is built on the caller stack in debug builds and overflows the 8 MB main
+  thread stack. Each clone still leaks one 8 MB virtual mapping until process exit
+  (short-lived CLI, acceptable).
+- Serde needs explicit `#[serde(rename = "mediaType")]` (and friends) — the registry
+  JSON uses camelCase. A missing rename silently yields an empty field (this once made
+  gzip layers look uncompressed and failed with confusing tar cksum errors).
+- The OCI `diff_id` is the sha256 of the *entire* uncompressed layer stream. Do not
+  compute it by hashing bytes consumed by a lazy tar parser (it skips trailing
+  padding); `pull.rs` decompresses to a spool file first and hashes the full stream.
+- Docker Hub's first TLS connection is occasionally flaky; the registry client retries
+  transport errors and 429/5xx with short backoff (src/image/registry.rs).
+- Pull and run with the same identity: the materialized rootfs is owned by whoever
+  unpacked it, and a rootful container can only write paths it owns.
 - **Language**: the whole repository is developed and maintained in **English** — code comments,
   docs, CLI/help/error messages, commit messages.
 - Commit messages use Conventional Commits (feat/fix/refactor/chore/test/docs), with reasonable
