@@ -16,6 +16,8 @@ sha2 = "0.10"
 tar = "0.4"
 flate2 = "1"
 ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
+zstd = "0.14.0"
+toml = "1.1.5"
 
 [profile.release]
 opt-level = "z"      # smallest code size

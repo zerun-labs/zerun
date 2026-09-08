@@ -128,3 +128,31 @@ pub fn mkdir_p(p: &Path) -> ZResult<()> {
 pub fn canonical_or_self(p: &Path) -> PathBuf {
     fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
+/// Render a byte count for humans ("3.7 MB"); used in CLI progress output.
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_size_rounds() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(3_700_000), "3.5 MB");
+    }
+}

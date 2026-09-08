@@ -348,7 +348,7 @@ fn resolve_run_image(
     eprintln!(
         "zerun: pulled {} ({}), rootfs ready",
         reference.canonical(),
-        human_size(pulled.size_bytes)
+        fsutil::human_size(pulled.size_bytes)
     );
     Ok((pulled.rootfs, pulled.config))
 }
@@ -493,7 +493,7 @@ fn cmd_pull(args: &[String]) -> i32 {
                     "{}: pull complete ({} layers, {})",
                     reference.canonical(),
                     img.config.rootfs.diff_ids.len(),
-                    human_size(img.size_bytes)
+                    fsutil::human_size(img.size_bytes)
                 );
             }
             Err(e) => {
@@ -543,7 +543,7 @@ fn cmd_images(_args: &[String]) -> i32 {
             r.name,
             tag,
             id,
-            human_size(r.size_bytes)
+            fsutil::human_size(r.size_bytes)
         );
     }
     0
@@ -662,21 +662,6 @@ fn short_id() -> String {
         .unwrap()
         .as_nanos();
     format!("{:x}", nanos & 0xffff_ffff_ffff)
-}
-
-fn human_size(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
-    let mut v = bytes as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{v:.1} {}", UNITS[u])
-    }
 }
 
 fn print_run_usage() {

@@ -3,8 +3,10 @@
 //! Scope: anonymous `pull` only, which is all a daemonless run-only runtime
 //! needs. It implements the Docker v2 token flow (WWW-Authenticate challenge ->
 //! Bearer token), multi-arch manifest resolution, and Docker Hub mirror
-//! inheritance (env `ZERUN_REGISTRY_MIRRORS`, then `/etc/docker/daemon.json`'s
-//! `registry-mirrors`). Registry credentials (private registries) are out of
+//! inheritance. Mirror priority: env `ZERUN_REGISTRY_MIRRORS`, then the zerun
+//! config file (`/etc/zerun/config.toml`, or `ZERUN_CONFIG` / user config;
+//! `[registry] mirrors = [...]`), then `/etc/docker/daemon.json`'s
+//! `registry-mirrors`. Registry credentials (private registries) are out of
 //! scope for now and produce a clear error.
 use crate::error::ZResult;
 use std::collections::HashMap;
@@ -195,27 +197,89 @@ fn split_kv(s: &str) -> Option<(String, String)> {
     Some((k.trim().to_string(), v.trim().trim_matches('"').to_string()))
 }
 
-/// Discover Docker Hub mirrors: env first, then `/etc/docker/daemon.json`.
+/// Discover Docker Hub mirrors in priority order:
+/// 1. `ZERUN_REGISTRY_MIRRORS` (explicit per-invocation override);
+/// 2. the zerun config file, user-level first, then `/etc/zerun/config.toml`;
+/// 3. `/etc/docker/daemon.json` (`registry-mirrors`), for seamless Docker
+///    migration on hosts that already run Docker.
 fn discover_mirrors() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    if let Ok(v) = std::env::var("ZERUN_REGISTRY_MIRRORS") {
-        for m in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            out.push(normalize_mirror(m));
+    for m in env_mirrors() {
+        push_unique(&mut out, m);
+    }
+    for path in config_file_candidates() {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            for m in mirrors_from_config_toml(&text) {
+                push_unique(&mut out, normalize_mirror(&m));
+            }
         }
     }
     if let Ok(text) = std::fs::read_to_string("/etc/docker/daemon.json") {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
             if let Some(list) = v.get("registry-mirrors").and_then(|m| m.as_array()) {
                 for m in list.iter().filter_map(|m| m.as_str()) {
-                    let m = normalize_mirror(m);
-                    if !out.contains(&m) {
-                        out.push(m);
-                    }
+                    push_unique(&mut out, normalize_mirror(m));
                 }
             }
         }
     }
     out
+}
+
+fn push_unique(out: &mut Vec<String>, mirror: String) {
+    if !out.contains(&mirror) {
+        out.push(mirror);
+    }
+}
+
+fn env_mirrors() -> Vec<String> {
+    std::env::var("ZERUN_REGISTRY_MIRRORS")
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(normalize_mirror)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Config file locations, most specific first. `ZERUN_CONFIG` overrides the
+/// search entirely (used by tests and by users who keep config elsewhere);
+/// otherwise the per-user file shadows the system-wide one.
+fn config_file_candidates() -> Vec<String> {
+    if let Ok(p) = std::env::var("ZERUN_CONFIG") {
+        if !p.is_empty() {
+            return vec![p];
+        }
+    }
+    let mut out = Vec::new();
+    let user_cfg = std::env::var("XDG_CONFIG_HOME")
+        .map(|xdg| format!("{xdg}/zerun/config.toml"))
+        .or_else(|_| std::env::var("HOME").map(|home| format!("{home}/.config/zerun/config.toml")));
+    if let Ok(p) = user_cfg {
+        out.push(p);
+    }
+    out.push("/etc/zerun/config.toml".to_string());
+    out
+}
+
+/// Parse `[registry] mirrors = [...]` from a zerun config file (TOML).
+/// Unreadable/unsupported files simply contribute no mirrors.
+fn mirrors_from_config_toml(text: &str) -> Vec<String> {
+    #[derive(serde::Deserialize, Default)]
+    struct FileConfig {
+        #[serde(default)]
+        registry: RegistrySection,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct RegistrySection {
+        #[serde(default)]
+        mirrors: Vec<String>,
+    }
+    toml::from_str::<FileConfig>(text)
+        .map(|c| c.registry.mirrors)
+        .unwrap_or_default()
 }
 
 fn normalize_mirror(m: &str) -> String {
@@ -294,5 +358,36 @@ mod tests {
             normalize_mirror("https://mirror.example/"),
             "https://mirror.example"
         );
+    }
+
+    #[test]
+    fn config_toml_parses_mirrors() {
+        let text = r#"
+            # zerun config
+            [registry]
+            mirrors = ["https://mirror.a.example", "docker.m.daocloud.io"]
+        "#;
+        assert_eq!(
+            mirrors_from_config_toml(text),
+            vec![
+                "https://mirror.a.example".to_string(),
+                "docker.m.daocloud.io".to_string()
+            ]
+        );
+        assert!(mirrors_from_config_toml("not toml [").is_empty());
+        assert!(mirrors_from_config_toml("[other]\nx = 1").is_empty());
+        assert!(mirrors_from_config_toml("").is_empty());
+    }
+
+    #[test]
+    fn config_mirrors_are_normalized_and_deduped() {
+        let text = "[registry]\nmirrors = [\"mirror.example/\", \"https://mirror.example\"]\n";
+        let parsed = mirrors_from_config_toml(text);
+        assert_eq!(parsed.len(), 2);
+        let mut out = Vec::new();
+        for m in parsed {
+            push_unique(&mut out, normalize_mirror(&m));
+        }
+        assert_eq!(out, vec!["https://mirror.example".to_string()]);
     }
 }

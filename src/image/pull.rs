@@ -15,7 +15,7 @@ use crate::image::unpack::unpack_layer;
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 
 #[derive(Debug, Clone, Default)]
@@ -270,6 +270,13 @@ fn materialize_rootfs(
     fsutil::remove_dir_all_quiet(&tmp);
     fs::create_dir_all(&tmp).map_err(|e| crate::zerr!("create rootfs staging dir: {e}"))?;
     for (i, layer) in manifest.layers.iter().enumerate() {
+        println!(
+            "  layer {}/{}: {} ({})",
+            i + 1,
+            manifest.layers.len(),
+            short_digest(&layer.digest),
+            crate::fsutil::human_size(layer.size)
+        );
         ensure_blob(store, client, endpoints, repo, &layer.digest)?;
         let blob_path = store.blob_path(&layer.digest)?;
         let expected_diff = config.rootfs.diff_ids[i].clone();
@@ -354,29 +361,162 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Wrap a stored layer blob in a decompressor matching its media type.
+/// Open a stored layer blob for decompressed reading.
+///
+/// Dispatch is media-type first (OCI/Docker names); when the media type is
+/// unknown or missing we fall back to sniffing the compression magic bytes, so
+/// a correctly compressed layer still unpacks even if registry metadata is
+/// wrong. Chunked variants (`zstd:chunked`) use a different framing and get a
+/// clear error instead of silent corruption.
 fn open_layer_reader(path: &Path, media_type: &str) -> ZResult<Box<dyn Read>> {
-    if media_type.contains("zstd") {
+    let file = File::open(path).map_err(|e| crate::zerr!("open layer {}: {e}", path.display()))?;
+    let mut reader = io::BufReader::new(file);
+
+    if media_type.contains("chunked") {
         return Err(crate::zerr!(
-            "zstd-compressed layers are not supported yet (media type '{media_type}')"
+            "chunked layer compression is not supported (media type '{media_type}')"
         ));
     }
-    let file = File::open(path).map_err(|e| crate::zerr!("open layer {}: {e}", path.display()))?;
-    if media_type.contains("gzip") {
-        Ok(Box::new(GzDecoder::new(file)))
-    } else {
-        Ok(Box::new(file))
+    if media_type.contains("zstd") {
+        return zstd_decoder(reader);
     }
+    if media_type.contains("gzip") {
+        return gzip_decoder(reader);
+    }
+    // Unknown media type: peek without consuming, then pick a decoder.
+    let head = match reader.fill_buf() {
+        Ok(h) => h.to_vec(),
+        Err(e) => return Err(crate::zerr!("read layer header: {e}")),
+    };
+    if head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        return zstd_decoder(reader);
+    }
+    if head.starts_with(&[0x1f, 0x8b]) {
+        return gzip_decoder(reader);
+    }
+    Ok(Box::new(reader))
+}
+
+fn gzip_decoder<R: Read + 'static>(reader: R) -> ZResult<Box<dyn Read>> {
+    Ok(Box::new(GzDecoder::new(reader)))
+}
+
+fn zstd_decoder<R: Read + 'static>(reader: R) -> ZResult<Box<dyn Read>> {
+    zstd::stream::read::Decoder::new(reader)
+        .map(|d| Box::new(d) as Box<dyn Read>)
+        .map_err(|e| crate::zerr!("open zstd layer: {e}"))
+}
+
+/// Abbreviate a `sha256:<hex>` digest for human progress output.
+fn short_digest(digest: &str) -> String {
+    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+    let keep = hex.len().min(12);
+    format!("sha256:{}", &hex[..keep])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+
+    fn temp_blob(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "zerun-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    fn read_all(mut r: Box<dyn Read>) -> Vec<u8> {
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        out
+    }
 
     #[test]
-    fn layer_media_type_dispatch() {
+    fn missing_file_errors_regardless_of_media_type() {
         let p = Path::new("/nonexistent");
-        assert!(open_layer_reader(p, "application/vnd.docker.image.rootfs.diff.tar.gzip").is_err()); // file missing, not media issue
-        assert!(open_layer_reader(p, "application/vnd.oci.image.layer.v1.tar+zstd").is_err());
+        for mt in [
+            "application/vnd.docker.image.rootfs.diff.tar.gzip",
+            "application/vnd.oci.image.layer.v1.tar+zstd",
+            "application/vnd.oci.image.layer.v1.tar",
+        ] {
+            assert!(open_layer_reader(p, mt).is_err());
+        }
+    }
+
+    #[test]
+    fn gzip_and_zstd_layers_decode_by_media_type() {
+        let plain = b"hello uncompressed layer\n";
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut gz = gz;
+        use std::io::Write;
+        gz.write_all(plain).unwrap();
+        let gz_bytes = gz.finish().unwrap();
+
+        let zstd_bytes = zstd::stream::encode_all(&plain[..], 3).unwrap();
+
+        let gp = temp_blob("gzip", &gz_bytes);
+        let zp = temp_blob("zstd", &zstd_bytes);
+        let g =
+            open_layer_reader(&gp, "application/vnd.docker.image.rootfs.diff.tar.gzip").unwrap();
+        assert_eq!(read_all(g), plain);
+        let z = open_layer_reader(&zp, "application/vnd.oci.image.layer.v1.tar+zstd").unwrap();
+        assert_eq!(read_all(z), plain);
+        let _ = std::fs::remove_file(&gp);
+        let _ = std::fs::remove_file(&zp);
+    }
+
+    #[test]
+    fn unknown_media_type_sniffs_compression_magic() {
+        let plain = b"sniffed layer\n";
+        let gz_bytes = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut gz = gz_bytes;
+        use std::io::Write;
+        gz.write_all(plain).unwrap();
+        let gz_bytes = gz.finish().unwrap();
+        let zstd_bytes = zstd::stream::encode_all(&plain[..], 3).unwrap();
+
+        let gp = temp_blob("sniff-gzip", &gz_bytes);
+        let zp = temp_blob("sniff-zstd", &zstd_bytes);
+        let tp = temp_blob("plain", plain);
+        assert_eq!(
+            read_all(open_layer_reader(&gp, "application/octet-stream").unwrap()),
+            plain
+        );
+        assert_eq!(
+            read_all(open_layer_reader(&zp, "application/octet-stream").unwrap()),
+            plain
+        );
+        assert_eq!(
+            read_all(open_layer_reader(&tp, "application/octet-stream").unwrap()),
+            plain
+        );
+        for p in [&gp, &zp, &tp] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn chunked_zstd_gets_a_clear_error() {
+        let p = temp_blob("chunked", b"whatever");
+        let err = match open_layer_reader(&p, "application/vnd.oci.image.layer.v1.tar+zstd+chunked")
+        {
+            Ok(_) => panic!("chunked zstd should be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("chunked"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn short_digest_abbreviates() {
+        assert_eq!(
+            short_digest("sha256:abcdef1234567890"),
+            "sha256:abcdef123456"
+        );
+        assert_eq!(short_digest("not-a-digest"), "sha256:not-a-digest");
     }
 }
