@@ -1,0 +1,27 @@
+[package]
+name = "zerun"
+version = "0.2.0"
+edition = "2021"
+description = "Zerun: daemonless, single-binary Linux container runtime for low-end/edge hosts"
+license = "Apache-2.0"
+repository = "https://github.com/zerun-labs/zerun"
+
+# Runtime dependency policy: thin syscall wrappers only, kept to a minimum.
+# All unsafe code is concentrated in src/syscalls.rs.
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"      # smallest code size
+lto = true           # link-time optimization
+codegen-units = 1
+strip = true         # drop symbol table / debug info
+panic = "abort"      # no unwind tables, smaller binary
+
+# Static musl build (production / minimal edge root filesystems):
+#   rustup target add x86_64-unknown-linux-musl
+#   cargo build --release --target x86_64-unknown-linux-musl
+# Cross compilation to edge devices:
+#   rustup target add aarch64-unknown-linux-musl          # ARM64
+#   rustup target add armv7-unknown-linux-musleabihf      # ARMv7
+#   rustup target add riscv64gc-unknown-linux-musl        # RISC-V64
