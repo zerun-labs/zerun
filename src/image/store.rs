@@ -357,9 +357,18 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// Unique per-call store dir: tests run in parallel within one process, so a
+    /// pid-suffixed path would be shared and races would corrupt each other.
     fn test_store() -> ImageStore {
-        let dir = std::env::temp_dir().join(format!("zerun-imgstore-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-imgstore-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = fs::remove_dir_all(&dir);
         ImageStore::at(&dir).unwrap()
     }
