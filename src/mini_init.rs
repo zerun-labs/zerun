@@ -1,8 +1,12 @@
 //! Built-in mini-init (like docker-init/tini).
 //!
-//! Entered by the container init process via `zerun __init -- <cmd>...` re-exec.
-//! Responsibilities: 1) reap orphaned children to avoid zombies; 2) forward
-//! SIGTERM/SIGINT to the workload; 3) exit with the workload's exit code.
+//! Runs directly as container PID 1 when `--init` is used. Responsibilities:
+//!
+//! 1. reap orphaned children to avoid zombies;
+//! 2. forward SIGTERM/SIGINT to the workload;
+//! 3. exit with the workload's exit code.
+//!
+//! The `zerun __init -- cmd` re-exec entry is retained for manual/legacy use.
 use crate::error::{last_err, ZResult};
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -17,8 +21,17 @@ extern "C" fn forward_signal(_sig: libc::c_int) {
     }
 }
 
-/// `argv` is the business command after `--` in `__init -- <cmd> ...`.
-pub fn run(business: &[String]) -> ZResult<i32> {
+/// Run the business command as a child of this init process.
+///
+/// `env` is the explicit container environment (image mode); `None` keeps the
+/// inherited environment (legacy `--rootfs` mode). `hostname`/`id` feed the
+/// HOSTNAME default in legacy mode.
+pub fn run(
+    business: &[String],
+    env: Option<&[(String, String)]>,
+    hostname: Option<&str>,
+    id: &str,
+) -> ZResult<i32> {
     if business.is_empty() {
         return Err(crate::zerr!("__init: missing business command"));
     }
@@ -44,7 +57,7 @@ pub fn run(business: &[String]) -> ZResult<i32> {
             libc::signal(libc::SIGTERM, libc::SIG_DFL);
             libc::signal(libc::SIGINT, libc::SIG_DFL);
         }
-        exec_business(business)?;
+        exec_business(business, env, hostname, id)?;
         unreachable!("exec failure is returned as Err");
     }
     CHILD_PID.store(pid, Ordering::Relaxed);
@@ -87,15 +100,16 @@ fn decode_status(status: libc::c_int) -> i32 {
     }
 }
 
-fn exec_business(argv: &[String]) -> ZResult<()> {
+fn exec_business(
+    argv: &[String],
+    env: Option<&[(String, String)]>,
+    hostname: Option<&str>,
+    id: &str,
+) -> ZResult<()> {
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(&argv[0]);
     cmd.args(&argv[1..]);
-    // Container-conventional default PATH, consistent with the direct-exec path.
-    cmd.env(
-        "PATH",
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-    );
+    crate::workload::apply_env(&mut cmd, env, hostname, id);
     let err = cmd.exec();
     Err(crate::zerr!("mini-init exec {} failed: {err}", argv[0]))
 }

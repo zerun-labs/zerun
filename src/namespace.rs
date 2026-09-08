@@ -37,6 +37,12 @@ pub struct RunSpec {
     /// Per-container writable filesystem; None = pivot directly into `rootfs`.
     pub overlay: Option<OverlayPaths>,
     pub id: String,
+    /// Explicit container environment (image mode: KEY=VALUE pairs, fully
+    /// replacing the inherited env). None = legacy `--rootfs` behavior
+    /// (inherit host env + inject defaults).
+    pub env: Option<Vec<(String, String)>>,
+    /// Working directory inside the container (None = "/").
+    pub cwd: Option<String>,
 }
 
 static TARGET_CHILD: AtomicI32 = AtomicI32::new(0);
@@ -190,6 +196,12 @@ fn child_stage(
     // 3. Security hardening: no_new_privs -> capability drop -> seccomp profile.
     security::harden(spec.seccomp)?;
 
+    // 3b. Move to the container working directory before the error pipe closes
+    //     so a missing directory is reported to the parent as a setup failure.
+    if let Some(cwd) = &spec.cwd {
+        syscalls::chdir(cwd)?;
+    }
+
     // 4. Start the workload.
     //    --init: do NOT re-exec our own binary (that would depend on
     //    /proc/self/exe being visible under the new root). Instead the container
@@ -202,27 +214,26 @@ fn child_stage(
     //    forever on the sync read.)
     syscalls::close(err_w);
     trace::mark("child:exec:begin");
+    let argv = crate::workload::resolve_argv(spec.env.as_deref(), &spec.argv);
     if spec.use_init {
-        let code = crate::mini_init::run(&spec.argv)?;
+        let code = crate::mini_init::run(
+            &argv,
+            spec.env.as_deref(),
+            spec.hostname.as_deref(),
+            &spec.id,
+        )?;
         unsafe { libc::_exit(code) };
     }
 
     use std::os::unix::process::CommandExt;
-    let mut cmd = std::process::Command::new(&spec.argv[0]);
-    cmd.args(spec.argv.iter().skip(1));
-
-    // Environment: inherit the parent env, then override with container defaults
-    // (from the image config.Env once the image engine lands).
-    cmd.env(
-        "PATH",
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-    )
-    .env("HOME", "/root")
-    .env(
-        "HOSTNAME",
-        spec.hostname.clone().unwrap_or_else(|| spec.id.clone()),
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(argv.iter().skip(1));
+    crate::workload::apply_env(
+        &mut cmd,
+        spec.env.as_deref(),
+        spec.hostname.as_deref(),
+        &spec.id,
     );
-
     let err = cmd.exec(); // only returns on failure
     Err(crate::zerr!("execve failed: {err}"))
 }
