@@ -1,0 +1,18 @@
+# --- Rust ---
+/target
+Cargo.lock.orig
+
+# --- Design document (reference only; must never be committed) ---
+/ZerunDesignDoc.md
+
+# --- bench runtime artifacts (example-* are kept in-repo) ---
+bench/results/latency-*.csv
+bench/results/mem-*.csv
+bench/results/report-*.md
+bench/results/latest-report.md
+
+# --- editors / OS ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
