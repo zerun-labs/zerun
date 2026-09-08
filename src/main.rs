@@ -14,6 +14,7 @@ mod mounts;
 mod namespace;
 mod netlink;
 mod network;
+mod nfnetlink;
 mod seccomp;
 mod security;
 mod store;
@@ -78,6 +79,8 @@ struct RunArgs {
     no_overlay: bool,
     platform: Option<String>,
     env: Vec<String>,
+    ports: Vec<network::PublishedPort>,
+    dns: Vec<String>,
     argv: Vec<String>,
 }
 
@@ -146,6 +149,16 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             "--env" | "-e" => {
                 a.env.push(next_value(args, &mut i, s)?);
             }
+            "--publish" | "-p" => {
+                let v = next_value(args, &mut i, s)?;
+                a.ports.push(parse_publish(&v)?);
+            }
+            "--dns" => {
+                let v = next_value(args, &mut i, "--dns")?;
+                v.parse::<std::net::IpAddr>()
+                    .map_err(|_| format!("invalid --dns address '{v}'"))?;
+                a.dns.push(v);
+            }
             "--" => {
                 // Option terminator. Remaining tokens:
                 //   legacy: the command; image: first token is IMAGE if none yet.
@@ -188,6 +201,45 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     Ok(a)
 }
 
+/// Parse `-p`/`--publish` values. Supported forms (TCP only):
+///   HOST:CONTAINER   publish container port on the given host port
+///   CONTAINER        shorthand for CONTAINER:CONTAINER
+/// Bind addresses (`127.0.0.1:8080:80`) and UDP are rejected with a clear
+/// error until user-space forwarding lands.
+fn parse_publish(v: &str) -> Result<network::PublishedPort, String> {
+    fn parse_port(s: &str) -> Result<u16, String> {
+        s.parse::<u16>()
+            .map_err(|_| format!("invalid port '{s}' (expected 1-65535)"))
+            .and_then(|p| {
+                if p == 0 {
+                    Err(format!("invalid port '{s}' (expected 1-65535)"))
+                } else {
+                    Ok(p)
+                }
+            })
+    }
+    if v.ends_with("/udp") {
+        return Err("-p: UDP publishing is not supported yet (TCP only)".to_string());
+    }
+    if let Some((host, container)) = v.split_once(':') {
+        if container.contains(':') {
+            return Err(format!(
+                "-p: binding to a host address ('{v}') is not supported yet; use HOST:CONTAINER"
+            ));
+        }
+        Ok(network::PublishedPort {
+            host: parse_port(host)?,
+            container: parse_port(container)?,
+        })
+    } else {
+        let p = parse_port(v)?;
+        Ok(network::PublishedPort {
+            host: p,
+            container: p,
+        })
+    }
+}
+
 fn next_value(args: &[String], i: &mut usize, opt: &str) -> Result<String, String> {
     let v = args
         .get(*i + 1)
@@ -208,6 +260,13 @@ fn cmd_run(args: &[String]) -> i32 {
             return 2;
         }
     };
+    if !a.ports.is_empty() && a.net != NetMode::Bridge {
+        eprintln!("zerun run: -p/--publish requires --net bridge");
+        return 2;
+    }
+    if !a.dns.is_empty() && a.net != NetMode::Bridge {
+        eprintln!("zerun: warning: --dns only applies to --net bridge; ignoring");
+    }
     if a.rootfs.is_none() && a.image.is_none() {
         eprintln!("zerun run: an IMAGE (or --rootfs DIR for legacy mode) is required");
         print_run_usage();
@@ -286,6 +345,7 @@ fn cmd_run(args: &[String]) -> i32 {
             }
         }
     };
+    inject_resolv_conf(a.net, a.dns.as_slice(), container_fs.as_ref());
     let (pivot_root, overlay) = match &container_fs {
         Some(fs) => (
             fs.root().to_path_buf(),
@@ -315,6 +375,7 @@ fn cmd_run(args: &[String]) -> i32 {
         id,
         env,
         cwd,
+        ports: a.ports,
     };
 
     let result = namespace::run_container(spec);
@@ -328,6 +389,78 @@ fn cmd_run(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// Give bridge-mode containers a working `/etc/resolv.conf`.
+///
+/// Docker semantics: explicit `--dns` wins; otherwise the host's nameservers
+/// are inherited. The file is written into the per-run overlay `upper` on the
+/// host side, so it appears in the container's `/etc` once the overlay is
+/// mounted — no bind mounts across the pivot are needed.
+fn inject_resolv_conf(
+    net: NetMode,
+    explicit: &[String],
+    container_fs: Option<&store::ContainerFs>,
+) {
+    if net != NetMode::Bridge {
+        return;
+    }
+    let Some(fs) = container_fs else {
+        eprintln!("zerun: warning: --no-overlay has no writable layer; DNS is not injected");
+        return;
+    };
+    let servers = if !explicit.is_empty() {
+        explicit.to_vec()
+    } else {
+        host_nameservers()
+    };
+    if servers.is_empty() {
+        return; // no nameserver available; keep the image's resolv.conf
+    }
+    let content = servers
+        .iter()
+        .map(|s| {
+            format!(
+                "nameserver {s}
+"
+            )
+        })
+        .collect::<String>();
+    let etc = fs.upper.join("etc");
+    if let Err(e) = fsutil::mkdir_p(&etc) {
+        eprintln!("zerun: warning: DNS injection: {e}");
+        return;
+    }
+    if let Err(e) = fsutil::atomic_write(&etc.join("resolv.conf"), content.as_bytes()) {
+        eprintln!("zerun: warning: DNS injection: {e}");
+    }
+}
+
+/// Nameserver IPs from the host's `/etc/resolv.conf`.
+///
+/// Loopback servers (systemd-resolved's 127.0.0.53) are useless inside a
+/// container netns, so they are skipped; when nothing usable is left we fall
+/// back to public resolvers so `--net bridge` containers get DNS out of the
+/// box even on stub-resolver hosts.
+fn host_nameservers() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(text) = std::fs::read_to_string("/etc/resolv.conf") {
+        for line in text.lines() {
+            let mut it = line.split_whitespace();
+            if it.next() == Some("nameserver") {
+                if let Some(ip) = it.next() {
+                    if !ip.starts_with("127.") && !ip.starts_with("::1") {
+                        out.push(ip.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push("1.1.1.1".to_string());
+        out.push("8.8.8.8".to_string());
+    }
+    out
 }
 
 /// Resolve an image for `run`: find it locally or pull it. Returns the
@@ -694,7 +827,11 @@ RUN OPTIONS:\n  \
   --cpus 0.5          cgroup v2 cpu.max (cores)\n  \
   --pids 256          cgroup v2 pids.max\n  \
   -h, --hostname H    container hostname (new UTS namespace)\n  \
-  --net none|host     none = fresh netns with loopback only (default); host = share host net\n  \
+  --net none|host|bridge\n  \
+                      none = fresh netns + loopback (default); host = share host net;\n  \
+                      bridge = zerun0 bridge + NAT (rootful, needs CAP_NET_ADMIN)\n  \
+  -p, --publish HOST:CONTAINER  publish a TCP port on the host (requires --net bridge)\n  \
+  --dns IP            container DNS server (repeatable; bridge mode; defaults to the host's)\n  \
   --init              run the built-in mini-init (reap orphans + forward signals)\n  \
   --seccomp default|unconfined\n  \
   --platform os/arch[/variant]  pull/run a specific platform\n  \

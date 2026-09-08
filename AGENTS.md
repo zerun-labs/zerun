@@ -36,7 +36,8 @@ zerun/                      # crate root == repository root
 │   ├── syscalls.rs         # ★ ALL unsafe syscalls live here (mount/clone/pivot_root/caps/pipe)
 │   ├── namespace.rs        # parent/child orchestration: clone, error/net-ready pipes, signals, wait
 │   ├── netlink.rs          # kernel interface: rtnetlink wrapper (links/addresses/routes)
-│   ├── network.rs          # bridge-mode orchestration: zerun0 bridge, veth pair, IPAM
+│   ├── nfnetlink.rs        # kernel interface: nf_tables via netlink (egress NAT, no nft binary)
+│   ├── network.rs          # bridge-mode orchestration: zerun0 bridge, veth pair, IPAM, -p proxy
 │   ├── mounts.rs           # pivot_root sequence, pseudo-fs, masked/readonly paths, minimal /dev
 │   ├── cgroup.rs           # cgroups v2 driver (memory/cpu/pids) + subtree_control setup
 │   ├── security.rs         # no_new_privs -> capability drop -> seccomp orchestration
@@ -130,7 +131,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 | M1 | Isolation executor: namespaces, pivot_root, pseudo-fs, mini-init, caps, bench | ✅ committed (ported from zerun-m1-skeleton) |
 | M2 | Default seccomp allowlist; OverlayFS read-only lowers + disk upper; layer whiteout materialization | ✅ committed: seccomp; per-run OverlayFS (disk upper, auto-cleanup); whiteout materialization (done as part of the M3 rootfs builder) |
 | M3 | OCI pull: multi-arch manifest list, Bearer token, diff_id double verification, mirror inheritance | ✅ committed: `pull/images/rmi`; `run IMAGE` auto-pull + config env/cmd/entrypoint/cwd; multi-arch platform selection; diff_id double verification; mirror inheritance (env + zerun config.toml + `/etc/docker/daemon.json`); zstd layer decode + compression magic sniffing; per-layer pull progress. ⏳ still open: private-registry auth |
-| M4 | Netlink veth/bridge + nftables NAT, host loopback, DNS/hosts | 🚧 core committed: `--net bridge` (rootful) — `zerun0` bridge 10.88.0.1/24, per-container veth pair, net-ready sync, container `eth0` addr + default route. ⏳ next: nftables NAT / `-p` port publishing, DNS/hosts, default `--net bridge` |
+| M4 | Netlink veth/bridge + egress NAT, `-p` publishing, DNS | ✅ committed: `--net bridge` (rootful) — `zerun0` bridge 10.88.0.1/24, per-container veth pair, net-ready sync, container `eth0` addr + default route, egress masquerade per container (nf_tables via pure netlink), `-p HOST:CONTAINER` via a built-in userland proxy (Docker's docker-proxy, in-binary), `--dns` + host resolv.conf inheritance. ⏳ left open: `/etc/hosts` entries, default `--net bridge`, file-based IPAM bitmap (M5) |
 | M5 | Detached reaper, logs, ps/stop/logs/exec, crash reconcile | ⏳ |
 | M6 | cargo-dist, install.sh, generate-service, AUR/Brew | ⏳ |
 
@@ -162,6 +163,22 @@ cargo build --release --target x86_64-unknown-linux-musl
 - rtnetlink sockets must be created inside a tokio runtime context (netlink-sys registers
   with the reactor): `Netlink::new()` builds the runtime first, then calls
   `rtnetlink::new_connection()` inside `Runtime::block_on` and spawns the connection task.
+- A locally generated packet whose source is 127.0.0.1 **cannot be routed to the bridge**:
+  after an OUTPUT-chain DNAT the post-DNAT route lookup fails (EINVAL / martian source) and
+  the SYN dies before POSTROUTING. This is why Docker excludes 127.0.0.0/8 from OUTPUT DNAT
+  and ships docker-proxy. Zerun publishes `-p` ports with a built-in userland TCP proxy
+  (src/network.rs `bind_port_proxies`, bound before the clone so a busy port fails fast) and
+  keeps only egress masquerade in the kernel. Do not "simplify" this back to kernel DNAT.
+- `-p` proxy listeners and their pump threads are deliberately untracked: they live exactly as
+  long as the owning process (foreground CLI or detached reaper), which never outlives the
+  container run, so process exit cleans them up.
+- Container <-> host bridge traffic is verified working in this sandbox (ping both ways, TCP to
+  a host listener, `curl localhost:HOST` through the proxy). Bridge **internet egress** is
+  blocked by this sandbox's outer NAT even though the SYN leaves the host correctly
+  masqueraded (source 198.18.0.1); it works on real hosts exactly like Docker's bridge.
+- A crashed/killed `run` (SIGKILL of the CLI, power loss) leaves its nft table + veth host end
+  behind: teardown runs in the parent after `waitpid`, so it only survives a parent that never
+  got to wait. M5's `ps`/reconcile and `doctor` must clean these up.
 - When a container netns dies, the kernel removes the whole veth pair automatically; host-side
   teardown must tolerate "No such device" (look the link up by name first).
 - Bridge-mode networking needs CAP_NET_ADMIN in the host netns (rootful only for now): rootless

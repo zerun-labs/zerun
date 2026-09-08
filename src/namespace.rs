@@ -51,6 +51,10 @@ pub struct RunSpec {
     pub env: Option<Vec<(String, String)>>,
     /// Working directory inside the container (None = "/").
     pub cwd: Option<String>,
+    /// TCP ports published on the host (`-p HOST:CONTAINER`); only valid with
+    /// `NetMode::Bridge`, where each port becomes a PREROUTING + OUTPUT DNAT
+    /// rule in the container's nft table.
+    pub ports: Vec<crate::network::PublishedPort>,
 }
 
 static TARGET_CHILD: AtomicI32 = AtomicI32::new(0);
@@ -99,6 +103,18 @@ pub fn run_container(spec: RunSpec) -> ZResult<i32> {
              run rootful, or use --net none / --net host"
         ));
     }
+    // Published ports are served by userland proxies bound before the clone:
+    // a busy port must abort the run before any container work happens. The
+    // proxies live as long as this parent waits on the container (foreground
+    // CLI or detached reaper) and die with it.
+    let _port_proxies = if matches!(spec.net, NetMode::Bridge) && !spec.ports.is_empty() {
+        Some(crate::network::bind_port_proxies(
+            crate::network::container_ip(&spec.id),
+            &spec.ports,
+        )?)
+    } else {
+        None
+    };
     let mut flags = libc::CLONE_NEWPID
         | libc::CLONE_NEWNS
         | libc::CLONE_NEWUTS
