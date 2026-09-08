@@ -10,6 +10,12 @@ repository = "https://github.com/zerun-labs/zerun"
 # All unsafe code is concentrated in src/syscalls.rs.
 [dependencies]
 libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tar = "0.4"
+flate2 = "1"
+ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
 
 [profile.release]
 opt-level = "z"      # smallest code size
