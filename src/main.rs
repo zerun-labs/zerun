@@ -12,6 +12,8 @@ mod image;
 mod mini_init;
 mod mounts;
 mod namespace;
+mod netlink;
+mod network;
 mod seccomp;
 mod security;
 mod store;
@@ -114,9 +116,12 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             "--net" => {
                 let v = next_value(args, &mut i, "--net")?;
                 a.net = match v.as_str() {
+                    "bridge" => NetMode::Bridge,
                     "host" => NetMode::Host,
                     "none" => NetMode::None,
-                    other => return Err(format!("invalid --net value '{other}' (host|none)")),
+                    other => {
+                        return Err(format!("invalid --net value '{other}' (bridge|host|none)"))
+                    }
                 };
             }
             "--init" => {

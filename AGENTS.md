@@ -34,7 +34,9 @@ zerun/                      # crate root == repository root
 │   ├── error.rs            # ZError / zerr! / ZResult
 │   ├── trace.rs            # ZERUN_TRACE=1 stage timing (bench/analyze.py parses its format!)
 │   ├── syscalls.rs         # ★ ALL unsafe syscalls live here (mount/clone/pivot_root/caps/pipe)
-│   ├── namespace.rs        # parent/child orchestration: clone, error pipe, signals, wait
+│   ├── namespace.rs        # parent/child orchestration: clone, error/net-ready pipes, signals, wait
+│   ├── netlink.rs          # kernel interface: rtnetlink wrapper (links/addresses/routes)
+│   ├── network.rs          # bridge-mode orchestration: zerun0 bridge, veth pair, IPAM
 │   ├── mounts.rs           # pivot_root sequence, pseudo-fs, masked/readonly paths, minimal /dev
 │   ├── cgroup.rs           # cgroups v2 driver (memory/cpu/pids) + subtree_control setup
 │   ├── security.rs         # no_new_privs -> capability drop -> seccomp orchestration
@@ -80,6 +82,10 @@ target/release/zerun images
 target/release/zerun run alpine echo hi            # rootless
 sudo env ZERUN_DATA_ROOT=/tmp/zerun-root ./target/release/zerun run --init alpine /bin/sh -c 'exit 7'; echo $?
 
+# M4 bridge networking (rootful only): container gets eth0 on bridge zerun0
+sudo env ZERUN_DATA_ROOT=/tmp/zerun-root ./target/release/zerun run --net bridge alpine /bin/ls /sys/class/net   # eth0 lo
+sudo ip -br addr show zerun0   # 10.88.0.1/24 while a bridge container runs
+
 # Prepare a minimal rootfs (Alpine minirootfs)
 mkdir -p /tmp/zerun-test/rootfs
 curl -sSL https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz \
@@ -92,9 +98,9 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 ## 4. Architecture invariants (must not be violated)
 
-1. **Unsafe concentration**: bare syscalls only in `src/syscalls.rs` (and future kernel-interface
-   files such as netlink/nfnetlink modules; when adding one, update this section). Everything else
-   calls the safe wrappers.
+1. **Unsafe concentration**: bare syscalls only in `src/syscalls.rs`; kernel-interface files are
+   `src/netlink.rs` (rtnetlink) and the future nfnetlink/nftables module. Everything else calls
+   the safe wrappers. When adding a kernel-interface file, update this section.
 2. **Parent/child process model**: the container is cloned from the CLI parent. The parent writes
    cgroup.procs, assembles networking, and either waits (foreground) or hands off (detached).
    The child mounts/pivots/execs inside the new namespaces. There is no "single process enters
@@ -123,8 +129,8 @@ cargo build --release --target x86_64-unknown-linux-musl
 |---|---|---|
 | M1 | Isolation executor: namespaces, pivot_root, pseudo-fs, mini-init, caps, bench | ✅ committed (ported from zerun-m1-skeleton) |
 | M2 | Default seccomp allowlist; OverlayFS read-only lowers + disk upper; layer whiteout materialization | ✅ committed: seccomp; per-run OverlayFS (disk upper, auto-cleanup); whiteout materialization (done as part of the M3 rootfs builder) |
-| M3 | OCI pull: multi-arch manifest list, Bearer token, diff_id double verification, mirror inheritance | ✅ core committed: `pull/images/rmi`; `run IMAGE` auto-pull + config env/cmd/entrypoint/cwd; multi-arch platform selection; diff_id double verification; mirror inheritance (env + /etc/docker/daemon.json). ⏳ still open: zstd layers, private-registry auth, `/etc/zerun/config.toml` |
-| M4 | Netlink veth/bridge + nftables 4-chain NAT, host loopback, DNS/hosts | ⏳ |
+| M3 | OCI pull: multi-arch manifest list, Bearer token, diff_id double verification, mirror inheritance | ✅ committed: `pull/images/rmi`; `run IMAGE` auto-pull + config env/cmd/entrypoint/cwd; multi-arch platform selection; diff_id double verification; mirror inheritance (env + zerun config.toml + `/etc/docker/daemon.json`); zstd layer decode + compression magic sniffing; per-layer pull progress. ⏳ still open: private-registry auth |
+| M4 | Netlink veth/bridge + nftables NAT, host loopback, DNS/hosts | 🚧 core committed: `--net bridge` (rootful) — `zerun0` bridge 10.88.0.1/24, per-container veth pair, net-ready sync, container `eth0` addr + default route. ⏳ next: nftables NAT / `-p` port publishing, DNS/hosts, default `--net bridge` |
 | M5 | Detached reaper, logs, ps/stop/logs/exec, crash reconcile | ⏳ |
 | M6 | cargo-dist, install.sh, generate-service, AUR/Brew | ⏳ |
 
@@ -153,6 +159,17 @@ cargo build --release --target x86_64-unknown-linux-musl
   read-only for the container root. Unpack images with the same identity that runs containers.
 - OverlayFS creates its internal work/work dir with mode 000: recursive cleanup must not descend
   into it (see fsutil::remove_rec: rmdir first, readdir only when non-empty).
+- rtnetlink sockets must be created inside a tokio runtime context (netlink-sys registers
+  with the reactor): `Netlink::new()` builds the runtime first, then calls
+  `rtnetlink::new_connection()` inside `Runtime::block_on` and spawns the connection task.
+- When a container netns dies, the kernel removes the whole veth pair automatically; host-side
+  teardown must tolerate "No such device" (look the link up by name first).
+- Bridge-mode networking needs CAP_NET_ADMIN in the host netns (rootful only for now): rootless
+  runs are rejected with a clear error until a user-mode NAT lands.
+- Container IPv4 addresses are deterministic from the container id (no shared state yet); a
+  file-based IPAM bitmap is planned with the M5 lifecycle work.
+- The net-ready pipe protocol (parent writes `0` = ready / `1` + error text; the child relays
+  host-side failures over the error pipe) must be preserved by any future child-side stage.
 - This dev machine is WSL2: `/mnt/c` is a 9P cross-filesystem and must never hold code/rootfs
   (overlay/pivot need native ext4; this repo is on /dev/sdd ext4). Kernel 6.18 with
   NF_TABLES/VETH/OVERLAY_FS/USER_NS enabled.

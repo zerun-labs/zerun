@@ -23,10 +23,14 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   with disk upper and automatic cleanup; OCI whiteout materialization.
 - **M3 — OCI image engine (core done)**: `zerun pull / images / rmi`; Docker v2 pull with
   Bearer token auth, multi-arch platform selection (`--platform`), compressed-blob and
-  diff_id double verification, and mirror inheritance from `/etc/docker/daemon.json` or
-  `ZERUN_REGISTRY_MIRRORS`; `zerun run IMAGE` auto-pulls and applies image
-  env/entrypoint/cmd/working-dir.
-- **M4+** — kernel networking, detached lifecycle, distribution (see AGENTS.md).
+  diff_id double verification, zstd layer decode + magic sniffing, mirror inheritance
+  (env, zerun `config.toml`, `/etc/docker/daemon.json`), and per-layer pull progress;
+  `zerun run IMAGE` auto-pulls and applies image env/entrypoint/cmd/working-dir.
+- **M4 (in progress)** — kernel networking: `--net bridge` (rootful) creates the `zerun0`
+  bridge (10.88.0.1/24) and a per-container veth pair with container-side `eth0` and a
+  default route (verified: host ↔ container reachable). NAT / `-p` port publishing and
+  DNS/hosts injection come next.
+- **M5+** — detached lifecycle, distribution (see AGENTS.md).
 
 ## Highlights
 
@@ -34,8 +38,8 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   resident runtime behind; detached runs only spawn a tiny per-container reaper.
 - **Single static binary**: `musl`-linked, ~a few hundred KiB for the current skeleton;
   release profile optimized for size (`opt-level=z`, LTO, strip, panic=abort).
-- **No external command dependencies**: namespaces, mounts, cgroups, and (later) netlink /
-  nftables are driven directly through syscalls. No shelling out to `ip`, `nft`, or a daemon.
+- **No external command dependencies**: namespaces, mounts, cgroups, and netlink are driven
+  directly (rtnetlink) — no shelling out to `ip`, `nft`, or a daemon.
 - **Secure defaults**: `PR_SET_NO_NEW_PRIVS`, capability bounding-set cleared, masked
   `/proc`/`/sys` paths, and a deny-by-default seccomp allowlist (opt out with
   `--seccomp unconfined`).
@@ -89,7 +93,9 @@ Run options (current subset):
 --cpus 0.5           cgroup v2 cpu.max (cores)
 --pids 256           cgroup v2 pids.max
 -h, --hostname H     container hostname (new UTS namespace)
---net none|host      none = fresh netns with loopback only (default); host = share host net
+--net bridge|none|host
+                     bridge = rootful bridge networking on zerun0 (veth + eth0 in container);
+                     none = fresh netns with loopback only (default); host = share host net
 --init               run built-in mini-init (reap orphans, forward signals)
 --seccomp default|unconfined   seccomp policy (default: deny-by-default allowlist)
 --platform os/arch[/variant]   pull/run a specific platform
@@ -97,8 +103,10 @@ Run options (current subset):
 --no-overlay        pivot directly into the rootfs (no writable upper layer)
 ```
 
-`ZERUN_REGISTRY_MIRRORS` (comma-separated) and the `/etc/docker/daemon.json`
-`registry-mirrors` list are honored for `docker.io` pulls.
+`ZERUN_REGISTRY_MIRRORS` (comma-separated), a zerun config file
+(`/etc/zerun/config.toml` with `[registry] mirrors = [...]`, overridable via
+`ZERUN_CONFIG` or `~/.config/zerun/config.toml`), and the `/etc/docker/daemon.json`
+`registry-mirrors` list are honored for `docker.io` pulls (in that priority order).
 
 ### Legacy rootfs mode (M1/M2)
 

@@ -1,8 +1,15 @@
 //! Isolation orchestration.
 //!
 //! Parent: create cgroup -> clone the child -> write cgroup.procs -> forward
-//! signals -> wait. Child: mount/pivot -> pseudo-fs -> security hardening ->
-//! execve (or run the built-in mini-init first).
+//! signals -> wait. Child: mount/pivot -> pseudo-fs -> (bridge: net-ready sync
+//! + container-side network config) -> security hardening -> execve (or run
+//!   the built-in mini-init first).
+//!
+//! For `--net bridge` a second pipe synchronizes networking between parent and
+//! child: the parent builds the bridge/veth and moves the peer into the child's
+//! netns, then signals the child over the net-ready pipe (0 = ready, 1 + text =
+//! host-side failure). The child configures `eth0` only after the signal, so
+//! networking is up before the workload starts.
 use crate::cgroup::{CgroupV2, ResourceLimits};
 use crate::error::ZResult;
 use crate::mounts::{setup_rootfs, OverlayPaths, RootfsConfig};
@@ -14,14 +21,15 @@ use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NetMode {
-    /// Fresh netns with loopback only (bridge/veth arrives with the networking
-    /// milestone).
+    /// Fresh netns with loopback only.
     #[default]
     None,
-    /// Share the host network (a single-process unshare path would be possible
-    /// here, but M1 still goes through clone for uniformity).
+    /// Rootful bridge networking: `zerun0` bridge + per-container veth pair.
+    /// Requires CAP_NET_ADMIN in the host network namespace.
+    Bridge,
+    /// Share the host network.
     Host,
 }
 
@@ -73,17 +81,31 @@ pub fn run_container(spec: RunSpec) -> ZResult<i32> {
 
     let (err_r, err_w) = syscalls::pipe2_cloexec()?;
 
-    // clone flags: PID/MNT/UTS/IPC/CGROUP on by default; NEWNET additionally for
-    // --net none. Non-root automatically adds NEWUSER (the kernel guarantees the
-    // user namespace is created first).
+    // Bridge mode needs a second pipe (parent -> child) so the child does not
+    // exec before the veth peer has been moved into its netns. See module docs.
+    let net_sync = if matches!(spec.net, NetMode::Bridge) {
+        Some(syscalls::pipe2_cloexec()?)
+    } else {
+        None
+    };
+
+    // clone flags: PID/MNT/UTS/IPC/CGROUP on by default; NEWNET additionally
+    // for --net none and --net bridge. Non-root automatically adds NEWUSER (the
+    // kernel guarantees the user namespace is created first).
     let rootless = unsafe { libc::geteuid() } != 0;
+    if rootless && matches!(spec.net, NetMode::Bridge) {
+        return Err(crate::zerr!(
+            "--net bridge needs CAP_NET_ADMIN in the host network namespace; \
+             run rootful, or use --net none / --net host"
+        ));
+    }
     let mut flags = libc::CLONE_NEWPID
         | libc::CLONE_NEWNS
         | libc::CLONE_NEWUTS
         | libc::CLONE_NEWIPC
         | libc::CLONE_NEWCGROUP
         | libc::SIGCHLD;
-    if matches!(spec.net, NetMode::None) {
+    if !matches!(spec.net, NetMode::Host) {
         flags |= libc::CLONE_NEWNET;
     }
     if rootless {
@@ -97,13 +119,37 @@ pub fn run_container(spec: RunSpec) -> ZResult<i32> {
 
     let child_spec = spec.clone();
     let pid = syscalls::clone_into(flags, move || {
-        child_main(child_spec, err_w, err_r, rootless, host_euid, host_egid)
+        child_main(
+            child_spec, err_w, err_r, net_sync, rootless, host_euid, host_egid,
+        )
     })?;
     trace::mark("parent:clone:done");
 
-    // The parent keeps neither the write end nor the child end of the pipe.
+    // The parent keeps neither the write end nor the child end of the error pipe.
     syscalls::close(err_w);
     TARGET_CHILD.store(pid, Ordering::Relaxed);
+
+    // Bridge mode: build the host side now. The child is parked on the net-ready
+    // pipe, so the veth peer can be moved into its netns before it execs. On
+    // failure the parent sends `1` + error text, which the child forwards over
+    // the error pipe; on success it sends `0`.
+    let mut host_net: Option<crate::network::HostNet> = None;
+    if let Some((net_r, net_w)) = net_sync {
+        syscalls::close(net_r); // the parent never reads the net-ready pipe
+        let msg = match crate::network::setup_host_side(&spec.id, pid) {
+            Ok(net) => {
+                host_net = Some(net);
+                vec![0]
+            }
+            Err(e) => {
+                let mut v = vec![1];
+                v.extend_from_slice(e.to_string().as_bytes());
+                v
+            }
+        };
+        syscalls::write_fd(net_w, &msg); // EPIPE: child already failed
+        syscalls::close(net_w);
+    }
 
     // Write cgroup.procs (the child may already have exited; attach ignores ESRCH).
     if let Some(cg) = &cg {
@@ -121,10 +167,14 @@ pub fn run_container(spec: RunSpec) -> ZResult<i32> {
     let n = read_all(err_r, &mut buf)?;
     syscalls::close(err_r);
     if n > 0 {
-        // The child failed before exec.
+        // The child failed before exec (this also reports bridge setup failures,
+        // which the child relays over this pipe).
         let msg = String::from_utf8_lossy(&buf[..n]);
         eprintln!("zerun: container setup failed: {msg}");
         let _ = wait_pid(pid);
+        if let Some(net) = &host_net {
+            crate::network::teardown_host_side(net);
+        }
         if let Some(cg) = cg {
             cg.cleanup();
         }
@@ -133,6 +183,9 @@ pub fn run_container(spec: RunSpec) -> ZResult<i32> {
     trace::mark("parent:child-execved");
 
     let code = wait_pid(pid)?;
+    if let Some(net) = &host_net {
+        crate::network::teardown_host_side(net);
+    }
     if let Some(cg) = cg {
         cg.cleanup();
     }
@@ -144,14 +197,20 @@ fn child_main(
     spec: RunSpec,
     err_w: RawFd,
     err_r: RawFd,
+    net_sync: Option<(RawFd, RawFd)>,
     rootless: bool,
     host_euid: u32,
     host_egid: u32,
 ) -> ZResult<()> {
     syscalls::close(err_r);
+    // The net-ready pipe is parent -> child; the child never writes it.
+    let net_r = net_sync.map(|(r, w)| {
+        syscalls::close(w);
+        r
+    });
 
     // Report any failure to the parent over the pipe; the trampoline then exits 1.
-    let result = child_stage(&spec, rootless, host_euid, host_egid, err_w);
+    let result = child_stage(&spec, rootless, host_euid, host_egid, err_w, net_r);
     if let Err(e) = result {
         let msg = format!("{e}");
         syscalls::write_fd(err_w, msg.as_bytes());
@@ -167,6 +226,7 @@ fn child_stage(
     host_euid: u32,
     host_egid: u32,
     err_w: RawFd,
+    net_r: Option<RawFd>,
 ) -> ZResult<()> {
     // 0. rootless: write the uid/gid mapping before doing any mounts.
     if rootless {
@@ -188,9 +248,27 @@ fn child_stage(
     };
     setup_rootfs(&cfg)?;
 
-    // 2. With --net none, bring loopback up so 127.0.0.1 works.
-    if matches!(spec.net, NetMode::None) {
-        syscalls::bring_loopback_up()?;
+    // 2. Network inside the container netns (before capability drop, which
+    //    would remove the CAP_NET_ADMIN needed to configure eth0).
+    match spec.net {
+        NetMode::Bridge => {
+            let fd = net_r.ok_or_else(|| crate::zerr!("bridge mode lost its net-ready pipe"))?;
+            net_sync_wait(fd)?;
+            syscalls::close(fd);
+            crate::network::setup_container_side(&spec.id)?;
+        }
+        NetMode::None => {
+            // Bring loopback up so 127.0.0.1 works.
+            syscalls::bring_loopback_up()?;
+            if let Some(fd) = net_r {
+                syscalls::close(fd);
+            }
+        }
+        NetMode::Host => {
+            if let Some(fd) = net_r {
+                syscalls::close(fd);
+            }
+        }
     }
 
     // 3. Security hardening: no_new_privs -> capability drop -> seccomp profile.
@@ -249,6 +327,40 @@ fn write_self_id_mapping(host_euid: u32, host_egid: u32) -> ZResult<()> {
     std::fs::write("/proc/self/gid_map", format!("0 {host_egid} 1"))
         .map_err(|e| crate::zerr!("write gid_map failed: {e}"))?;
     Ok(())
+}
+
+/// Wait for the parent's net-ready signal over `fd`.
+///
+/// Protocol: a single `0` byte means the host side (bridge/veth) is ready; a
+/// `1` byte is followed by the parent's error text. EOF without any byte means
+/// the parent gave up without signalling (treated as a failure).
+fn net_sync_wait(fd: RawFd) -> ZResult<()> {
+    let mut first = [0u8; 1];
+    let n = read_all(fd, &mut first)?;
+    if n == 0 {
+        return Err(crate::zerr!(
+            "host network setup ended without signalling the container"
+        ));
+    }
+    if first[0] == 0 {
+        return Ok(());
+    }
+    let mut rest = Vec::new();
+    let mut buf = [0u8; 512];
+    loop {
+        let m = syscalls::read_fd(fd, &mut buf)? as usize;
+        if m == 0 {
+            break;
+        }
+        rest.extend_from_slice(&buf[..m]);
+    }
+    let msg = String::from_utf8_lossy(&rest);
+    let msg = msg.trim();
+    if msg.is_empty() {
+        Err(crate::zerr!("host network setup failed"))
+    } else {
+        Err(crate::zerr!("{msg}"))
+    }
 }
 
 fn install_forward(sig: libc::c_int) {

@@ -18,6 +18,9 @@ flate2 = "1"
 ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
 zstd = "0.14.0"
 toml = "1.1.5"
+rtnetlink = "0.23.0"
+tokio = "1.53.1"
+futures-util = "0.3.34"
 
 [profile.release]
 opt-level = "z"      # smallest code size
