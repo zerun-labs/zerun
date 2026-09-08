@@ -1,18 +1,19 @@
 //! Security hardening (the area that v1 of the design doc missed entirely).
 //!
-//! Current stage: PR_SET_NO_NEW_PRIVS + capability bounding-set drop.
-//! Next stage (M2): default seccomp allowlist profile.
+//! Current stage: PR_SET_NO_NEW_PRIVS + capability bounding-set drop + a default
+//! seccomp allowlist profile (M2).
 use crate::error::ZResult;
+use crate::seccomp::{self, SeccompMode};
 use crate::syscalls;
 use crate::trace;
 
 /// Security sequence before the workload execs. Order matters: NO_NEW_PRIVS first,
 /// then capabilities, then seccomp (loading a seccomp filter without CAP_SYS_ADMIN
 /// requires NO_NEW_PRIVS to be set first).
-pub fn harden() -> ZResult<()> {
+pub fn harden(seccomp_mode: SeccompMode) -> ZResult<()> {
     no_new_privs()?;
     drop_bounding_caps()?;
-    apply_seccomp_profile()?;
+    seccomp::apply(seccomp_mode)?;
     trace::mark("child:security:done");
     Ok(())
 }
@@ -60,19 +61,5 @@ fn drop_bounding_caps() -> ZResult<()> {
         // is already empty, which is enough to continue.
         libc::syscall(libc::SYS_capset, &header, data.as_mut_ptr());
     }
-    Ok(())
-}
-
-/// M2 placeholder: default seccomp allowlist.
-///
-/// Planned implementation path (API verified, filter lands in M2):
-/// 1. prctl(PR_SET_NO_NEW_PRIVS, 1) — already done above.
-/// 2. Generate a BPF program: default SECCOMP_RET_ERRNO(EPERM), allow a whitelist
-///    of common syscalls, explicitly deny keyctl/add_module/userfaultfd/bpf/ptrace.
-/// 3. prog.len/prog.filter via syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog).
-///
-/// Not loaded yet so the skeleton runs on any kernel; the trace explicitly says so.
-fn apply_seccomp_profile() -> ZResult<()> {
-    trace::mark("child:seccomp:skipped-m2-placeholder");
     Ok(())
 }

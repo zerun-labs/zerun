@@ -19,8 +19,8 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   corrected `pivot_root(".", ".")` sequence, container pseudo-filesystems, minimal `/dev`,
   masked/readonly paths, capability dropping, cgroups v2 (memory/cpu/pids), optional
   built-in mini-init, and a reproducible benchmark harness.
-- **M2 — storage & security (in progress)**: default seccomp allowlist, OverlayFS read-write
-  mounts, OCI layer whiteout materialization.
+- **M2 — storage & security (in progress)**: default seccomp allowlist (done), OverlayFS
+  read-write mounts, OCI layer whiteout materialization.
 - **M3+** — OCI pull, kernel networking, detached lifecycle, distribution (see AGENTS.md).
 
 ## Highlights
@@ -32,7 +32,8 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
 - **No external command dependencies**: namespaces, mounts, cgroups, and (later) netlink /
   nftables are driven directly through syscalls. No shelling out to `ip`, `nft`, or a daemon.
 - **Secure defaults**: `PR_SET_NO_NEW_PRIVS`, capability bounding-set cleared, masked
-  `/proc`/`/sys` paths; a default seccomp filter is being added in M2.
+  `/proc`/`/sys` paths, and a deny-by-default seccomp allowlist (opt out with
+  `--seccomp unconfined`).
 - **Docker-compatible top 20% CLI**: `run / ps / stop / rm / logs / exec / pull / images /
   rmi / generate-service / doctor`.
 

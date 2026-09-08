@@ -10,12 +10,14 @@ mod error;
 mod mini_init;
 mod mounts;
 mod namespace;
+mod seccomp;
 mod security;
 mod syscalls;
 mod trace;
 
 use cgroup::ResourceLimits;
 use namespace::{NetMode, RunSpec};
+use seccomp::SeccompMode;
 use std::process::exit;
 
 fn main() {
@@ -57,6 +59,7 @@ struct RunArgs {
     hostname: Option<String>,
     net: NetMode,
     use_init: bool,
+    seccomp: SeccompMode,
     argv: Vec<String>,
 }
 
@@ -96,6 +99,13 @@ fn cmd_run(args: &[String]) -> i32 {
             "--init" => {
                 a.use_init = true;
                 i += 1;
+            }
+            "--seccomp" => {
+                a.seccomp = match args.get(i + 1).map(|s| s.as_str()) {
+                    Some("unconfined") => SeccompMode::Unconfined,
+                    _ => SeccompMode::Default,
+                };
+                i += 2;
             }
             "--" => {
                 a.argv = args[i + 1..].to_vec();
@@ -140,6 +150,7 @@ fn cmd_run(args: &[String]) -> i32 {
             cpus: a.cpus,
             pids: a.pids,
         },
+        seccomp: a.seccomp,
         id: short_id(),
     };
 

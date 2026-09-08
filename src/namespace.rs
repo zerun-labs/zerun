@@ -6,6 +6,7 @@
 use crate::cgroup::{CgroupV2, ResourceLimits};
 use crate::error::ZResult;
 use crate::mounts::{setup_rootfs, RootfsConfig};
+use crate::seccomp::SeccompMode;
 use crate::security;
 use crate::syscalls;
 use crate::trace;
@@ -32,6 +33,7 @@ pub struct RunSpec {
     pub net: NetMode,
     pub use_init: bool,
     pub limits: ResourceLimits,
+    pub seccomp: SeccompMode,
     pub id: String,
 }
 
@@ -182,8 +184,8 @@ fn child_stage(
         syscalls::bring_loopback_up()?;
     }
 
-    // 3. Security hardening (no_new_privs + cap drop; seccomp in M2).
-    security::harden()?;
+    // 3. Security hardening: no_new_privs -> capability drop -> seccomp profile.
+    security::harden(spec.seccomp)?;
 
     // 4. Start the workload.
     //    --init: do NOT re-exec our own binary (that would depend on

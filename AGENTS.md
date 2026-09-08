@@ -37,7 +37,8 @@ zerun/                      # crate root == repository root
 │   ├── namespace.rs        # parent/child orchestration: clone, error pipe, signals, wait
 │   ├── mounts.rs           # pivot_root sequence, pseudo-fs, masked/readonly paths, minimal /dev
 │   ├── cgroup.rs           # cgroups v2 driver (memory/cpu/pids)
-│   ├── security.rs         # no_new_privs -> capability drop -> seccomp (seccomp: next milestone)
+│   ├── security.rs         # no_new_privs -> capability drop -> seccomp orchestration
+│   ├── seccomp.rs          # default deny-by-default BPF allowlist (x86_64 table; extend per arch)
 │   └── mini_init.rs        # container PID1 mini-init (signal forwarding + orphan reaping)
 ├── bench/                  # comparison harness (zerun/crun/runc); see bench/README.md
 ├── tests/                  # integration tests (added milestone by milestone)
@@ -93,7 +94,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 | Milestone | Scope | Status |
 |---|---|---|
 | M1 | Isolation executor: namespaces, pivot_root, pseudo-fs, mini-init, caps, bench | ✅ committed (ported from zerun-m1-skeleton) |
-| M2 | Default seccomp allowlist; OverlayFS read-only lowers + disk upper; layer whiteout materialization | 🚧 in progress (seccomp lands first) |
+| M2 | Default seccomp allowlist; OverlayFS read-only lowers + disk upper; layer whiteout materialization | 🚧 in progress: default seccomp allowlist done; overlay storage next |
 | M3 | OCI pull: multi-arch manifest list, Bearer token, diff_id double verification, mirror inheritance | ⏳ |
 | M4 | Netlink veth/bridge + nftables 4-chain NAT, host loopback, DNS/hosts | ⏳ |
 | M5 | Detached reaper, logs, ps/stop/logs/exec, crash reconcile | ⏳ |
