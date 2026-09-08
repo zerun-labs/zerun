@@ -126,7 +126,9 @@ fn enable_controllers(parent: &Path, want: &[&str]) -> ZResult<()> {
     let mut to_enable: Vec<&str> = Vec::new();
     for c in want {
         if available.split_whitespace().any(|a| a == *c)
-            && !enabled.split_whitespace().any(|e| e.trim_start_matches('+') == *c)
+            && !enabled
+                .split_whitespace()
+                .any(|e| e.trim_start_matches('+') == *c)
         {
             to_enable.push(c);
         }
