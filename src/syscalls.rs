@@ -189,28 +189,54 @@ pub fn write_fd(fd: RawFd, data: &[u8]) {
 // ---------- clone: the only entry point into new namespaces ----------
 
 const CLONE_STACK_SIZE: usize = 8 * 1024 * 1024;
-
-#[repr(C, align(16))]
-struct CloneStack([u8; CLONE_STACK_SIZE]);
+const PAGE_SIZE: usize = 4096;
 
 /// Create a child process with the given clone flags; the child runs `child_fn`.
 ///
 /// New PID/NET/etc. namespaces must be created by a new child process; the caller
-/// never enters them itself. The stack needs 16-byte alignment. Each clone leaks an
-/// 8 MB virtual mapping (reclaimed when the process exits) — acceptable because CLI
-/// processes are short-lived.
+/// never enters them itself. The child stack is an anonymous mmap (lazily
+/// populated, unlike a zeroed Box array, so debug builds do not overflow the
+/// parent stack) with a PROT_NONE guard page below it. The mapping is leaked until
+/// process exit — acceptable because CLI processes are short-lived.
 pub fn clone_into<F>(flags: c_int, child_fn: F) -> ZResult<i32>
 where
     F: FnOnce() -> ZResult<()> + Send + 'static,
 {
     let arg = Box::into_raw(Box::new(child_fn)) as *mut c_void;
-    let stack = Box::new(CloneStack([0u8; CLONE_STACK_SIZE]));
-    let stack_base = &stack.0[0] as *const u8 as usize;
-    let top = (stack_base + CLONE_STACK_SIZE) as *mut c_void;
-    std::mem::forget(stack); // stack must stay alive while the child runs
+    let total = CLONE_STACK_SIZE + PAGE_SIZE;
+    let base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            total,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED {
+        unsafe {
+            drop(Box::from_raw(arg as *mut F));
+        }
+        return Err(last_err("mmap clone stack"));
+    }
+    // Guard page at the bottom of the mapping: a runaway child stack hits
+    // SIGSEGV instead of silently corrupting adjacent memory.
+    if unsafe { libc::mprotect(base, PAGE_SIZE, libc::PROT_NONE) } != 0 {
+        unsafe {
+            drop(Box::from_raw(arg as *mut F));
+            libc::munmap(base, total);
+        }
+        return Err(last_err("mprotect clone stack guard"));
+    }
+    let top = (base as usize + total) as *mut c_void;
 
     let pid = unsafe { libc::clone(trampoline::<F>, top, flags, arg) };
     if pid < 0 {
+        unsafe {
+            drop(Box::from_raw(arg as *mut F));
+            libc::munmap(base, total);
+        }
         return Err(last_err("clone"));
     }
     Ok(pid)
