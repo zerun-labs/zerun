@@ -16,7 +16,7 @@
 //! "running" state and release the foreground CLI at exactly the right time.
 use crate::cgroup::{CgroupV2, ResourceLimits};
 use crate::error::ZResult;
-use crate::mounts::{setup_rootfs, OverlayPaths, RootfsConfig};
+use crate::mounts::{setup_rootfs, BindMount, OverlayPaths, RootfsConfig};
 use crate::seccomp::SeccompMode;
 use crate::security;
 use crate::syscalls;
@@ -62,6 +62,8 @@ pub struct RunSpec {
     /// TCP ports published on the host (`-p HOST:CONTAINER`); only valid with
     /// `NetMode::Bridge`. Served by the built-in userland proxy in network.rs.
     pub ports: Vec<crate::network::PublishedPort>,
+    /// Host bind mounts (simple file/directory volumes).
+    pub volumes: Vec<BindMount>,
     /// Bridge IPv4 assigned by the parent from the file IPAM (set before
     /// clone; consumed by both host-side NAT and the child's eth0 config).
     pub bridge_ip: Option<std::net::Ipv4Addr>,
@@ -390,6 +392,7 @@ fn child_stage(
         hostname: spec.hostname.as_deref(),
         rootless: identity.rootless,
         overlay: spec.overlay.as_ref(),
+        volumes: &spec.volumes,
     };
     setup_rootfs(&cfg)?;
 

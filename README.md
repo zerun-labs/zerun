@@ -20,7 +20,8 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   masked/readonly paths, capability dropping, cgroups v2 (memory/cpu/pids), optional
   built-in mini-init, and a reproducible benchmark harness.
 - **M2 — storage & security (done)**: deny-by-default seccomp allowlist; per-run OverlayFS
-  with disk upper and automatic cleanup; OCI whiteout materialization.
+  with disk upper and automatic cleanup; OCI whiteout materialization; safe host bind-mount
+  volumes with `-v HOST:CONTAINER[:ro|rw]`.
 - **M3 — OCI image engine (done)**: `zerun login / logout / pull / images / rmi`; Docker v2
   pull with Bearer token auth, private-registry credentials, multi-arch platform selection (`--platform`), compressed-blob and
   diff_id double verification, zstd layer decode + magic sniffing, mirror inheritance
@@ -142,6 +143,8 @@ Run options (current subset):
 --seccomp default|unconfined   seccomp policy (default: deny-by-default allowlist)
 --platform os/arch[/variant]   pull/run a specific platform
 -e, --env NAME[=VALUE]         set a container environment variable (image mode)
+-v, --volume HOST:CONTAINER[:ro]
+                     bind-mount an existing host file/directory into the container
 --no-overlay        pivot directly into the rootfs (no writable upper layer)
 ```
 

@@ -105,6 +105,7 @@ struct RunArgs {
     platform: Option<String>,
     env: Vec<String>,
     ports: Vec<network::PublishedPort>,
+    volumes: Vec<mounts::BindMount>,
     dns: Vec<String>,
     argv: Vec<String>,
     /// `-i/--interactive`: keep stdin attached (foreground runs).
@@ -197,6 +198,11 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--env" | "-e" => {
                 a.env.push(next_value(args, &mut i, s)?);
+            }
+            "--volume" | "-v" => {
+                let v = next_value(args, &mut i, s)?;
+                a.volumes
+                    .push(mounts::parse_bind(&v).map_err(|e| e.to_string())?);
             }
             "--publish" | "-p" => {
                 let v = next_value(args, &mut i, s)?;
@@ -479,6 +485,7 @@ fn cmd_run(args: &[String]) -> i32 {
         env,
         cwd,
         ports: a.ports,
+        volumes: a.volumes,
         // Allocated from the file IPAM inside run_container (bridge mode).
         bridge_ip: None,
         run_root: store.run_root().to_path_buf(),
@@ -716,6 +723,13 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
         args.extend([
             "--publish".to_string(),
             format!("{}:{}", p.host, p.container),
+        ]);
+    }
+    for v in &a.volumes {
+        let mode = if v.readonly { "ro" } else { "rw" };
+        args.extend([
+            "--volume".to_string(),
+            format!("{}:{}:{}", v.source.display(), v.target.display(), mode),
         ]);
     }
     for v in &a.dns {
@@ -2380,6 +2394,7 @@ RUN OPTIONS:\n  \
   -i, --interactive      keep stdin attached (foreground runs)\n  \
   -t, --tty              allocate a PTY (foreground runs; combine with -i)\n  \
   -p, --publish HOST:CONTAINER  publish a TCP port on the host (requires --net bridge)\n  \
+  -v, --volume HOST:CONTAINER[:ro]  bind-mount a host file or directory\n  \
   --dns IP            container DNS server (repeatable; bridge mode; defaults to the host's)\n  \
   --init              run the built-in mini-init (reap orphans + forward signals)\n  \
   --seccomp default|unconfined\n  \

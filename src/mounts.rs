@@ -10,7 +10,7 @@ use crate::syscalls;
 use crate::trace;
 use libc::{
     MNT_DETACH, MS_BIND, MS_NODEV, MS_NOEXEC, MS_NOSUID, MS_PRIVATE, MS_RDONLY, MS_REC,
-    MS_RELATIME, MS_STRICTATIME,
+    MS_RELATIME, MS_REMOUNT, MS_STRICTATIME,
 };
 use std::path::{Path, PathBuf};
 
@@ -40,6 +40,73 @@ pub struct OverlayPaths {
     pub merged: PathBuf,
 }
 
+/// A host path bind-mounted into the container rootfs before pivot_root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindMount {
+    /// Canonicalized host path. It must already exist.
+    pub source: PathBuf,
+    /// Absolute path inside the container (without `..` components).
+    pub target: PathBuf,
+    pub readonly: bool,
+}
+
+/// Parse Docker-style simple bind syntax: `HOST:CONTAINER[:ro|rw]`. Named
+/// volumes and colon-containing paths are not accepted; this keeps parsing
+/// unambiguous and avoids accidentally treating a registry-style volume name
+/// as a host path.
+pub fn parse_bind(value: &str) -> Result<BindMount, String> {
+    let mut parts = value.split(':');
+    let Some(host) = parts.next() else {
+        return Err("-v: HOST:CONTAINER is required".to_string());
+    };
+    let Some(container) = parts.next() else {
+        return Err(format!("-v: HOST:CONTAINER is required ('{value}')"));
+    };
+    let mode = parts.next().unwrap_or("rw");
+    if parts.next().is_some() {
+        return Err(format!(
+            "-v: unsupported volume '{value}' (colon-containing paths are not supported)"
+        ));
+    }
+    let readonly = match mode {
+        "" | "rw" => false,
+        "ro" => true,
+        other => return Err(format!("-v: unsupported mode '{other}' (rw|ro)")),
+    };
+    if !host.starts_with('/') {
+        return Err(format!("-v: host path '{host}' must be absolute"));
+    }
+    if !container.starts_with('/') {
+        return Err(format!("-v: container path '{container}' must be absolute"));
+    }
+    if container == "/" {
+        return Err("-v: refusing to mount over the container root".to_string());
+    }
+    if !Path::new(container)
+        .components()
+        .skip(1)
+        .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "-v: container path '{container}' must be absolute without '.' or '..'"
+        ));
+    }
+    let source = std::fs::canonicalize(host)
+        .map_err(|e| format!("-v: host path '{host}' does not exist: {e}"))?;
+    let meta = std::fs::metadata(&source)
+        .map_err(|e| format!("-v: host path '{host}' is not accessible: {e}"))?;
+    if !meta.is_dir() && !meta.is_file() {
+        return Err(format!(
+            "-v: host path '{host}' must be a regular file or directory"
+        ));
+    }
+    Ok(BindMount {
+        source,
+        target: PathBuf::from(container),
+        readonly,
+    })
+}
+
 pub struct RootfsConfig<'a> {
     /// Directory to pivot into (== overlay.merged when an overlay is used).
     pub rootfs: &'a Path,
@@ -48,6 +115,8 @@ pub struct RootfsConfig<'a> {
     pub rootless: bool,
     /// When set, first make `rootfs` a writable overlay whose lower is read-only.
     pub overlay: Option<&'a OverlayPaths>,
+    /// Host bind mounts, established while the host root is still reachable.
+    pub volumes: &'a [BindMount],
 }
 
 /// Full root migration + pseudo-filesystem assembly, run by the child inside the
@@ -64,6 +133,11 @@ pub fn setup_rootfs(cfg: &RootfsConfig) -> ZResult<()> {
     if let Some(ovl) = cfg.overlay {
         setup_overlay(cfg.rootless, ovl)?;
     }
+
+    // 1c. Bind volumes while host paths are still reachable. Mounts created
+    //     under the rootfs move with it through the recursive self-bind/pivot.
+    mount_volumes(cfg.rootless, cfg.rootfs, cfg.volumes)?;
+    trace::mark("child:mount:volumes-ok");
 
     // 2. The new root must itself be a mount point: recursive bind onto itself.
     let rootfs_str = cfg.rootfs.to_string_lossy().to_string();
@@ -91,6 +165,74 @@ pub fn setup_rootfs(cfg: &RootfsConfig) -> ZResult<()> {
     }
     trace::mark("child:mount:done");
     Ok(())
+}
+
+/// Bind a host file or directory into the new root. The target path is checked
+/// component-by-component so a malicious image cannot use a symlink to make a
+/// bind land outside the rootfs.
+fn mount_volumes(rootless: bool, rootfs: &Path, volumes: &[BindMount]) -> ZResult<()> {
+    for volume in volumes {
+        let target = safe_target(rootfs, &volume.target)?;
+        if let Some(parent) = target.parent() {
+            syscalls::mkdir_p(parent, 0o755)?;
+        }
+        let source = &volume.source;
+        let meta = std::fs::metadata(source)
+            .map_err(|e| crate::zerr!("stat volume source {}: {e}", source.display()))?;
+        if meta.is_dir() {
+            syscalls::mkdir_p(&target, 0o755)?;
+        } else if !target.exists() {
+            std::fs::write(&target, b"")
+                .map_err(|e| crate::zerr!("create volume mount point {}: {e}", target.display()))?;
+        }
+        // Some hardened user namespaces reject recursive bind mounts; plain
+        // binds cover the normal host directory/file volume case.
+        let flags = if rootless { MS_BIND } else { MS_BIND | MS_REC };
+        syscalls::mount(
+            Some(&source.to_string_lossy()),
+            target.to_string_lossy(),
+            None,
+            flags,
+            None,
+        )?;
+        if volume.readonly {
+            syscalls::mount(
+                None,
+                target.to_string_lossy(),
+                None,
+                MS_BIND | MS_REMOUNT | MS_RDONLY,
+                None,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Convert an absolute container path to a safe path under `rootfs`.
+fn safe_target(rootfs: &Path, target: &Path) -> ZResult<PathBuf> {
+    let mut cur = rootfs.to_path_buf();
+    for comp in target.components().skip(1) {
+        match comp {
+            std::path::Component::Normal(c) => {
+                cur.push(c);
+                if let Ok(md) = std::fs::symlink_metadata(&cur) {
+                    if md.file_type().is_symlink() {
+                        return Err(crate::zerr!(
+                            "refusing volume target {}: intermediate symlink escapes the rootfs",
+                            target.display()
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(crate::zerr!(
+                    "invalid volume target {} (use an absolute path without '..')",
+                    target.display()
+                ))
+            }
+        }
+    }
+    Ok(cur)
 }
 
 /// Mount the per-container overlay (or copy the lower up as a fallback).
@@ -335,4 +477,36 @@ pub fn bind_file_into(src_on_host: &Path, target_in_root: &str) -> ZResult<()> {
         MS_BIND,
         None,
     )
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+
+    fn temp_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("zerun-bind-{}-{name}", std::process::id()));
+        fsutil::remove_dir_all_quiet(&dir);
+        dir
+    }
+
+    #[test]
+    fn parse_bind_accepts_files_and_modes() {
+        let root = temp_path("parse");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let host = std::fs::canonicalize(root.join("src")).unwrap();
+        let bind = parse_bind(&format!("{}:/mnt/data:ro", host.display())).unwrap();
+        assert_eq!(bind.source, host);
+        assert_eq!(bind.target, PathBuf::from("/mnt/data"));
+        assert!(bind.readonly);
+        fsutil::remove_dir_all_quiet(&root);
+    }
+
+    #[test]
+    fn parse_bind_rejects_ambiguous_or_unsafe_paths() {
+        assert!(parse_bind("data:/mnt").is_err());
+        assert!(parse_bind("/tmp:mnt").is_err());
+        assert!(parse_bind("/tmp:/../etc").is_err());
+        assert!(parse_bind("/tmp:/tmp:ro:extra").is_err());
+        assert!(parse_bind("/tmp:/tmp:bad").is_err());
+    }
 }
