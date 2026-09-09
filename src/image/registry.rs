@@ -84,15 +84,6 @@ impl RegistryClient {
         let scope = format!("repository:{repo}:pull");
         for _ in 0..2 {
             let cached = self.tokens.get(&scope).cloned();
-            let mut req = self.agent.get(url).set("User-Agent", USER_AGENT);
-            if let Some(a) = accept {
-                req = req.set("Accept", a);
-            }
-            if let Some(tok) = cached.as_ref() {
-                if now() < tok.expires_at {
-                    req = req.set("Authorization", &tok.authorization);
-                }
-            }
             for attempt in 0..3 {
                 let mut req = self.agent.get(url).set("User-Agent", USER_AGENT);
                 if let Some(a) = accept {
