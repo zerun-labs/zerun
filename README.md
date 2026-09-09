@@ -133,6 +133,27 @@ Detached containers keep no daemon: the per-container reaper is a tiny process t
 disappears when the container exits. If the host crashes (or the reaper is killed), the
 next `ps`/`rm` reconciles the stale record and reclaims host-side resources.
 
+### systemd integration (M6)
+
+Generate a declarative systemd unit from the same arguments you would pass to `run`.
+The unit runs a foreground container, so systemd supervises Zerun, SIGTERM follows the
+normal signal-forwarding path, and failed workloads can be restarted:
+
+```bash
+sudo ./target/release/zerun generate-service \
+  --name web --net bridge -p 18080:80 --init \
+  alpine /bin/sh -c 'while true; do sleep 1; done' \
+  > /etc/systemd/system/zerun-web.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now zerun-web.service
+sudo journalctl -u zerun-web.service -f
+```
+
+Use `--init` with services whose SIGTERM handling matters. For a rootless container,
+generate the unit as that user, install it under `~/.config/systemd/user/`, and use
+`systemctl --user enable --now`. `generate-service` rejects `-d`/`--rm` because systemd
+owns lifecycle and restart semantics.
+
 ### Legacy rootfs mode (M1/M2)
 
 Run a command inside a plain unpacked rootfs directory (no image engine):

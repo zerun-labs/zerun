@@ -21,6 +21,7 @@ mod network;
 mod nfnetlink;
 mod seccomp;
 mod security;
+mod service;
 mod state;
 mod store;
 mod syscalls;
@@ -51,6 +52,7 @@ fn main() {
         Some("pull") => cmd_pull(&args[2..]),
         Some("images") => cmd_images(&args[2..]),
         Some("rmi") => cmd_rmi(&args[2..]),
+        Some("generate-service") => cmd_generate_service(&args[2..]),
         Some("doctor") => cmd_doctor(),
         Some("__init") => {
             // Internal re-exec entry: __init [--] <cmd...>
@@ -976,6 +978,27 @@ fn cmd_rmi(args: &[String]) -> i32 {
     }
 }
 
+fn cmd_generate_service(args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "--help") {
+        service::print_usage();
+        return 0;
+    }
+    let a = match parse_run_args(args) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("zerun generate-service: {e}");
+            return 2;
+        }
+    };
+    match service::generate(&a, &mut std::io::stdout().lock()) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("zerun generate-service: {e}");
+            1
+        }
+    }
+}
+
 fn cmd_doctor() -> i32 {
     println!("== Zerun environment doctor ==");
     unsafe {
@@ -1676,6 +1699,7 @@ USAGE:\n  \
   zerun pull [--platform ...] IMAGE...   pull OCI images (Docker Hub, mirrors)\n  \
   zerun images                           list local images\n  \
   zerun rmi IMAGE...                     remove local images\n  \
+  zerun generate-service [opts] IMAGE    write a systemd unit to stdout\n  \
   zerun doctor                           environment diagnostics\n\
 \n\
 RUN OPTIONS:\n  \
