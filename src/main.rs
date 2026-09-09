@@ -117,6 +117,10 @@ struct RunArgs {
     seccomp: SeccompMode,
     no_overlay: bool,
     tmpfs_upper: bool,
+    /// `--read-only`: remount the container root read-only before exec.
+    readonly: bool,
+    /// `--tmpfs PATH[:opts]`: extra in-container tmpfs mounts.
+    tmpfs: Vec<mounts::TmpfsMount>,
     platform: Option<String>,
     env: Vec<String>,
     ports: Vec<network::PublishedPort>,
@@ -221,6 +225,14 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             "--tmpfs-upper" => {
                 a.tmpfs_upper = true;
                 i += 1;
+            }
+            "--read-only" => {
+                a.readonly = true;
+                i += 1;
+            }
+            "--tmpfs" => {
+                let v = next_value(args, &mut i, "--tmpfs")?;
+                a.tmpfs.push(mounts::parse_tmpfs(&v)?);
             }
             "--platform" => {
                 a.platform = Some(next_value(args, &mut i, "--platform")?);
@@ -573,6 +585,8 @@ fn cmd_run(args: &[String]) -> i32 {
         user,
         ports: a.ports,
         volumes: a.volumes,
+        readonly: a.readonly,
+        tmpfs: a.tmpfs,
         // Allocated from the file IPAM inside run_container (bridge mode).
         bridge_ip: None,
         run_root: store.run_root().to_path_buf(),
@@ -856,6 +870,12 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     }
     if a.tmpfs_upper {
         args.push("--tmpfs-upper".to_string());
+    }
+    if a.readonly {
+        args.push("--read-only".to_string());
+    }
+    for t in &a.tmpfs {
+        args.extend(["--tmpfs".to_string(), t.raw.clone()]);
     }
     if let Some(v) = &a.platform {
         args.extend(["--platform".to_string(), v.clone()]);
@@ -2999,7 +3019,9 @@ RUN OPTIONS:\n  \
   --platform os/arch[/variant]  pull/run a specific platform\n  \
   -e, --env NAME[=VALUE]  set a container environment variable (image mode)\n  \
   --no-overlay        pivot directly into the rootfs (no writable upper layer)\n  \
-  --tmpfs-upper       keep the overlay writable layer in tmpfs (not committable)\n\
+  --tmpfs-upper       keep the overlay writable layer in tmpfs (not committable)\n  \
+  --read-only         remount the container root read-only before exec\n  \
+  --tmpfs PATH[:opts]  mount an in-container tmpfs (size=/mode=/ro, repeatable)\n\
 \n\
 ENV:\n  \
   ZERUN_TRACE=1   print per-stage nanosecond timings to stderr (bench harness)\n  \
@@ -3089,6 +3111,31 @@ mod tests {
         let (u, w) = resolve_image_user(None, Some("root:root"), true);
         assert_eq!(u.as_deref(), Some("root:root"));
         assert!(w.is_none());
+    }
+
+    #[test]
+    fn parses_and_captures_readonly_and_tmpfs_flags() {
+        let args: Vec<_> = [
+            "--read-only",
+            "--tmpfs",
+            "/scratch:size=16m",
+            "--tmpfs",
+            "/run/shm:ro",
+            "alpine",
+            "sh",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_run_args(&args).expect("flags");
+        assert!(a.readonly);
+        assert_eq!(a.tmpfs.len(), 2);
+        assert_eq!(a.tmpfs[0].data, "size=16m");
+        assert!(a.tmpfs[1].readonly);
+        let launch = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+        assert!(launch.contains(&"--read-only".to_string()));
+        assert!(launch.contains(&"/scratch:size=16m".to_string()));
+        assert!(launch.contains(&"/run/shm:ro".to_string()));
     }
 
     #[test]

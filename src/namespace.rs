@@ -17,7 +17,10 @@
 //! and returns final cgroup metrics before cleanup.
 use crate::cgroup::{CgroupV2, ResourceLimits};
 use crate::error::ZResult;
-use crate::mounts::{setup_rootfs, BindMount, OverlayPaths, RootfsConfig};
+use crate::mounts::{
+    make_root_readonly, mount_extra_tmpfs, setup_rootfs, BindMount, OverlayPaths, RootfsConfig,
+    TmpfsMount,
+};
 use crate::seccomp::SeccompMode;
 use crate::security;
 use crate::state::ContainerMetrics;
@@ -65,6 +68,11 @@ pub struct RunSpec {
     /// "1000:1000". None keeps the root user (mapped to the host user in
     /// rootless mode).
     pub user: Option<String>,
+    /// Remount the container root read-only before exec (`--read-only`);
+    /// separate volume/tmpfs mounts stay writable.
+    pub readonly: bool,
+    /// Extra in-container tmpfs mounts (`--tmpfs PATH[:opts]`).
+    pub tmpfs: Vec<TmpfsMount>,
     /// TCP ports published on the host (`-p HOST:CONTAINER`); only valid with
     /// `NetMode::Bridge`. Served by the built-in userland proxy in network.rs.
     pub ports: Vec<crate::network::PublishedPort>,
@@ -428,6 +436,10 @@ fn child_stage(
     //     (--no-overlay) we would mutate the caller's rootfs, so we skip.
     write_etc_hosts(spec);
 
+    // 1c. Extra `--tmpfs` mounts, after pivot: they are separate writable
+    //     mounts that survive a `--read-only` root.
+    mount_extra_tmpfs(identity.rootless, &spec.tmpfs)?;
+
     // 2. Network inside the container netns (before capability drop, which
     //    would remove the CAP_NET_ADMIN needed to configure eth0).
     match spec.net {
@@ -452,6 +464,14 @@ fn child_stage(
                 syscalls::close(fd);
             }
         }
+    }
+
+    // 2b. `--read-only`: remount the root read-only after every setup write
+    //     (/etc/hosts, tmpfs mounts) but *before* the capability drop, which
+    //     removes the CAP_SYS_ADMIN a remount needs. Separate volume/tmpfs
+    //     mounts stay writable.
+    if spec.readonly {
+        make_root_readonly(identity.rootless)?;
     }
 
     // 3. Security hardening: no_new_privs -> capability drop -> seccomp profile.

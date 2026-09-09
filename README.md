@@ -160,6 +160,9 @@ Run options (current subset):
                      bind-mount an existing host file/directory into the container
 --no-overlay        pivot directly into the rootfs (no writable upper layer)
 --tmpfs-upper       keep the overlay writable layer in tmpfs (not committable)
+--read-only         remount the container root read-only before exec
+--tmpfs PATH[:opts] mount an in-container tmpfs (size=/mode=/ro, repeatable; pairs
+                    naturally with --read-only for /tmp-like scratch space)
 ```
 
 `ZERUN_REGISTRY_MIRRORS` (comma-separated), a zerun config file

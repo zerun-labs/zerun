@@ -109,6 +109,162 @@ pub fn parse_bind(value: &str) -> Result<BindMount, String> {
     })
 }
 
+/// A per-container tmpfs mount requested with `--tmpfs PATH[:opts]`.
+/// `raw` keeps the operator's exact spelling so `restart` / `generate-service`
+/// can reproduce the launch arguments verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmpfsMount {
+    /// Absolute container path (no `.`/`..` components).
+    pub target: PathBuf,
+    /// Mount data (e.g. "size=16m,mode=1777"); empty for kernel defaults.
+    pub data: String,
+    /// Mount the tmpfs read-only.
+    pub readonly: bool,
+    /// The original `--tmpfs` argument.
+    pub raw: String,
+}
+
+/// Parse Docker-style `--tmpfs PATH[:opts]`. Options are comma-separated
+/// `key=value` pairs; `size` accepts K/M/G suffixes and `mode` an octal value.
+/// Anything else is rejected so a typo fails loudly instead of silently
+/// mounting a tmpfs the operator did not ask for.
+pub fn parse_tmpfs(value: &str) -> Result<TmpfsMount, String> {
+    let (path, opts) = match value.split_once(':') {
+        Some((p, o)) if !o.is_empty() => (p, Some(o)),
+        _ => (value, None),
+    };
+    if !path.starts_with('/') {
+        return Err(format!("--tmpfs: container path '{path}' must be absolute"));
+    }
+    if !Path::new(path)
+        .components()
+        .skip(1)
+        .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "--tmpfs: container path '{path}' must be absolute without '.' or '..'"
+        ));
+    }
+    if path == "/" {
+        return Err("--tmpfs: refusing to mount over the container root".to_string());
+    }
+
+    let mut data = String::new();
+    let mut readonly = false;
+    if let Some(opts) = opts {
+        for opt in opts.split(',') {
+            if opt.is_empty() {
+                continue;
+            }
+            if opt == "ro" {
+                readonly = true;
+                continue;
+            }
+            if opt == "rw" {
+                readonly = false;
+                continue;
+            }
+            let Some((key, val)) = opt.split_once('=') else {
+                return Err(format!(
+                    "--tmpfs: unsupported option '{opt}' (key=value expected)"
+                ));
+            };
+            match key {
+                "size" => {
+                    if !valid_size_suffix(val) {
+                        return Err(format!(
+                            "--tmpfs: invalid size '{val}' (K/M/G suffix required)"
+                        ));
+                    }
+                    push_opt(&mut data, "size", val);
+                }
+                "mode" => {
+                    let parsed = u32::from_str_radix(val.trim_start_matches("0o"), 8)
+                        .map_err(|_| format!("--tmpfs: invalid mode '{val}' (octal expected)"))?;
+                    if parsed > 0o7777 {
+                        return Err(format!("--tmpfs: invalid mode '{val}' (max 7777)"));
+                    }
+                    push_opt(&mut data, "mode", &format!("{parsed:o}"));
+                }
+                other => {
+                    return Err(format!("--tmpfs: unsupported option '{other}'"));
+                }
+            }
+        }
+    }
+    Ok(TmpfsMount {
+        target: PathBuf::from(path),
+        data,
+        readonly,
+        raw: value.to_string(),
+    })
+}
+
+fn valid_size_suffix(v: &str) -> bool {
+    let digits = v
+        .strip_suffix(|c: char| matches!(c, 'k' | 'K' | 'm' | 'M' | 'g' | 'G'))
+        .unwrap_or(v);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn push_opt(data: &mut String, key: &str, value: &str) {
+    if !data.is_empty() {
+        data.push(',');
+    }
+    data.push_str(key);
+    data.push('=');
+    data.push_str(value);
+}
+
+/// Mount the operator's `--tmpfs` requests inside the container root (called
+/// after pivot_root). Explicitly requested mounts are strict when rootful; a
+/// restricted rootless host degrades with a warning, matching the pseudo-fs
+/// setup above.
+pub fn mount_extra_tmpfs(rootless: bool, mounts: &[TmpfsMount]) -> ZResult<()> {
+    for m in mounts {
+        syscalls::mkdir_p(&m.target, 0o1777)?;
+        let mut flags = MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME;
+        if m.readonly {
+            flags |= MS_RDONLY;
+        }
+        let data = if m.data.is_empty() {
+            "mode=1777"
+        } else {
+            m.data.as_str()
+        };
+        require_or_warn(
+            rootless,
+            syscalls::mount(
+                Some("tmpfs"),
+                m.target.to_string_lossy(),
+                Some("tmpfs"),
+                flags,
+                Some(data),
+            ),
+            &format!("--tmpfs {}", m.raw),
+        )?;
+    }
+    Ok(())
+}
+
+/// Remount the container root read-only (`--read-only`). Called after every
+/// setup write (/etc/hosts, resolv.conf) so the workload starts on a read-only
+/// root; bind volumes and tmpfs mounts stay writable (separate mounts).
+pub fn make_root_readonly(rootless: bool) -> ZResult<()> {
+    let res = syscalls::mount(None, "/", None, MS_BIND | MS_REMOUNT | MS_RDONLY, None)
+        .or_else(|_| syscalls::mount(None, "/", None, MS_REMOUNT | MS_RDONLY, None));
+    match res {
+        Ok(()) => Ok(()),
+        Err(e) if rootless => {
+            eprintln!(
+                "zerun: warn: --read-only could not be enforced rootless ({e}); continuing read-write"
+            );
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 pub struct RootfsConfig<'a> {
     /// Directory to pivot into (== overlay.merged when an overlay is used).
     pub rootfs: &'a Path,
@@ -529,5 +685,37 @@ mod bind_tests {
         assert!(parse_bind("/tmp:/../etc").is_err());
         assert!(parse_bind("/tmp:/tmp:ro:extra").is_err());
         assert!(parse_bind("/tmp:/tmp:bad").is_err());
+    }
+
+    #[test]
+    fn parse_tmpfs_accepts_paths_and_options() {
+        let plain = parse_tmpfs("/scratch").unwrap();
+        assert_eq!(plain.target, PathBuf::from("/scratch"));
+        assert!(plain.data.is_empty());
+        assert!(!plain.readonly);
+        assert_eq!(plain.raw, "/scratch");
+
+        let sized = parse_tmpfs("/scratch:size=16m,mode=0700,ro").unwrap();
+        assert_eq!(sized.target, PathBuf::from("/scratch"));
+        assert_eq!(sized.data, "size=16m,mode=700");
+        assert!(sized.readonly);
+        assert_eq!(sized.raw, "/scratch:size=16m,mode=0700,ro");
+
+        let rw = parse_tmpfs("/tmp:size=64M,ro,rw").unwrap();
+        assert!(!rw.readonly);
+    }
+
+    #[test]
+    fn parse_tmpfs_rejects_unsafe_or_unknown_options() {
+        assert!(parse_tmpfs("scratch").is_err());
+        assert!(parse_tmpfs("/a/../b").is_err());
+        assert!(parse_tmpfs("/").is_err());
+        assert!(parse_tmpfs("/x:size=abc").is_err());
+        assert_eq!(parse_tmpfs("/x:size=64m").unwrap().data, "size=64m");
+        assert_eq!(parse_tmpfs("/x:size=64").unwrap().data, "size=64");
+        assert!(parse_tmpfs("/x:mode=99").is_err());
+        assert!(parse_tmpfs("/x:mode=8888").is_err());
+        assert!(parse_tmpfs("/x:nosuid").is_err());
+        assert!(parse_tmpfs("/x:size=1m:extra").is_err());
     }
 }

@@ -123,6 +123,13 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
     if a.tmpfs_upper {
         run_args.push("--tmpfs-upper".into());
     }
+    if a.readonly {
+        run_args.push("--read-only".into());
+    }
+    for t in &a.tmpfs {
+        run_args.push("--tmpfs".into());
+        run_args.push(t.raw.clone());
+    }
     if let Some(v) = &a.platform {
         run_args.push("--platform".into());
         run_args.push(v.clone());
