@@ -28,13 +28,18 @@
 //! the container, so they disappear with the run.
 //!
 //! IPv4 address allocation is deterministic from the container id (no daemon,
-//! no shared state). A file-based IPAM bitmap is planned together with the M5
-//! lifecycle work, where persistent state first exists.
+//! no shared state) and serialized in a file-based IPAM under
+//! `<run>/net/ipam.json` guarded by an flock (M5): a container's deterministic
+//! slot is tried first, occupied slots are skipped, and records are released
+//! on exit — or reclaimed by `ps`/`rm` crash reconcile when the owner died.
 
 use crate::error::ZResult;
 use crate::netlink::Netlink;
 use crate::nfnetlink::{NatConfig, Nftables};
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
+use std::path::Path;
 use std::thread;
 
 /// One TCP port publish: host port -> container port.
@@ -55,6 +60,18 @@ pub struct HostNet {
     veth_name: String,
     /// nft table holding this container's NAT rules.
     table: String,
+}
+
+impl HostNet {
+    /// veth host-end name (used for crash reconcile bookkeeping).
+    pub fn veth_name(&self) -> &str {
+        &self.veth_name
+    }
+
+    /// nft table name holding this container's egress NAT.
+    pub fn table(&self) -> &str {
+        &self.table
+    }
 }
 
 /// One listening host port forwarded to the container (userland `-p` proxy).
@@ -143,10 +160,96 @@ pub fn container_ip(id: &str) -> Ipv4Addr {
     Ipv4Addr::new(10, 88, 0, host as u8)
 }
 
+// --- file-based IPAM (M5) ------------------------------------------------------
+//
+// Bridge addresses are handed out from a file under `<run>/net/ipam.json`,
+// guarded by an flock on `<run>/net/ipam.lock`. The deterministic
+// `container_ip` slot is tried first (so a single container keeps a stable,
+// debuggable address); occupied slots are skipped. Concurrent `run`/`ps`
+// invocations serialize on the lock; a crashed run leaves a stale record that
+// `ps` reconcile / `doctor` reclaims (a record whose container id has no
+// running state).
+
+fn ipam_file(run_root: &Path) -> std::path::PathBuf {
+    run_root.join("net").join("ipam.json")
+}
+
+fn ipam_lock(run_root: &Path) -> std::path::PathBuf {
+    run_root.join("net").join("ipam.lock")
+}
+
+fn read_ipam(path: &Path) -> BTreeMap<String, Ipv4Addr> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn write_ipam(path: &Path, map: &BTreeMap<String, Ipv4Addr>) -> ZResult<()> {
+    let json = serde_json::to_vec_pretty(map).map_err(|e| crate::zerr!("serialize ipam: {e}"))?;
+    crate::fsutil::atomic_write(path, &json)
+}
+
+/// Acquire an exclusive advisory lock on the IPAM file (blocking).
+fn lock_ipam(run_root: &Path) -> std::io::Result<std::fs::File> {
+    let lock = ipam_lock(run_root);
+    if let Some(dir) = lock.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock)?;
+    // LOCK_EX on the whole file; released on drop/close.
+    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(f)
+}
+
+/// Allocate this container's bridge IP (idempotent per id).
+pub fn allocate_ip(run_root: &Path, id: &str) -> ZResult<Ipv4Addr> {
+    let _guard = lock_ipam(run_root).map_err(|e| crate::zerr!("ipam lock: {e}"))?;
+    let path = ipam_file(run_root);
+    let mut map = read_ipam(&path);
+    if let Some(ip) = map.get(id) {
+        return Ok(*ip);
+    }
+    let preferred = container_ip(id);
+    let taken: Vec<Ipv4Addr> = map.values().copied().collect();
+    let ip = if !taken.contains(&preferred) {
+        preferred
+    } else {
+        (2u16..=254)
+            .map(|h| Ipv4Addr::new(10, 88, 0, h as u8))
+            .find(|cand| !taken.contains(cand))
+            .ok_or_else(|| crate::zerr!("bridge subnet 10.88.0.0/24 exhausted"))?
+    };
+    map.insert(id.to_string(), ip);
+    write_ipam(&path, &map)?;
+    Ok(ip)
+}
+
+/// Release this container's bridge IP (best effort; idempotent).
+pub fn release_ip(run_root: &Path, id: &str) {
+    let Ok(_guard) = lock_ipam(run_root) else {
+        return;
+    };
+    let path = ipam_file(run_root);
+    let mut map = read_ipam(&path);
+    if map.remove(id).is_none() {
+        return;
+    }
+    let _ = write_ipam(&path, &map);
+}
+
 /// Host side: ensure the bridge, create the veth pair, move the peer into the
 /// child's netns, attach the host end to the bridge and install the
 /// per-container egress-NAT table.
-pub fn setup_host_side(id: &str, child_pid: i32) -> ZResult<HostNet> {
+pub fn setup_host_side(id: &str, child_pid: i32, ip: Ipv4Addr) -> ZResult<HostNet> {
     let nl = Netlink::new()?;
     let bridge = nl.ensure_bridge(BRIDGE_NAME)?;
     nl.ensure_address(bridge, GATEWAY_IP, SUBNET_PREFIX)?;
@@ -171,7 +274,7 @@ pub fn setup_host_side(id: &str, child_pid: i32) -> ZResult<HostNet> {
     let nft = Nftables::new()?;
     let cfg = NatConfig {
         table: &table,
-        container_ip: container_ip(id),
+        container_ip: ip,
     };
     nft.install_nat(&cfg)?;
 
@@ -184,7 +287,7 @@ pub fn setup_host_side(id: &str, child_pid: i32) -> ZResult<HostNet> {
 /// Child side (inside the fresh netns, after the net-ready signal): rename the
 /// peer to `eth0`, bring loopback and eth0 up, assign the address and default
 /// route.
-pub fn setup_container_side(id: &str) -> ZResult<()> {
+pub fn setup_container_side(id: &str, ip: Ipv4Addr) -> ZResult<()> {
     let nl = Netlink::new()?;
     let peer = peer_name(id);
     let idx = nl
@@ -197,7 +300,6 @@ pub fn setup_container_side(id: &str) -> ZResult<()> {
         nl.link_up(lo)?;
     }
 
-    let ip = container_ip(id);
     nl.ensure_address(idx, ip, SUBNET_PREFIX)?;
     nl.add_default_route(GATEWAY_IP, idx)?;
     Ok(())
@@ -211,22 +313,26 @@ pub fn setup_container_side(id: &str) -> ZResult<()> {
 /// (e.g. after an unclean kill). Both steps are best-effort and never fail the
 /// caller.
 pub fn teardown_host_side(net: &HostNet) {
+    teardown_named(&net.veth_name, &net.table);
+}
+
+/// Best-effort removal of a container's host-side leftovers by name. Used by
+/// normal teardown and by crash reconcile (`ze ps`, `ze rm -f`) where the
+/// reaper died before it could clean up.
+pub fn teardown_named(veth: &str, table: &str) {
     if let Ok(nft) = Nftables::new() {
-        nft.remove_table(&net.table);
+        nft.remove_table(table);
     }
     let nl = match Netlink::new() {
         Ok(nl) => nl,
         Err(_) => return,
     };
-    let index = match nl.link_index(&net.veth_name) {
+    let index = match nl.link_index(veth) {
         Ok(Some(i)) => i,
         _ => return, // already gone with the container netns
     };
     if let Err(e) = nl.delete_link(index) {
-        eprintln!(
-            "zerun: warn: failed to remove veth {} ({}): {e}",
-            net.veth_name, index
-        );
+        eprintln!("zerun: warn: failed to remove veth {veth} ({index}): {e}");
     }
 }
 

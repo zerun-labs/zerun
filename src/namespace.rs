@@ -10,6 +10,10 @@
 //! netns, then signals the child over the net-ready pipe (0 = ready, 1 + text =
 //! host-side failure). The child configures `eth0` only after the signal, so
 //! networking is up before the workload starts.
+//!
+//! `run_container_with_hook` exposes the moment the workload has exec'd
+//! (`StartedInfo`) so the detached reaper (src/lifecycle.rs) can persist
+//! "running" state and release the foreground CLI at exactly the right time.
 use crate::cgroup::{CgroupV2, ResourceLimits};
 use crate::error::ZResult;
 use crate::mounts::{setup_rootfs, OverlayPaths, RootfsConfig};
@@ -52,9 +56,14 @@ pub struct RunSpec {
     /// Working directory inside the container (None = "/").
     pub cwd: Option<String>,
     /// TCP ports published on the host (`-p HOST:CONTAINER`); only valid with
-    /// `NetMode::Bridge`, where each port becomes a PREROUTING + OUTPUT DNAT
-    /// rule in the container's nft table.
+    /// `NetMode::Bridge`. Served by the built-in userland proxy in network.rs.
     pub ports: Vec<crate::network::PublishedPort>,
+    /// Bridge IPv4 assigned by the parent from the file IPAM (set before
+    /// clone; consumed by both host-side NAT and the child's eth0 config).
+    pub bridge_ip: Option<std::net::Ipv4Addr>,
+    /// Runtime root of the active store (`/run/zerun` etc.), used by the
+    /// parent for IPAM bookkeeping.
+    pub run_root: PathBuf,
 }
 
 static TARGET_CHILD: AtomicI32 = AtomicI32::new(0);
@@ -68,8 +77,32 @@ extern "C" fn forward_to_child(sig: libc::c_int) {
     }
 }
 
-/// Full run path. Returns the workload exit code.
+/// What the parent knows once the container workload has exec'd.
+pub struct StartedInfo {
+    pub pid: i32,
+    /// Bridge IP of the container (net == bridge).
+    pub ip: Option<std::net::Ipv4Addr>,
+    /// Egress-NAT nft table name (crash reconcile).
+    pub table: Option<String>,
+    /// veth host-end name (crash reconcile).
+    pub veth: Option<String>,
+    /// cgroup v2 directory path (when limits were configured).
+    pub cgroup: Option<String>,
+}
+
+/// Full run path without a lifecycle hook. Returns the workload exit code.
 pub fn run_container(spec: RunSpec) -> ZResult<i32> {
+    run_container_with_hook(spec, |_| {})
+}
+
+/// Full run path. `on_started` fires in the parent exactly when the child has
+/// exec'd the workload (error-pipe EOF), before the parent blocks on waitpid;
+/// detached mode uses it to persist state and release the foreground CLI.
+/// Returns the workload exit code.
+pub fn run_container_with_hook<F>(spec: RunSpec, on_started: F) -> ZResult<i32>
+where
+    F: FnOnce(&StartedInfo),
+{
     trace::init();
     trace::mark("parent:begin");
 
@@ -103,15 +136,22 @@ pub fn run_container(spec: RunSpec) -> ZResult<i32> {
              run rootful, or use --net none / --net host"
         ));
     }
-    // Published ports are served by userland proxies bound before the clone:
-    // a busy port must abort the run before any container work happens. The
-    // proxies live as long as this parent waits on the container (foreground
-    // CLI or detached reaper) and die with it.
-    let _port_proxies = if matches!(spec.net, NetMode::Bridge) && !spec.ports.is_empty() {
-        Some(crate::network::bind_port_proxies(
-            crate::network::container_ip(&spec.id),
-            &spec.ports,
-        )?)
+    // Bridge mode: claim this container's IP from the file IPAM first (a
+    // concurrent run may hold our deterministic slot), then bind the `-p`
+    // userland proxies. Both happen before the clone so that IP exhaustion or
+    // a busy host port abort the run before any container work happens.
+    let mut spec = spec;
+    spec.bridge_ip = if matches!(spec.net, NetMode::Bridge) {
+        Some(crate::network::allocate_ip(&spec.run_root, &spec.id)?)
+    } else {
+        None
+    };
+    let _port_proxies = if let (NetMode::Bridge, Some(ip)) = (spec.net, spec.bridge_ip) {
+        if !spec.ports.is_empty() {
+            Some(crate::network::bind_port_proxies(ip, &spec.ports)?)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -152,7 +192,7 @@ pub fn run_container(spec: RunSpec) -> ZResult<i32> {
     let mut host_net: Option<crate::network::HostNet> = None;
     if let Some((net_r, net_w)) = net_sync {
         syscalls::close(net_r); // the parent never reads the net-ready pipe
-        let msg = match crate::network::setup_host_side(&spec.id, pid) {
+        let msg = match crate::network::setup_host_side(&spec.id, pid, spec.bridge_ip.unwrap()) {
             Ok(net) => {
                 host_net = Some(net);
                 vec![0]
@@ -194,9 +234,21 @@ pub fn run_container(spec: RunSpec) -> ZResult<i32> {
         if let Some(cg) = cg {
             cg.cleanup();
         }
+        release_bridge_ip(&spec);
         return Ok(1);
     }
     trace::mark("parent:child-execved");
+
+    // Lifecycle hook: the workload is up (or about to be); detached mode
+    // persists "running" state and releases the `run -d` CLI here.
+    let started = StartedInfo {
+        pid,
+        ip: spec.bridge_ip,
+        table: host_net.as_ref().map(|n| n.table().to_string()),
+        veth: host_net.as_ref().map(|n| n.veth_name().to_string()),
+        cgroup: cg.as_ref().map(|c| c.path().display().to_string()),
+    };
+    on_started(&started);
 
     let code = wait_pid(pid)?;
     if let Some(net) = &host_net {
@@ -205,8 +257,16 @@ pub fn run_container(spec: RunSpec) -> ZResult<i32> {
     if let Some(cg) = cg {
         cg.cleanup();
     }
+    release_bridge_ip(&spec);
     trace::mark("parent:end");
     Ok(code)
+}
+
+/// Best-effort release of a bridge IP back to the file IPAM.
+fn release_bridge_ip(spec: &RunSpec) {
+    if matches!(spec.net, NetMode::Bridge) {
+        crate::network::release_ip(&spec.run_root, &spec.id);
+    }
 }
 
 fn child_main(
@@ -271,7 +331,10 @@ fn child_stage(
             let fd = net_r.ok_or_else(|| crate::zerr!("bridge mode lost its net-ready pipe"))?;
             net_sync_wait(fd)?;
             syscalls::close(fd);
-            crate::network::setup_container_side(&spec.id)?;
+            let ip = spec
+                .bridge_ip
+                .ok_or_else(|| crate::zerr!("bridge run lost its allocated IP"))?;
+            crate::network::setup_container_side(&spec.id, ip)?;
         }
         NetMode::None => {
             // Bring loopback up so 127.0.0.1 works.

@@ -1,14 +1,18 @@
 //! zerun — daemonless, single-binary Linux container runtime.
 //!
 //! Command surface (Docker-compatible top 20%):
-//!   zerun run [opts] IMAGE [CMD...]     run a container from an OCI image
+//!   zerun run [opts] IMAGE [CMD...]       run a container from an OCI image
 //!   zerun run --rootfs DIR [opts] -- CMD  legacy: run from an unpacked rootfs
-//!   zerun pull / images / rmi           OCI image lifecycle (M3)
-//!   zerun doctor                        environment diagnostics
+//!   zerun run -d [--name N] [opts] IMAGE  run detached (state under /run/zerun)
+//!   zerun ps [-a] / stop / rm / logs / exec   detached-container lifecycle (M5)
+//!   zerun pull / images / rmi             OCI image lifecycle (M3)
+//!   zerun doctor                          environment diagnostics
 mod cgroup;
 mod error;
+mod execc;
 mod fsutil;
 mod image;
+mod lifecycle;
 mod mini_init;
 mod mounts;
 mod namespace;
@@ -17,6 +21,7 @@ mod network;
 mod nfnetlink;
 mod seccomp;
 mod security;
+mod state;
 mod store;
 mod syscalls;
 mod trace;
@@ -28,14 +33,21 @@ use image::PullOptions;
 use mounts::OverlayPaths;
 use namespace::{NetMode, RunSpec};
 use seccomp::SeccompMode;
-use std::path::PathBuf;
+use state::ContainerState;
+use std::path::{Path, PathBuf};
 use std::process::exit;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use store::Store;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let code = match args.get(1).map(|s| s.as_str()) {
         Some("run") => cmd_run(&args[2..]),
+        Some("ps") => cmd_ps(&args[2..]),
+        Some("stop") => cmd_stop(&args[2..]),
+        Some("rm") => cmd_rm(&args[2..]),
+        Some("logs") => cmd_logs(&args[2..]),
+        Some("exec") => cmd_exec(&args[2..]),
         Some("pull") => cmd_pull(&args[2..]),
         Some("images") => cmd_images(&args[2..]),
         Some("rmi") => cmd_rmi(&args[2..]),
@@ -82,6 +94,12 @@ struct RunArgs {
     ports: Vec<network::PublishedPort>,
     dns: Vec<String>,
     argv: Vec<String>,
+    /// `-d/--detach`: fork a reaper and return after the container starts.
+    detach: bool,
+    /// `--name NAME`: assign a human-friendly name (ps/stop/rm/logs/exec).
+    name: Option<String>,
+    /// `--rm`: remove state + overlay automatically when the container exits.
+    rm: bool,
 }
 
 /// Parse `run` arguments. Two invocation styles:
@@ -158,6 +176,17 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 v.parse::<std::net::IpAddr>()
                     .map_err(|_| format!("invalid --dns address '{v}'"))?;
                 a.dns.push(v);
+            }
+            "--detach" | "-d" => {
+                a.detach = true;
+                i += 1;
+            }
+            "--name" => {
+                a.name = Some(next_value(args, &mut i, "--name")?);
+            }
+            "--rm" => {
+                a.rm = true;
+                i += 1;
             }
             "--" => {
                 // Option terminator. Remaining tokens:
@@ -285,6 +314,10 @@ fn cmd_run(args: &[String]) -> i32 {
         return 1;
     }
 
+    // One id per run: used for the HOSTNAME default, the per-run overlay, the
+    // nft table/veth names and the lifecycle state directory.
+    let id = short_id();
+
     // Resolve the container root filesystem and, for image mode, the process
     // environment / working directory / default command from the OCI config.
     let (rootfs, env, cwd, argv) = if let Some(rootfs_str) = &a.rootfs {
@@ -316,8 +349,7 @@ fn cmd_run(args: &[String]) -> i32 {
         };
         match resolve_run_image(&store, &reference, a.platform.as_deref()) {
             Ok((rootfs, cfg)) => {
-                let env =
-                    build_image_env(&cfg.config.env, &a.env, a.hostname.as_deref(), &short_id());
+                let env = build_image_env(&cfg.config.env, &a.env, a.hostname.as_deref(), &id);
                 let argv = resolve_image_argv(&cfg, &a.argv);
                 let cwd = if cfg.config.working_dir.is_empty() {
                     None
@@ -333,7 +365,6 @@ fn cmd_run(args: &[String]) -> i32 {
         }
     };
 
-    let id = short_id();
     let container_fs = if a.no_overlay {
         None
     } else {
@@ -359,6 +390,18 @@ fn cmd_run(args: &[String]) -> i32 {
         None => (rootfs.clone(), None),
     };
 
+    let image_desc = match &a.image {
+        Some(i) => i.clone(),
+        None => format!("rootfs:{}", rootfs.display()),
+    };
+
+    // Where the container actually pivoted to (overlay merged dir or the raw
+    // rootfs), recorded in lifecycle state so `ze exec` can chroot there.
+    let state_rootfs = match &container_fs {
+        Some(fs) => fs.root().display().to_string(),
+        None => fsutil::canonical_or_self(&rootfs).display().to_string(),
+    };
+
     let spec = RunSpec {
         rootfs: pivot_root,
         argv,
@@ -376,8 +419,24 @@ fn cmd_run(args: &[String]) -> i32 {
         env,
         cwd,
         ports: a.ports,
+        // Allocated from the file IPAM inside run_container (bridge mode).
+        bridge_ip: None,
+        run_root: store.run_root().to_path_buf(),
     };
 
+    if a.detach {
+        return run_detached(
+            &store,
+            spec,
+            container_fs,
+            &image_desc,
+            &state_rootfs,
+            a.name,
+            a.rm,
+        );
+    }
+
+    // Foreground: this CLI is the parent and waits for the container.
     let result = namespace::run_container(spec);
     if let Some(fs) = container_fs {
         store.cleanup_container_fs(&fs);
@@ -388,6 +447,177 @@ fn cmd_run(args: &[String]) -> i32 {
             eprintln!("zerun: {e}");
             1
         }
+    }
+}
+
+/// `zerun run -d`: fork a per-container reaper, print the container id once
+/// the workload is up, and exit. Everything container-shaped (clone, wait,
+/// host-resource teardown, overlay cleanup, state updates) happens in the
+/// reaper child (src/lifecycle.rs); it writes `0` / `1:<error>` over the
+/// started pipe so the CLI never reports success for a container that failed
+/// to start.
+fn run_detached(
+    store: &Store,
+    spec: RunSpec,
+    container_fs: Option<store::ContainerFs>,
+    image_desc: &str,
+    state_rootfs: &str,
+    name: Option<String>,
+    rm: bool,
+) -> i32 {
+    use std::os::unix::io::AsRawFd;
+
+    let id = spec.id.clone();
+    if let Some(n) = &name {
+        if state::list(store)
+            .iter()
+            .any(|c| c.name.as_deref() == Some(n))
+        {
+            eprintln!("zerun run: name '{n}' is already in use by another container");
+            return 1;
+        }
+    }
+
+    let sdir = state::ContainerState::dir(store, &id);
+    if let Err(e) = fsutil::mkdir_p(&sdir) {
+        eprintln!("zerun: {e}");
+        return 1;
+    }
+    let log_path = sdir.join("console.log");
+    let log_fd = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&log_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("zerun: open {}: {e}", log_path.display());
+            return 1;
+        }
+    };
+    let env: Vec<String> = spec
+        .env
+        .as_ref()
+        .map(|pairs| pairs.iter().map(|(k, v)| format!("{k}={v}")).collect())
+        .unwrap_or_default();
+    let st = state::ContainerState {
+        version: 1,
+        id: id.clone(),
+        name,
+        image: image_desc.to_string(),
+        pid: None,
+        status: state::Status::Created,
+        exit_code: None,
+        created: state::now_rfc3339(),
+        started: None,
+        finished: None,
+        rootless: unsafe { libc::geteuid() } != 0,
+        net: net_label(spec.net),
+        ports: spec.ports.iter().map(|p| (p.host, p.container)).collect(),
+        ip: None,
+        cmd: spec.argv.clone(),
+        env,
+        cwd: spec.cwd.clone(),
+        log: log_path.display().to_string(),
+        rootfs: state_rootfs.to_string(),
+        overlay: container_fs
+            .as_ref()
+            .map(|fs| fs.dir().display().to_string()),
+        table: None,
+        veth: None,
+        cgroup: None,
+    };
+    if let Err(e) = st.save() {
+        eprintln!("zerun: {e}");
+        return 1;
+    }
+
+    let (started_r, started_w) = match syscalls::pipe2_cloexec() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+
+    // Double purpose of the fork: the reaper becomes the container's parent and
+    // survives this CLI; setsid() detaches it from the terminal so closing the
+    // terminal cannot kill the container.
+    match unsafe { libc::fork() } {
+        -1 => {
+            eprintln!("zerun: fork: {}", std::io::Error::last_os_error());
+            1
+        }
+        0 => {
+            // --- reaper child ---
+            syscalls::close(started_r);
+            unsafe {
+                libc::setsid();
+            }
+            redirect_stdio(log_fd.as_raw_fd());
+            let code = lifecycle::run_detached(store.clone(), spec, container_fs, rm, started_w);
+            unsafe { libc::_exit(code) }
+        }
+        _ => {
+            // --- foreground CLI: wait for the start signal ---
+            syscalls::close(started_w);
+            let mut msg = Vec::new();
+            let mut buf = [0u8; 256];
+            // Read one newline-terminated status line. EOF without a newline
+            // (reaper died before signalling) is treated as the end of the
+            // message. We must not wait for EOF: with --init the container
+            // child never execs, so the write end of this pipe survives in the
+            // container and EOF would only arrive when the container exits.
+            while let Ok(n) = syscalls::read_fd(started_r, &mut buf) {
+                if n == 0 {
+                    break;
+                }
+                msg.extend_from_slice(&buf[..n as usize]);
+                if msg.contains(&b'\n') {
+                    break;
+                }
+            }
+            syscalls::close(started_r);
+            let text = String::from_utf8_lossy(&msg);
+            if text.starts_with("0") {
+                println!("{id}");
+                0
+            } else {
+                let err = text.strip_prefix("1:").unwrap_or(&text).trim();
+                if !err.is_empty() {
+                    eprintln!("zerun: {err}");
+                } else {
+                    eprintln!(
+                        "zerun: container failed to start (see {})",
+                        log_path.display()
+                    );
+                }
+                1
+            }
+        }
+    }
+}
+
+fn net_label(net: NetMode) -> String {
+    match net {
+        NetMode::None => "none".to_string(),
+        NetMode::Host => "host".to_string(),
+        NetMode::Bridge => "bridge".to_string(),
+    }
+}
+
+/// Point stdin at /dev/null and stdout/stderr at `log_fd` (the reaper and the
+/// container it clones inherit these, which is how `ze logs` works).
+fn redirect_stdio(log_fd: std::os::fd::RawFd) {
+    unsafe {
+        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+        if devnull >= 0 {
+            libc::dup2(devnull, 0);
+            libc::close(devnull);
+        }
+        libc::dup2(log_fd, 1);
+        libc::dup2(log_fd, 2);
     }
 }
 
@@ -793,6 +1023,624 @@ fn cmd_doctor() -> i32 {
     0
 }
 
+// ---------------------------------------------------------------------------
+// M5 detached-container lifecycle commands: ps / stop / rm / logs / exec
+// ---------------------------------------------------------------------------
+
+fn cmd_ps(args: &[String]) -> i32 {
+    let mut all = false;
+    for a in args {
+        match a.as_str() {
+            "-a" | "--all" => all = true,
+            "-h" | "--help" => {
+                println!("usage: zerun ps [-a]");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun ps: unknown option {other}");
+                return 2;
+            }
+            other => {
+                eprintln!("zerun ps: unexpected argument '{other}'");
+                return 2;
+            }
+        }
+    }
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for mut st in state::list(&store) {
+        // Crash reconcile: a record that says Running for a dead PID belongs
+        // to a reaper that never got to clean up; mark it exited and reclaim
+        // its host-side resources (nft table, veth, cgroup, IPAM, overlay).
+        if lifecycle::reconcile_stale(&store, &mut st) {
+            let _ = st.save();
+        }
+        if !all && st.status != state::Status::Running {
+            continue;
+        }
+        rows.push(ps_row(&st));
+    }
+    if rows.is_empty() {
+        return 0;
+    }
+    let headers = [
+        "CONTAINER ID".to_string(),
+        "IMAGE".to_string(),
+        "COMMAND".to_string(),
+        "CREATED".to_string(),
+        "STATUS".to_string(),
+        "PORTS".to_string(),
+        "NAMES".to_string(),
+    ];
+    print!("{}", render_table(&headers, &rows));
+    0
+}
+
+fn ps_row(st: &ContainerState) -> Vec<String> {
+    vec![
+        st.id.clone(),
+        st.image.clone(),
+        truncate(&one_line(&st.cmd), 30),
+        format!("{} ago", elapsed_str(&st.created)),
+        ps_status(st),
+        ports_label(&st.ports),
+        st.name.clone().unwrap_or_default(),
+    ]
+}
+
+fn ps_status(st: &ContainerState) -> String {
+    match st.status {
+        state::Status::Running => match &st.started {
+            Some(t) => format!("Up {}", elapsed_str(t)),
+            None => "Up".to_string(),
+        },
+        state::Status::Exited => {
+            let code = st.exit_code.unwrap_or(-1);
+            match &st.finished {
+                Some(t) => format!("Exited ({code}) {} ago", elapsed_str(t)),
+                None => format!("Exited ({code})"),
+            }
+        }
+        state::Status::Created => "Created".to_string(),
+    }
+}
+
+fn ports_label(ports: &[(u16, u16)]) -> String {
+    ports
+        .iter()
+        .map(|(h, c)| format!("0.0.0.0:{h}->{c}/tcp"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn cmd_stop(args: &[String]) -> i32 {
+    let mut timeout_secs: u64 = 10;
+    let mut targets: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "-t" | "--time" => match next_value(args, &mut i, a) {
+                Ok(v) => match v.parse::<u64>() {
+                    Ok(n) => timeout_secs = n,
+                    Err(_) => {
+                        eprintln!("zerun stop: invalid --time value '{v}'");
+                        return 2;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("zerun stop: {e}");
+                    return 2;
+                }
+            },
+            "-h" | "--help" => {
+                println!("usage: zerun stop [--time SECONDS] CONTAINER...");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun stop: unknown option {other}");
+                return 2;
+            }
+            _ => {
+                targets.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    if targets.is_empty() {
+        eprintln!("zerun stop: at least one CONTAINER is required");
+        return 2;
+    }
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let mut failed = false;
+    for t in targets {
+        match stop_one(&store, &t, timeout_secs) {
+            Ok(name) => println!("{name}"),
+            Err(e) => {
+                eprintln!("zerun stop: {e}");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        1
+    } else {
+        0
+    }
+}
+
+/// Docker semantics: SIGTERM, wait up to `--time`, then SIGKILL. The per-run
+/// reaper observes the death and persists the exit itself; when it is gone
+/// (crash) the stale record is reconciled instead.
+fn stop_one(store: &Store, target: &str, timeout_secs: u64) -> Result<String, String> {
+    let st = state::resolve(store, target)?;
+    let name = display_name(&st);
+    match st.status {
+        state::Status::Exited | state::Status::Created => return Ok(name), // nothing to signal
+        state::Status::Running => {}
+    }
+    if !st.pid_alive() {
+        let mut s = st.clone();
+        if lifecycle::reconcile_stale(store, &mut s) {
+            let _ = s.save();
+        }
+        return Ok(name);
+    }
+    let pid = st
+        .pid
+        .ok_or_else(|| format!("container {} has no PID", st.id))?;
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    if !wait_pid_gone(pid, Duration::from_secs(timeout_secs)) {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        wait_pid_gone(pid, Duration::from_secs(5));
+    }
+    lifecycle::settle_exit(store, &st.id);
+    Ok(name)
+}
+
+fn cmd_rm(args: &[String]) -> i32 {
+    let mut force = false;
+    let mut targets: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-f" | "--force" => {
+                force = true;
+                i += 1;
+            }
+            "-h" | "--help" => {
+                println!("usage: zerun rm [-f] CONTAINER...");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun rm: unknown option {other}");
+                return 2;
+            }
+            _ => {
+                targets.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    if targets.is_empty() {
+        eprintln!("zerun rm: at least one CONTAINER is required");
+        return 2;
+    }
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let mut failed = false;
+    for t in targets {
+        match rm_one(&store, &t, force) {
+            Ok(name) => println!("{name}"),
+            Err(e) => {
+                eprintln!("zerun rm: {e}");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        1
+    } else {
+        0
+    }
+}
+
+fn rm_one(store: &Store, target: &str, force: bool) -> Result<String, String> {
+    let mut st = state::resolve(store, target)?;
+    let name = display_name(&st);
+    if st.status == state::Status::Running {
+        if !force {
+            return Err(format!(
+                "cannot remove a running container {name} - stop it first or use -f"
+            ));
+        }
+        if let Some(pid) = st.pid.filter(|p| *p > 0) {
+            if pid_alive(pid) {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                wait_pid_gone(pid, Duration::from_secs(5));
+            }
+        }
+        // Let the reaper record the exit (or reconcile when it is gone), so the
+        // state directory is not deleted underneath a reaper that is about to
+        // write its final record.
+        lifecycle::settle_exit(store, &st.id);
+        if let Some(fresh) = state::ContainerState::load(store, &st.id) {
+            st = fresh;
+        }
+    }
+    // Reclaim any host-side leftovers still recorded (best effort; the normal
+    // reaper path already cleaned them up).
+    lifecycle::reclaim_resources(store, &st);
+    if let Some(ov) = &st.overlay {
+        fsutil::remove_dir_all_quiet(Path::new(ov));
+    }
+    let dir = state::ContainerState::dir(store, &st.id);
+    fsutil::remove_dir_all_quiet(&dir);
+    Ok(name)
+}
+
+fn cmd_logs(args: &[String]) -> i32 {
+    let mut tail: Option<usize> = None;
+    let mut follow = false;
+    let mut targets: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "-n" | "--tail" => match next_value(args, &mut i, a) {
+                Ok(v) => match v.parse::<usize>() {
+                    Ok(n) => tail = Some(n),
+                    Err(_) => {
+                        eprintln!("zerun logs: invalid --tail value '{v}'");
+                        return 2;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("zerun logs: {e}");
+                    return 2;
+                }
+            },
+            "-f" | "--follow" => {
+                follow = true;
+                i += 1;
+            }
+            "-h" | "--help" => {
+                println!("usage: zerun logs [--tail N] [-f] CONTAINER");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun logs: unknown option {other}");
+                return 2;
+            }
+            _ => {
+                targets.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    if targets.len() != 1 {
+        eprintln!("zerun logs: exactly one CONTAINER is required");
+        return 2;
+    }
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let st = match state::resolve(&store, &targets[0]) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun logs: {e}");
+            return 1;
+        }
+    };
+    let path = PathBuf::from(&st.log);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "zerun logs: cannot read {} for container {}: {e}",
+                path.display(),
+                display_name(&st)
+            );
+            return 1;
+        }
+    };
+    let shown = tail_bytes(&bytes, tail.unwrap_or(usize::MAX));
+    write_stdout(shown);
+    if follow {
+        follow_log(&store, &st, &path, shown.len() as u64);
+    }
+    0
+}
+
+/// Print data appended to `console.log` until the container exits.
+fn follow_log(store: &Store, st: &ContainerState, path: &Path, mut pos: u64) {
+    while container_observable(store, st) {
+        std::thread::sleep(Duration::from_millis(200));
+        pos = drain_log(path, pos);
+    }
+    drain_log(path, pos);
+}
+
+fn drain_log(path: &Path, pos: u64) -> u64 {
+    use std::io::{Read, Seek};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return pos;
+    };
+    let Ok(len) = f.metadata().map(|m| m.len()) else {
+        return pos;
+    };
+    if len <= pos {
+        return pos;
+    }
+    if f.seek(std::io::SeekFrom::Start(pos)).is_err() {
+        return pos;
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_ok() {
+        write_stdout(&buf);
+    }
+    len
+}
+
+fn container_observable(store: &Store, st: &ContainerState) -> bool {
+    match state::ContainerState::load(store, &st.id) {
+        Some(s) => s.status == state::Status::Running && s.pid_alive(),
+        None => false, // --rm removed the record; stop following
+    }
+}
+
+fn cmd_exec(args: &[String]) -> i32 {
+    let mut env_extra: Vec<String> = Vec::new();
+    let mut workdir: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "-e" | "--env" => match next_value(args, &mut i, a) {
+                Ok(v) => env_extra.push(v),
+                Err(e) => {
+                    eprintln!("zerun exec: {e}");
+                    return 2;
+                }
+            },
+            "-w" | "--workdir" => match next_value(args, &mut i, a) {
+                Ok(v) => workdir = Some(v),
+                Err(e) => {
+                    eprintln!("zerun exec: {e}");
+                    return 2;
+                }
+            },
+            "-h" | "--help" => {
+                println!("usage: zerun exec [-e NAME=VAL] [-w DIR] CONTAINER CMD [ARG...]");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun exec: unknown option {other}");
+                return 2;
+            }
+            _ => {
+                let container = args[i].clone();
+                let cmd = args[i + 1..].to_vec();
+                if cmd.is_empty() {
+                    eprintln!("zerun exec: a command is required after CONTAINER");
+                    return 2;
+                }
+                let store = match Store::detect() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("zerun: {e}");
+                        return 1;
+                    }
+                };
+                let st = match state::resolve(&store, &container) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("zerun exec: {e}");
+                        return 1;
+                    }
+                };
+                return match execc::run(&st, &env_extra, workdir.as_deref(), &cmd) {
+                    Ok(code) => code,
+                    Err(e) => {
+                        eprintln!("zerun exec: {e}");
+                        1
+                    }
+                };
+            }
+        }
+    }
+    eprintln!("zerun exec: CONTAINER and COMMAND are required");
+    2
+}
+
+// --- shared helpers for the lifecycle commands -------------------------------
+
+fn display_name(st: &ContainerState) -> String {
+    st.name.clone().unwrap_or_else(|| st.id.clone())
+}
+
+fn one_line(cmd: &[String]) -> String {
+    cmd.join(" ")
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(n.saturating_sub(3)).collect();
+        format!("{cut}...")
+    }
+}
+
+fn render_table(headers: &[String], rows: &[Vec<String>]) -> String {
+    let mut w: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for r in rows {
+        for (i, c) in r.iter().enumerate() {
+            if i < w.len() {
+                w[i] = w[i].max(c.chars().count());
+            }
+        }
+    }
+    let mut out = String::new();
+    push_row(&mut out, headers, &w);
+    for r in rows {
+        push_row(&mut out, r, &w);
+    }
+    out
+}
+
+fn push_row(out: &mut String, cells: &[String], w: &[usize]) {
+    for (i, c) in cells.iter().enumerate() {
+        if i > 0 {
+            out.push_str("  ");
+        }
+        out.push_str(c);
+        if i + 1 < w.len() {
+            let pad = w[i].saturating_sub(c.chars().count());
+            for _ in 0..pad {
+                out.push(' ');
+            }
+        }
+    }
+    out.push('\n');
+}
+
+fn pid_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let r = unsafe { libc::kill(pid, 0) };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn wait_pid_gone(pid: i32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !pid_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    !pid_alive(pid)
+}
+
+/// Keep only the last `n` lines of `data` (newline-terminated lines; a
+/// trailing newline does not produce an extra empty line).
+fn tail_bytes(data: &[u8], n: usize) -> &[u8] {
+    if n == 0 || data.is_empty() {
+        return &[];
+    }
+    let mut line_starts = vec![0usize];
+    for (i, b) in data.iter().enumerate() {
+        if *b == b'\n' && i + 1 < data.len() {
+            line_starts.push(i + 1);
+        }
+    }
+    if line_starts.len() > n {
+        &data[line_starts[line_starts.len() - n]..]
+    } else {
+        data
+    }
+}
+
+fn write_stdout(data: &[u8]) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(data);
+    let _ = out.flush();
+}
+
+/// Human-friendly age of an RFC3339 UTC timestamp ("5 minutes").
+fn elapsed_str(rfc: &str) -> String {
+    let Some(then) = epoch_of_rfc3339(rfc) else {
+        return "unknown".to_string();
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let secs = (now - then).max(0);
+    if secs < 60 {
+        plural(secs, "second")
+    } else if secs < 3600 {
+        plural(secs / 60, "minute")
+    } else if secs < 86400 {
+        plural(secs / 3600, "hour")
+    } else {
+        plural(secs / 86400, "day")
+    }
+}
+
+fn plural(n: i64, unit: &str) -> String {
+    if n == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{n} {unit}s")
+    }
+}
+
+/// Parse the fixed-width "YYYY-MM-DDTHH:MM:SSZ" records state.rs writes.
+fn epoch_of_rfc3339(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| -> Option<i64> {
+        std::str::from_utf8(&b[r]).ok()?.parse().ok()
+    };
+    let y = num(0..4)?;
+    let mo = num(5..7)?;
+    let d = num(8..10)?;
+    let h = num(11..13)?;
+    let mi = num(14..16)?;
+    let se = num(17..19)?;
+    Some(days_from_civil(y, mo as u32, d as u32) * 86_400 + h * 3600 + mi * 60 + se)
+}
+
+/// Howard Hinnant's days_from_civil (inverse of the algorithm in state.rs).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = (u64::from(m) + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + u64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe as i64 - 719_468
+}
+
 fn short_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
@@ -806,6 +1654,7 @@ fn print_run_usage() {
     println!(
         "usage:\n  \
          zerun run [OPTIONS] IMAGE [CMD [ARGS...]]\n  \
+         zerun run -d [--name NAME] [OPTIONS] IMAGE [CMD [ARGS...]]   (detached)\n  \
          zerun run --rootfs DIR [OPTIONS] [--] CMD [ARGS...]   (legacy)"
     );
 }
@@ -816,6 +1665,14 @@ fn print_help() {
 \n\
 USAGE:\n  \
   zerun run [opts] IMAGE [CMD...]        run a container from an OCI image\n  \
+  zerun run -d [--name N] [opts] IMAGE [CMD...]\n  \
+                                        run detached (logs/ps/stop/rm/exec)\n  \
+  zerun ps [-a]                         list containers (detached)\n  \
+  zerun stop [--time S] CONTAINER...    SIGTERM, then SIGKILL after the timeout\n  \
+  zerun rm [-f] CONTAINER...            remove stopped containers (-f: kill first)\n  \
+  zerun logs [--tail N] [-f] CONTAINER  show a container's console.log\n  \
+  zerun exec [-e K=V] [-w DIR] CONTAINER CMD [ARG...]\n  \
+                                        run a command in a running container\n  \
   zerun pull [--platform ...] IMAGE...   pull OCI images (Docker Hub, mirrors)\n  \
   zerun images                           list local images\n  \
   zerun rmi IMAGE...                     remove local images\n  \
@@ -823,6 +1680,9 @@ USAGE:\n  \
 \n\
 RUN OPTIONS:\n  \
   --rootfs DIR    run from an unpacked rootfs dir instead of an image (legacy)\n  \
+  -d, --detach    run in the background; print the container id once started\n  \
+  --name NAME     assign a name (ps/stop/rm/logs/exec address it by name)\n  \
+  --rm            remove state and the writable layer when the container exits\n  \
   -m, --memory 64M    cgroup v2 memory.max (K/M/G suffixes)\n  \
   --cpus 0.5          cgroup v2 cpu.max (cores)\n  \
   --pids 256          cgroup v2 pids.max\n  \

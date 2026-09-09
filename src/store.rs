@@ -51,12 +51,10 @@ impl Store {
         })
     }
 
-    #[allow(dead_code)] // part of the Store API; used by the image store milestone
     pub fn data_root(&self) -> &Path {
         &self.data_root
     }
 
-    #[allow(dead_code)] // part of the Store API; used by the image store milestone
     pub fn run_root(&self) -> &Path {
         &self.run_root
     }
@@ -67,6 +65,7 @@ impl Store {
             self.data_root.join("overlays"),
             self.data_root.join("tmp"),
             self.run_root.join("containers"),
+            self.run_root.join("net"), // file-based IPAM (M5)
         ] {
             fsutil::mkdir_p(&d)?;
         }
@@ -102,6 +101,11 @@ impl ContainerFs {
     /// Path the child should pivot into (the overlay mount point).
     pub fn root(&self) -> &Path {
         &self.merged
+    }
+
+    /// The per-run directory holding upper/work/merged (what `rm` deletes).
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 }
 

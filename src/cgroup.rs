@@ -59,6 +59,11 @@ impl CgroupV2 {
         Ok(cg)
     }
 
+    /// Absolute path of this cgroup directory (used by lifecycle state).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     fn write(&self, file: &str, value: String) -> ZResult<()> {
         let p = self.path.join(file);
         fs::write(&p, value.as_bytes())
