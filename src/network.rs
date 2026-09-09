@@ -36,17 +36,35 @@
 use crate::error::ZResult;
 use crate::netlink::Netlink;
 use crate::nfnetlink::{NatConfig, Nftables};
-use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::collections::{BTreeMap, HashMap};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::thread;
 
-/// One TCP port publish: host port -> container port.
+/// Transport protocol for a published port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortProtocol {
+    Tcp,
+    Udp,
+}
+
+impl PortProtocol {
+    /// Lowercase label used in state records and CLI output.
+    pub fn label(self) -> &'static str {
+        match self {
+            PortProtocol::Tcp => "tcp",
+            PortProtocol::Udp => "udp",
+        }
+    }
+}
+
+/// One port publish: host port -> container port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublishedPort {
     pub host: u16,
     pub container: u16,
+    pub protocol: PortProtocol,
 }
 
 /// Host bridge every bridge-mode container shares (like Docker's docker0).
@@ -78,25 +96,54 @@ impl HostNet {
 /// Dropping the proxy closes the listener; pump threads are detached and die
 /// with the owning process, which never outlives the container run.
 pub struct PortProxy {
-    _listener: TcpListener,
+    _listener: ProxyListener,
+}
+
+enum ProxyListener {
+    Tcp(#[allow(dead_code)] TcpListener),
+    Udp(#[allow(dead_code)] UdpSocket),
 }
 
 impl PortProxy {
-    /// Bind one listener and spawn its accept loop.
-    fn bind(host: u16, container_ip: Ipv4Addr, container: u16) -> ZResult<Self> {
-        let listener = TcpListener::bind(("0.0.0.0", host)).map_err(|e| {
-            crate::zerr!("cannot publish 0.0.0.0:{host} -> {container_ip}:{container}: {e}")
-        })?;
-        let thread_listener = listener
-            .try_clone()
-            .map_err(|e| crate::zerr!("clone listener for 0.0.0.0:{host}: {e}"))?;
-        thread::spawn(move || accept_loop(thread_listener, container_ip, container));
-        Ok(PortProxy {
-            _listener: listener,
-        })
+    /// Bind one listener/socket and spawn its receive loop.
+    fn bind(
+        host: u16,
+        container_ip: Ipv4Addr,
+        container: u16,
+        protocol: PortProtocol,
+    ) -> ZResult<Self> {
+        match protocol {
+            PortProtocol::Tcp => {
+                let listener = TcpListener::bind(("0.0.0.0", host)).map_err(|e| {
+                    crate::zerr!(
+                        "cannot publish 0.0.0.0:{host} -> {container_ip}:{container}/tcp: {e}"
+                    )
+                })?;
+                let thread_listener = listener
+                    .try_clone()
+                    .map_err(|e| crate::zerr!("clone listener for 0.0.0.0:{host}: {e}"))?;
+                thread::spawn(move || accept_loop(thread_listener, container_ip, container));
+                Ok(PortProxy {
+                    _listener: ProxyListener::Tcp(listener),
+                })
+            }
+            PortProtocol::Udp => {
+                let listener = UdpSocket::bind(("0.0.0.0", host)).map_err(|e| {
+                    crate::zerr!(
+                        "cannot publish 0.0.0.0:{host} -> {container_ip}:{container}/udp: {e}"
+                    )
+                })?;
+                let thread_listener = listener
+                    .try_clone()
+                    .map_err(|e| crate::zerr!("clone UDP socket for 0.0.0.0:{host}: {e}"))?;
+                thread::spawn(move || udp_loop(thread_listener, container_ip, container));
+                Ok(PortProxy {
+                    _listener: ProxyListener::Udp(listener),
+                })
+            }
+        }
     }
 }
-
 /// Bind one userland proxy per published port (Docker's docker-proxy, built
 /// in). Fails fast so a port conflict aborts the run before any container
 /// work happens.
@@ -106,7 +153,7 @@ pub fn bind_port_proxies(
 ) -> ZResult<Vec<PortProxy>> {
     published
         .iter()
-        .map(|p| PortProxy::bind(p.host, container_ip, p.container))
+        .map(|p| PortProxy::bind(p.host, container_ip, p.container, p.protocol))
         .collect()
 }
 
@@ -117,6 +164,47 @@ fn accept_loop(listener: TcpListener, container_ip: Ipv4Addr, container: u16) {
         thread::spawn(move || {
             let _ = forward(client, container_ip, container);
         });
+    }
+}
+
+/// Receive datagrams from all clients and forward them to the container.
+/// Replies are sent from a per-client connected socket so multiple clients can
+/// use the same published host port independently.
+fn udp_loop(listener: UdpSocket, container_ip: Ipv4Addr, container: u16) {
+    let mut clients: HashMap<SocketAddr, UdpSocket> = HashMap::new();
+    let mut buf = [0u8; 65535];
+    while let Ok((len, client)) = listener.recv_from(&mut buf) {
+        let upstream = if let Some(upstream) = clients.get(&client) {
+            upstream
+        } else {
+            let (Ok(upstream), Ok(reply)) = (
+                UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)),
+                UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)),
+            ) else {
+                continue;
+            };
+            if upstream.connect((container_ip, container)).is_err()
+                || reply.connect(client).is_err()
+            {
+                continue;
+            }
+            let Ok(registered) = upstream.try_clone() else {
+                continue;
+            };
+            clients.insert(client, registered);
+            thread::spawn(move || {
+                let mut buf = [0u8; 65535];
+                while let Ok(len) = upstream.recv(&mut buf) {
+                    if reply.send(&buf[..len]).is_err() {
+                        break;
+                    }
+                }
+            });
+            clients
+                .get(&client)
+                .expect("client UDP proxy was just inserted")
+        };
+        let _ = upstream.send(&buf[..len]);
     }
 }
 

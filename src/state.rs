@@ -50,6 +50,9 @@ pub struct ContainerState {
     pub net: String,
     /// Published ports (host, container).
     pub ports: Vec<(u16, u16)>,
+    /// Transport for each port (`tcp`/`udp`). Older records are TCP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_protocols: Option<Vec<String>>,
     /// Bridge IP when net == bridge.
     pub ip: Option<Ipv4Addr>,
     /// Command the container runs.
@@ -273,6 +276,7 @@ mod tests {
             rootless: false,
             net: "none".to_string(),
             ports: vec![],
+            port_protocols: None,
             ip: None,
             cmd: vec!["sh".to_string()],
             env: vec![],
