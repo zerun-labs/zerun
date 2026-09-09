@@ -4,7 +4,7 @@
 //!   zerun run [opts] IMAGE [CMD...]       run a container from an OCI image
 //!   zerun run --rootfs DIR [opts] -- CMD  legacy: run from an unpacked rootfs
 //!   zerun run -d [--name N] [opts] IMAGE  run detached (state under /run/zerun)
-//!   zerun ps [-a] / stop / rm / logs / exec   detached-container lifecycle (M5)
+//!   zerun ps / wait / stop / rm / logs / exec   detached lifecycle (M5)
 //!   zerun login / logout / pull / images / rmi   image lifecycle (M3)
 //!   zerun doctor                          environment diagnostics
 mod cgroup;
@@ -49,6 +49,7 @@ fn main() {
     let code = match args.get(1).map(|s| s.as_str()) {
         Some("run") => cmd_run(&args[2..]),
         Some("ps") => cmd_ps(&args[2..]),
+        Some("wait") => cmd_wait(&args[2..]),
         Some("stop") => cmd_stop(&args[2..]),
         Some("restart") => cmd_restart(&args[2..]),
         Some("rm") => cmd_rm(&args[2..]),
@@ -1664,6 +1665,85 @@ fn ports_label(ports: &[(u16, u16)]) -> String {
         .join(", ")
 }
 
+fn cmd_wait(args: &[String]) -> i32 {
+    let mut targets: Vec<String> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "-h" | "--help" => {
+                println!("usage: zerun wait CONTAINER...");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun wait: unknown option {other}");
+                return 2;
+            }
+            _ => targets.push(a.clone()),
+        }
+    }
+    if targets.is_empty() {
+        eprintln!("zerun wait: at least one CONTAINER is required");
+        return 2;
+    }
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let mut failed = false;
+    for target in targets {
+        match wait_one(&store, &target) {
+            Ok(code) => {
+                println!("{code}");
+                if code != 0 {
+                    failed = true;
+                }
+            }
+            Err(e) => {
+                eprintln!("zerun wait: {e}");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        1
+    } else {
+        0
+    }
+}
+
+/// Block until a detached container's final state is visible. This is most
+/// useful for containers that retain their state after exit (`--rm` records
+/// are intentionally removed as soon as the reaper persists their exit).
+fn wait_one(store: &Store, target: &str) -> Result<i32, String> {
+    let st = state::resolve(store, target)?;
+    let name = display_name(&st);
+    let id = st.id.clone();
+    if st.status == state::Status::Created {
+        return Err(format!("container {name} was created but never started"));
+    }
+    loop {
+        let Some(mut st) = state::ContainerState::load(store, &id) else {
+            return Err(format!(
+                "container {name} state disappeared before its exit code was recorded (is it --rm?)"
+            ));
+        };
+        if st.status == state::Status::Exited {
+            return Ok(st.exit_code.unwrap_or(-1));
+        }
+        if st.status == state::Status::Running && !st.pid_alive() {
+            if lifecycle::reconcile_stale(store, &mut st) {
+                let _ = st.save();
+            }
+            if st.status == state::Status::Exited {
+                return Ok(st.exit_code.unwrap_or(-1));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn cmd_stop(args: &[String]) -> i32 {
     let mut timeout_secs: u64 = 10;
     let mut targets: Vec<String> = Vec::new();
@@ -2267,6 +2347,7 @@ USAGE:\n  \
   zerun run -d [--name N] [opts] IMAGE [CMD...]\n  \
                                         run detached (logs/ps/stop/rm/exec)\n  \
   zerun ps [-a]                         list containers (detached)\n  \
+  zerun wait CONTAINER...               block for detached containers to exit\n  \
   zerun stop [--time S] CONTAINER...    SIGTERM, then SIGKILL after the timeout\n  \
   zerun restart [--time S] CONTAINER... restart detached containers\n  \
   zerun rm [-f] CONTAINER...            remove stopped containers (-f: kill first)\n  \

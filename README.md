@@ -47,7 +47,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
 - **Secure defaults**: `PR_SET_NO_NEW_PRIVS`, capability bounding-set cleared, masked
   `/proc`/`/sys` paths, and a deny-by-default seccomp allowlist (opt out with
   `--seccomp unconfined`).
-- **Docker-compatible top 20% CLI**: `run / ps / stop / restart / rm / logs / exec / pull /
+- **Docker-compatible top 20% CLI**: `run / ps / wait / stop / restart / rm / logs / exec / pull /
   login / logout / images / rmi / commit / generate-service / doctor`.
 
 ## Install
@@ -168,6 +168,7 @@ sudo target/release/zerun run -d --name web -p 18080:80 --net bridge --init \
   alpine /bin/sh -c 'while true; do echo hi | nc -l -p 80; done'
 
 sudo target/release/zerun ps                          # running containers
+sudo target/release/zerun wait web                    # block until exit; prints the exit code
 sudo target/release/zerun logs --tail 20 web          # container console.log
 sudo target/release/zerun logs -t web                 # include capture timestamps
 sudo target/release/zerun exec web /bin/sh            # join the container
