@@ -26,11 +26,15 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   diff_id double verification, zstd layer decode + magic sniffing, mirror inheritance
   (env, zerun `config.toml`, `/etc/docker/daemon.json`), and per-layer pull progress;
   `zerun run IMAGE` auto-pulls and applies image env/entrypoint/cmd/working-dir.
-- **M4 (in progress)** — kernel networking: `--net bridge` (rootful) creates the `zerun0`
-  bridge (10.88.0.1/24) and a per-container veth pair with container-side `eth0` and a
-  default route (verified: host ↔ container reachable). NAT / `-p` port publishing and
-  DNS/hosts injection come next.
-- **M5+** — detached lifecycle, distribution (see AGENTS.md).
+- **M4 — kernel networking (done)**: `--net bridge` (rootful) creates the `zerun0` bridge
+  (10.88.0.1/24) and a per-container veth pair with container-side `eth0` and a default
+  route (verified: host ↔ container reachable). Per-container egress NAT via nf_tables
+  (pure netlink), `-p HOST:CONTAINER` publishing through a built-in userland proxy
+  (Docker's docker-proxy in-binary), and `--dns` / host resolv.conf inheritance.
+- **M5 — detached lifecycle (done)**: `run -d` forks a tiny per-container reaper that
+  redirects stdio to `console.log` and persists state to disk; `ps [-a]`, `stop`, `rm`,
+  `logs [-f]`, and `exec` address containers by id/name with crash reconcile of stale
+  records; file-based IPAM; `--rm` for auto-removal (see AGENTS.md).
 
 ## Highlights
 
@@ -89,6 +93,9 @@ sets environment variables, `--init` adds the built-in mini-init, and
 Run options (current subset):
 
 ```
+-d, --detach         run in the background (print id once started; see M5 section)
+--name NAME          name the container (ps/stop/rm/logs/exec accept it)
+--rm                 remove state + writable layer automatically on exit
 -m, --memory 64M     cgroup v2 memory.max (K/M/G suffixes)
 --cpus 0.5           cgroup v2 cpu.max (cores)
 --pids 256           cgroup v2 pids.max
@@ -107,6 +114,24 @@ Run options (current subset):
 (`/etc/zerun/config.toml` with `[registry] mirrors = [...]`, overridable via
 `ZERUN_CONFIG` or `~/.config/zerun/config.toml`), and the `/etc/docker/daemon.json`
 `registry-mirrors` list are honored for `docker.io` pulls (in that priority order).
+
+### Detached lifecycle (M5)
+
+```bash
+# Run in the background (prints the container id once the workload has started)
+sudo target/release/zerun run -d --name web -p 18080:80 --net bridge --init \
+  alpine /bin/sh -c 'while true; do echo hi | nc -l -p 80; done'
+
+sudo target/release/zerun ps                          # running containers
+sudo target/release/zerun logs --tail 20 web          # container console.log
+sudo target/release/zerun exec web /bin/sh            # join the container
+sudo target/release/zerun stop --time 3 web           # SIGTERM, then SIGKILL
+sudo target/release/zerun rm web                      # remove the stopped container
+```
+
+Detached containers keep no daemon: the per-container reaper is a tiny process that
+disappears when the container exits. If the host crashes (or the reaper is killed), the
+next `ps`/`rm` reconciles the stale record and reclaims host-side resources.
 
 ### Legacy rootfs mode (M1/M2)
 

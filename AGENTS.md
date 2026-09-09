@@ -30,7 +30,7 @@ making changes. When architecture or conventions change, update this file in the
 zerun/                      # crate root == repository root
 ├── Cargo.toml              # package zerun; release: opt-level=z + lto + strip + panic=abort
 ├── src/
-│   ├── main.rs             # CLI entry: run / doctor / __init (internal)
+│   ├── main.rs             # CLI entry: run / ps / stop / rm / logs / exec / pull / ... / doctor
 │   ├── error.rs            # ZError / zerr! / ZResult
 │   ├── trace.rs            # ZERUN_TRACE=1 stage timing (bench/analyze.py parses its format!)
 │   ├── syscalls.rs         # ★ ALL unsafe syscalls live here (mount/clone/pivot_root/caps/pipe)
@@ -43,6 +43,9 @@ zerun/                      # crate root == repository root
 │   ├── security.rs         # no_new_privs -> capability drop -> seccomp orchestration
 │   ├── seccomp.rs          # default deny-by-default BPF allowlist (x86_64 table; extend per arch)
 │   ├── mini_init.rs        # container PID1 mini-init (signal forwarding + orphan reaping)
+│   ├── state.rs            # M5 per-container state.json schema (<run>/containers/<id>/)
+│   ├── lifecycle.rs        # M5 detached reaper: run_detached + crash reconcile / settle_exit
+│   ├── execc.rs            # M5 `exec`: join a running container's namespaces in-process
 │   ├── store.rs            # state layout: data/run roots (rootful vs rootless), per-run overlay fs
 │   ├── fsutil.rs           # recursive copy, force-remove (mode-000 overlay workdirs), atomic write
 │   ├── workload.rs         # container env application + PATH argv[0] resolution
@@ -86,6 +89,15 @@ sudo env ZERUN_DATA_ROOT=/tmp/zerun-root ./target/release/zerun run --init alpin
 # M4 bridge networking (rootful only): container gets eth0 on bridge zerun0
 sudo env ZERUN_DATA_ROOT=/tmp/zerun-root ./target/release/zerun run --net bridge alpine /bin/ls /sys/class/net   # eth0 lo
 sudo ip -br addr show zerun0   # 10.88.0.1/24 while a bridge container runs
+
+# M5 detached lifecycle: run -d + ps/stop/rm/logs/exec (same binary, no daemon)
+sudo env ZERUN_DATA_ROOT=/tmp/zerun-root ./target/release/zerun run -d --name web -p 18080:80 --net bridge --init \
+  alpine /bin/sh -c 'while true; do echo hi | nc -l -p 80; done'   # prints the container id
+sudo env ZERUN_DATA_ROOT=/tmp/zerun-root ./target/release/zerun ps            # table of running containers
+sudo env ZERUN_DATA_ROOT=/tmp/zerun-root ./target/release/zerun logs --tail 20 web
+sudo env ZERUN_DATA_ROOT=/tmp/zerun-root ./target/release/zerun exec web /bin/sh -c 'echo in-container; hostname'
+sudo env ZERUN_DATA_ROOT=/tmp/zerun-root ./target/release/zerun stop --time 3 web
+sudo env ZERUN_DATA_ROOT=/tmp/zerun-root ./target/release/zerun rm web
 
 # Prepare a minimal rootfs (Alpine minirootfs)
 mkdir -p /tmp/zerun-test/rootfs
@@ -131,8 +143,8 @@ cargo build --release --target x86_64-unknown-linux-musl
 | M1 | Isolation executor: namespaces, pivot_root, pseudo-fs, mini-init, caps, bench | ✅ committed (ported from zerun-m1-skeleton) |
 | M2 | Default seccomp allowlist; OverlayFS read-only lowers + disk upper; layer whiteout materialization | ✅ committed: seccomp; per-run OverlayFS (disk upper, auto-cleanup); whiteout materialization (done as part of the M3 rootfs builder) |
 | M3 | OCI pull: multi-arch manifest list, Bearer token, diff_id double verification, mirror inheritance | ✅ committed: `pull/images/rmi`; `run IMAGE` auto-pull + config env/cmd/entrypoint/cwd; multi-arch platform selection; diff_id double verification; mirror inheritance (env + zerun config.toml + `/etc/docker/daemon.json`); zstd layer decode + compression magic sniffing; per-layer pull progress. ⏳ still open: private-registry auth |
-| M4 | Netlink veth/bridge + egress NAT, `-p` publishing, DNS | ✅ committed: `--net bridge` (rootful) — `zerun0` bridge 10.88.0.1/24, per-container veth pair, net-ready sync, container `eth0` addr + default route, egress masquerade per container (nf_tables via pure netlink), `-p HOST:CONTAINER` via a built-in userland proxy (Docker's docker-proxy, in-binary), `--dns` + host resolv.conf inheritance. ⏳ left open: `/etc/hosts` entries, default `--net bridge`, file-based IPAM bitmap (M5) |
-| M5 | Detached reaper, logs, ps/stop/logs/exec, crash reconcile | ⏳ |
+| M4 | Netlink veth/bridge + egress NAT, `-p` publishing, DNS | ✅ committed: `--net bridge` (rootful) — `zerun0` bridge 10.88.0.1/24, per-container veth pair, net-ready sync, container `eth0` addr + default route, egress masquerade per container (nf_tables via pure netlink), `-p HOST:CONTAINER` via a built-in userland proxy (Docker's docker-proxy, in-binary), `--dns` + host resolv.conf inheritance. ⏳ left open: `/etc/hosts` entries, default `--net bridge` |
+| M5 | Detached reaper, logs, ps/stop/logs/exec, crash reconcile | ✅ committed: `run -d/--name/--rm` (per-container reaper that redirects stdio to console.log and persists state under `<run>/containers/<id>/`); `ps [-a]` (crash reconcile of stale Running records), `stop [-t]` (TERM->KILL with reaper settle), `rm [-f]` (state + overlay removal), `logs [--tail N] [-f]`, `exec [-e] [-w]` (in-process setns join of user/mnt/uts/ipc/net/cgroup/pid + hardened exec); file-based IPAM with flock (deterministic slot first, crash-reclaimed); `--init`-safe started-pipe protocol. ⏳ left open: `/etc/hosts` entries, TTY (-t/-i), `logs` timestamps, restart/commit |
 | M6 | cargo-dist, install.sh, generate-service, AUR/Brew | ⏳ |
 
 ## 6. Pitfalls learned from real runs (read before coding)
@@ -178,13 +190,19 @@ cargo build --release --target x86_64-unknown-linux-musl
   masqueraded (source 198.18.0.1); it works on real hosts exactly like Docker's bridge.
 - A crashed/killed `run` (SIGKILL of the CLI, power loss) leaves its nft table + veth host end
   behind: teardown runs in the parent after `waitpid`, so it only survives a parent that never
-  got to wait. M5's `ps`/reconcile and `doctor` must clean these up.
+  got to wait. In M5 a killed **reaper** leaves state "Running" for a live container: `ps` shows
+  it Up, and `stop`/`rm -f` kill the PID and then `lifecycle::settle_exit` waits briefly for the
+  reaper's own final write before falling back to `reconcile_stale` (mark Exited, reclaim nft
+  table/veth/cgroup/IPAM and remove the per-run overlay). A Running record whose PID is already
+  dead is reconciled directly by `ps -a`.
 - When a container netns dies, the kernel removes the whole veth pair automatically; host-side
   teardown must tolerate "No such device" (look the link up by name first).
 - Bridge-mode networking needs CAP_NET_ADMIN in the host netns (rootful only for now): rootless
   runs are rejected with a clear error until a user-mode NAT lands.
-- Container IPv4 addresses are deterministic from the container id (no shared state yet); a
-  file-based IPAM bitmap is planned with the M5 lifecycle work.
+- Container IPv4 addresses are deterministic from the container id and tracked in a file IPAM
+  (src/network.rs, M5): `<run>/net/ipam.json` under an flock on `<run>/net/ipam.lock`. The
+  deterministic slot is tried first; occupied slots are skipped; `release_ip` runs on every exit
+  path and stale records are reclaimed by crash reconcile.
 - The net-ready pipe protocol (parent writes `0` = ready / `1` + error text; the child relays
   host-side failures over the error pipe) must be preserved by any future child-side stage.
 - This dev machine is WSL2: `/mnt/c` is a 9P cross-filesystem and must never hold code/rootfs
@@ -205,6 +223,29 @@ cargo build --release --target x86_64-unknown-linux-musl
   transport errors and 429/5xx with short backoff (src/image/registry.rs).
 - Pull and run with the same identity: the materialized rootfs is owned by whoever
   unpacked it, and a rootful container can only write paths it owns.
+- `run -d`'s started pipe carries a **single newline-terminated status line** (`0` / `1: err`).
+  The CLI must stop reading at the first newline, not wait for EOF: with `--init` the container
+  child never execs, so the CLOEXEC write end stays open in the container and EOF only arrives
+  when the container exits (this hung the CLI once). Same rule as the error pipe: keep the
+  protocol byte-exact.
+- `exec` (src/execc.rs) joins namespaces **in-process**: open all `/proc/<pid>/ns/*` fds first
+  and keep the `File`s alive (raw fds alone dangle), setns(user) only when `state.rootless`
+  (setns into the *initial* user namespace fails with EINVAL), setns(pid) last because it only
+  affects children, then fork the worker. The worker is born a child of the container's PID 1
+  but reaped by the joiner through the host PID namespace.
+- Detached state layout: `<run>/containers/<id>/state.json` + `console.log`; `state.json` is
+  written by the CLI (Created), the reaper (Running/Exited), and reconcilers. The per-run
+  overlay is removed by the reaper on exit (docker `--rm`-like semantics for every detached
+  run); `rm` deletes the state dir (and any overlay dir still recorded). Foreground runs keep
+  no state. `state::ContainerState::save()` derives its path from the `log` field — always set
+  `log` before saving.
+- `stop`/`rm -f` must never delete the state directory under a live reaper that is about to
+  write its final record: kill the PID, wait for the reaper's Exited write (`settle_exit`), then
+  remove. Killing only the container PID is enough to stop a container — when PID 1 of a PID
+  namespace dies, the kernel SIGKILLs the rest of the namespace.
+- `zerun exec` applies the default seccomp/caps hardening in the worker before exec'ing, like a
+  fresh container process. State does not yet record per-container `--seccomp`/`--init` choices,
+  so `exec` always uses the default profile.
 - **Language**: the whole repository is developed and maintained in **English** — code comments,
   docs, CLI/help/error messages, commit messages.
 - Commit messages use Conventional Commits (feat/fix/refactor/chore/test/docs), with reasonable
