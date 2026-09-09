@@ -1051,38 +1051,60 @@ fn cmd_commit(args: &[String]) -> i32 {
         eprintln!("zerun: warning: committing a running container; filesystem changes in progress may be inconsistent");
     }
 
-    // A live container can archive its mounted merged rootfs directly. After
-    // exit that mount is gone, so reconstruct the rootfs from the image lower
-    // layer plus the persisted overlay upper layer.
+    // A live container's overlay is mounted inside its own mount namespace; the
+    // host only sees the empty mount-point directory. Archive the live root via
+    // /proc/<pid>/root instead. After exit that mount is gone, so reconstruct
+    // the rootfs from the image lower layer plus the persisted overlay upper.
     let mut rebuilt: Option<std::path::PathBuf> = None;
-    let rootfs = match (
-        st.overlay.as_deref(),
-        matches!(st.status, state::Status::Running),
-    ) {
-        (Some(overlay), false) => {
-            let upper = std::path::Path::new(overlay).join("upper");
-            let staging = imgstore.blob_tmp("commit-source");
-            match committable_lower_rootfs(&imgstore, &st) {
-                Ok(lower) => {
-                    let root = match image::commit::rebuild_rootfs(&lower, &upper, &staging) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            fsutil::remove_dir_all_quiet(&staging);
-                            eprintln!("zerun commit: rebuild exited container rootfs: {e}");
-                            return 1;
-                        }
-                    };
-                    rebuilt = Some(root.clone());
-                    root
-                }
-                Err(e) => {
-                    fsutil::remove_dir_all_quiet(&staging);
-                    eprintln!("zerun commit: {e}");
+    let rootfs = if matches!(st.status, state::Status::Running) {
+        match st.pid.filter(|p| *p > 0 && st.pid_alive()) {
+            Some(pid) => {
+                let live = std::path::PathBuf::from(format!("/proc/{pid}/root"));
+                if !live.is_dir() {
+                    eprintln!(
+                        "zerun commit: cannot read container {} root at {}",
+                        display_name(&st),
+                        live.display()
+                    );
                     return 1;
                 }
+                live
+            }
+            None => {
+                eprintln!(
+                    "zerun commit: container {} is recorded as running but has no live PID",
+                    display_name(&st)
+                );
+                return 1;
             }
         }
-        _ => std::path::PathBuf::from(&st.rootfs),
+    } else {
+        match st.overlay.as_deref() {
+            Some(overlay) => {
+                let upper = std::path::Path::new(overlay).join("upper");
+                let staging = imgstore.blob_tmp("commit-source");
+                match committable_lower_rootfs(&imgstore, &st) {
+                    Ok(lower) => {
+                        let root = match image::commit::rebuild_rootfs(&lower, &upper, &staging) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                fsutil::remove_dir_all_quiet(&staging);
+                                eprintln!("zerun commit: rebuild exited container rootfs: {e}");
+                                return 1;
+                            }
+                        };
+                        rebuilt = Some(root.clone());
+                        root
+                    }
+                    Err(e) => {
+                        fsutil::remove_dir_all_quiet(&staging);
+                        eprintln!("zerun commit: {e}");
+                        return 1;
+                    }
+                }
+            }
+            None => std::path::PathBuf::from(&st.rootfs),
+        }
     };
     if !rootfs.is_dir() {
         if let Some(path) = &rebuilt {
