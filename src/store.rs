@@ -29,6 +29,8 @@ pub struct ContainerFs {
     pub work: PathBuf,
     /// Overlay mount point / final root path.
     pub merged: PathBuf,
+    /// True when upper/work/merged live on a per-run tmpfs.
+    pub tmpfs_upper: bool,
     dir: PathBuf,
 }
 
@@ -73,7 +75,12 @@ impl Store {
     }
 
     /// Prepare a per-run writable container filesystem (overlay dirs).
-    pub fn prepare_container_fs(&self, id: &str, lower: &Path) -> ZResult<ContainerFs> {
+    pub fn prepare_container_fs(
+        &self,
+        id: &str,
+        lower: &Path,
+        tmpfs_upper: bool,
+    ) -> ZResult<ContainerFs> {
         let dir = self.data_root.join("overlays").join(id);
         let upper = dir.join("upper");
         let work = dir.join("work");
@@ -87,6 +94,7 @@ impl Store {
             upper,
             work,
             merged,
+            tmpfs_upper,
             dir,
         })
     }

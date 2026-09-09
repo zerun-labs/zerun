@@ -21,7 +21,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   built-in mini-init, and a reproducible benchmark harness.
 - **M2 — storage & security (done)**: deny-by-default seccomp allowlist; per-run OverlayFS
   with disk upper and automatic cleanup; OCI whiteout materialization; safe host bind-mount
-  volumes with `-v HOST:CONTAINER[:ro|rw]`.
+  volumes with `-v HOST:CONTAINER[:ro|rw]`; optional ephemeral `--tmpfs-upper` writable layers.
 - **M3 — OCI image engine (done)**: `zerun login / logout / pull / images / rmi`; Docker v2
   pull with Bearer token auth, private-registry credentials, multi-arch platform selection (`--platform`), compressed-blob and
   diff_id double verification, zstd layer decode + magic sniffing, mirror inheritance
@@ -148,6 +148,7 @@ Run options (current subset):
 -v, --volume HOST:CONTAINER[:ro]
                      bind-mount an existing host file/directory into the container
 --no-overlay        pivot directly into the rootfs (no writable upper layer)
+--tmpfs-upper       keep the overlay writable layer in tmpfs (not committable)
 ```
 
 `ZERUN_REGISTRY_MIRRORS` (comma-separated), a zerun config file

@@ -38,6 +38,8 @@ pub struct OverlayPaths {
     pub work: PathBuf,
     /// Mount point the child pivots into.
     pub merged: PathBuf,
+    /// Mount a per-run tmpfs over the overlay directory before mounting overlay.
+    pub tmpfs_upper: bool,
 }
 
 /// A host path bind-mounted into the container rootfs before pivot_root.
@@ -239,6 +241,26 @@ fn safe_target(rootfs: &Path, target: &Path) -> ZResult<PathBuf> {
 /// Runs in the child after MS_PRIVATE: the mount is private to the child's
 /// namespace and disappears when the container exits.
 fn setup_overlay(rootless: bool, ovl: &OverlayPaths) -> ZResult<()> {
+    if ovl.tmpfs_upper {
+        // Mount in the child so the parent's mount namespace keeps no reference;
+        // it disappears with the container mount namespace.
+        let dir = ovl
+            .upper
+            .parent()
+            .ok_or_else(|| crate::zerr!("overlay upper has no parent"))?;
+        syscalls::mount(
+            Some("tmpfs"),
+            dir.to_string_lossy(),
+            Some("tmpfs"),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            Some("mode=0700"),
+        )?;
+        trace::mark("child:overlay:tmpfs-upper-ok");
+        // The tmpfs hides the staging directories created by the parent.
+        for path in [&ovl.upper, &ovl.work, &ovl.merged] {
+            fsutil::mkdir_p(path)?;
+        }
+    }
     let data = format!(
         "lowerdir={},upperdir={},workdir={}",
         ovl.lower.display(),

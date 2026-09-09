@@ -85,6 +85,9 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
     if a.no_overlay {
         run_args.push("--no-overlay".into());
     }
+    if a.tmpfs_upper {
+        run_args.push("--tmpfs-upper".into());
+    }
     if let Some(v) = &a.platform {
         run_args.push("--platform".into());
         run_args.push(v.clone());
@@ -203,6 +206,9 @@ fn validate(a: &RunArgs) -> Result<(), String> {
     }
     if a.rootfs.is_some() && a.image.is_some() {
         return Err("--rootfs and IMAGE are mutually exclusive".into());
+    }
+    if a.no_overlay && a.tmpfs_upper {
+        return Err("--tmpfs-upper requires the writable overlay; remove --no-overlay".into());
     }
     if !a.ports.is_empty() && a.net != NetMode::Bridge {
         return Err("-p/--publish requires --net bridge".into());
@@ -341,6 +347,16 @@ mod tests {
         assert!(unit.contains("alpine -- echo hello\n"));
         assert!(unit.contains("--publish 8080:80"));
         assert!(unit.contains("WantedBy=multi-user.target"));
+    }
+
+    #[test]
+    fn renders_and_validates_tmpfs_upper() {
+        let a = args(&["--tmpfs-upper", "--name", "web", "alpine", "echo", "hi"]);
+        let unit = render(Path::new("/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains(" --tmpfs-upper alpine -- echo hi\n"));
+
+        let invalid = args(&["--no-overlay", "--tmpfs-upper", "alpine"]);
+        assert!(render(Path::new("/bin/zerun"), &invalid, true).is_err());
     }
 
     #[test]

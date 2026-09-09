@@ -69,6 +69,9 @@ pub struct ContainerState {
     /// When set, the per-run overlay directory `rm` should delete on top of
     /// the state directory (legacy `--rootfs` runs keep nothing to remove).
     pub overlay: Option<String>,
+    /// True when the writable layer was ephemeral tmpfs (`--tmpfs-upper`).
+    #[serde(default)]
+    pub tmpfs_upper: bool,
     /// Canonical `zerun run` arguments (without the leading `run`) captured
     /// for detached containers. Older v1 records have no value and cannot be
     /// restarted directly.
@@ -284,6 +287,7 @@ mod tests {
             log: format!("{}/x/console.log", std::env::temp_dir().display()),
             rootfs: String::new(),
             overlay: None,
+            tmpfs_upper: false,
             launch_args: None,
             table: None,
             veth: None,

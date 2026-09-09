@@ -102,6 +102,7 @@ struct RunArgs {
     use_init: bool,
     seccomp: SeccompMode,
     no_overlay: bool,
+    tmpfs_upper: bool,
     platform: Option<String>,
     env: Vec<String>,
     ports: Vec<network::PublishedPort>,
@@ -191,6 +192,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--no-overlay" => {
                 a.no_overlay = true;
+                i += 1;
+            }
+            "--tmpfs-upper" => {
+                a.tmpfs_upper = true;
                 i += 1;
             }
             "--platform" => {
@@ -347,6 +352,10 @@ fn cmd_run(args: &[String]) -> i32 {
     if !a.net_specified {
         a.net = default_net(unsafe { libc::geteuid() });
     }
+    if a.no_overlay && a.tmpfs_upper {
+        eprintln!("zerun run: --tmpfs-upper requires the writable overlay; remove --no-overlay");
+        return 2;
+    }
     if !a.ports.is_empty() && a.net != NetMode::Bridge {
         eprintln!("zerun run: -p/--publish requires --net bridge");
         return 2;
@@ -434,7 +443,7 @@ fn cmd_run(args: &[String]) -> i32 {
     let container_fs = if a.no_overlay {
         None
     } else {
-        match store.prepare_container_fs(&id, &rootfs) {
+        match store.prepare_container_fs(&id, &rootfs, a.tmpfs_upper) {
             Ok(fs) => Some(fs),
             Err(e) => {
                 eprintln!("zerun: {e}");
@@ -451,6 +460,7 @@ fn cmd_run(args: &[String]) -> i32 {
                 upper: fs.upper.clone(),
                 work: fs.work.clone(),
                 merged: fs.merged.clone(),
+                tmpfs_upper: fs.tmpfs_upper,
             }),
         ),
         None => (rootfs.clone(), None),
@@ -617,6 +627,7 @@ fn run_detached(
         overlay: container_fs
             .as_ref()
             .map(|fs| fs.dir().display().to_string()),
+        tmpfs_upper: container_fs.as_ref().is_some_and(|fs| fs.tmpfs_upper),
         launch_args: Some(info.launch_args),
         table: None,
         veth: None,
@@ -730,6 +741,9 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     }
     if a.no_overlay {
         args.push("--no-overlay".to_string());
+    }
+    if a.tmpfs_upper {
+        args.push("--tmpfs-upper".to_string());
     }
     if let Some(v) = &a.platform {
         args.extend(["--platform".to_string(), v.clone()]);
@@ -919,6 +933,12 @@ fn cmd_commit(args: &[String]) -> i32 {
         }
     };
 
+    if st.tmpfs_upper {
+        eprintln!(
+            "zerun commit: a --tmpfs-upper container has no persisted writable layer to commit"
+        );
+        return 1;
+    }
     if st.status == state::Status::Running {
         eprintln!("zerun: warning: committing a running container; filesystem changes in progress may be inconsistent");
     }
@@ -2425,7 +2445,8 @@ RUN OPTIONS:\n  \
   --seccomp default|unconfined\n  \
   --platform os/arch[/variant]  pull/run a specific platform\n  \
   -e, --env NAME[=VALUE]  set a container environment variable (image mode)\n  \
-  --no-overlay        pivot directly into the rootfs (no writable upper layer)\n\
+  --no-overlay        pivot directly into the rootfs (no writable upper layer)\n  \
+  --tmpfs-upper       keep the overlay writable layer in tmpfs (not committable)\n\
 \n\
 ENV:\n  \
   ZERUN_TRACE=1   print per-stage nanosecond timings to stderr (bench harness)\n  \
