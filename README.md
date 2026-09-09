@@ -22,7 +22,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
 - **M2 — storage & security (done)**: deny-by-default seccomp allowlist; per-run OverlayFS
   with disk upper and automatic cleanup; OCI whiteout materialization; safe host bind-mount
   volumes with `-v HOST:CONTAINER[:ro|rw]`; optional ephemeral `--tmpfs-upper` writable layers.
-- **M3 — OCI image engine (done)**: `zerun login / logout / pull / push / images / rmi`; Docker v2
+- **M3 — OCI image engine (done)**: `zerun login / logout / pull / push / tag / images / rmi`; Docker v2
   pull with Bearer token auth, private-registry credentials, multi-arch platform selection (`--platform`), compressed-blob and
   diff_id double verification, zstd layer decode + magic sniffing, transient request retries,
   mirror inheritance
@@ -50,7 +50,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   `/proc`/`/sys` paths, and a deny-by-default seccomp allowlist (opt out with
   `--seccomp unconfined`).
 - **Docker-compatible top 20% CLI**: `run / ps / wait / stop / restart / rm / logs / exec / pull /
-  push / login / logout / images / rmi / commit / generate-service / doctor`.
+  push / tag / login / logout / images / rmi / commit / generate-service / doctor`.
 
 ## Install
 
@@ -187,8 +187,8 @@ registry already has them, and layer files stream from the local store:
 ```bash
 zerun commit -m snapshot web web:snapshot
 zerun push web:snapshot
-# Or target another registry after committing/tagging it there:
-zerun commit -m snapshot web registry.example:5000/team/app:v1
+# Or retag an existing image (including a pulled upstream image) and push it:
+zerun tag web:snapshot registry.example:5000/team/app:v1
 zerun push registry.example:5000/team/app:v1
 ```
 

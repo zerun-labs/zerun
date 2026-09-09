@@ -59,6 +59,7 @@ fn main() {
         Some("logout") => cmd_logout(&args[2..]),
         Some("pull") => cmd_pull(&args[2..]),
         Some("images") => cmd_images(&args[2..]),
+        Some("tag") => cmd_tag(&args[2..]),
         Some("rmi") => cmd_rmi(&args[2..]),
         Some("push") => cmd_push(&args[2..]),
         Some("commit") => cmd_commit(&args[2..]),
@@ -1634,6 +1635,70 @@ fn cmd_rmi(args: &[String]) -> i32 {
     }
 }
 
+fn cmd_tag(args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("usage: zerun tag SOURCE_IMAGE[:TAG] TARGET_IMAGE[:TAG]");
+        return 0;
+    }
+    if args.len() != 2 {
+        eprintln!("zerun tag: SOURCE_IMAGE and TARGET_IMAGE are required");
+        return 2;
+    }
+    let source = match Reference::parse(&args[0]) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("zerun tag: invalid source '{}': {e}", args[0]);
+            return 2;
+        }
+    };
+    let target = match Reference::parse(&args[1]) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("zerun tag: invalid target '{}': {e}", args[1]);
+            return 2;
+        }
+    };
+    if target.digest.is_some() {
+        eprintln!(
+            "zerun tag: target '{}' must be REPOSITORY[:TAG], not a digest reference",
+            args[1]
+        );
+        return 2;
+    }
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let imgstore = match image::store::ImageStore::open(&store) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let source_name = format!("{}/{}", source.registry, source.repository);
+    let target_name = format!("{}/{}", target.registry, target.repository);
+    match imgstore.tag_record(
+        &source_name,
+        source.tag.as_deref(),
+        source.digest.as_deref(),
+        &target_name,
+        target.tag.as_deref(),
+    ) {
+        Ok(record) => {
+            println!("{} -> {}", record.manifest, target.canonical());
+            0
+        }
+        Err(e) => {
+            eprintln!("zerun tag: {e}");
+            1
+        }
+    }
+}
+
 fn cmd_push(args: &[String]) -> i32 {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("usage: zerun push IMAGE[:TAG]");
@@ -2549,6 +2614,7 @@ USAGE:\n  \
   zerun logout [REGISTRY]               remove stored registry credentials\n  \
   zerun images                           list local images\n  \
   zerun rmi IMAGE...                     remove local images\n  \
+  zerun tag SOURCE TARGET[:TAG]          add a local tag to an image\n  \
   zerun push IMAGE[:TAG]                 push a local image to a registry\n  \
   zerun commit [-m MSG] CONTAINER IMAGE[:TAG]  save a container as an image\n  \
   zerun generate-service [opts] IMAGE    write a systemd unit to stdout\n  \

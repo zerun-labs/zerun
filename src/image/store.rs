@@ -268,6 +268,44 @@ impl ImageStore {
             .find(|r| r.name == name && r.tag.as_deref() == Some(tag)))
     }
 
+    /// Add another tag for an existing record (Docker `tag` semantics).
+    ///
+    /// The target replaces any prior record with the same name/tag. The source
+    /// may be tagged or digest-pinned; digest sources are useful for tagging
+    /// images that were pulled without a local tag.
+    pub fn tag_record(
+        &self,
+        source_name: &str,
+        source_tag: Option<&str>,
+        source_digest: Option<&str>,
+        target_name: &str,
+        target_tag: Option<&str>,
+    ) -> ZResult<ImageRecord> {
+        let Some(source) = self.find_record(source_name, source_tag, source_digest)? else {
+            let reference = match source_digest {
+                Some(d) => format!("{source_name}@{d}"),
+                None => format!("{}:{}", source_name, source_tag.unwrap_or("latest")),
+            };
+            return Err(crate::zerr!("No such image: {reference}"));
+        };
+        let Some(tag) = target_tag else {
+            return Err(crate::zerr!(
+                "tag target must be REPOSITORY[:TAG], not a digest reference"
+            ));
+        };
+        self.add_image(
+            target_name,
+            Some(tag),
+            &source.manifest,
+            &source.config,
+            source.size_bytes,
+        )?;
+        // `add_image` creates a new timestamped record; re-read it so callers
+        // observe exactly what is in the index after replacement.
+        self.find_record(target_name, Some(tag), None)?
+            .ok_or_else(|| crate::zerr!("tagged image vanished before it could be reported"))
+    }
+
     /// Remove one record for a reference (tag semantics like `docker rmi`).
     pub fn remove_record(
         &self,
@@ -439,6 +477,82 @@ mod tests {
         );
         assert!(digest_hex("md5:abc").is_err());
         assert!(digest_hex("sha256:short").is_err());
+    }
+
+    #[test]
+    fn tag_record_retags_tagged_and_digest_sources() {
+        let s = test_store();
+        let manifest = "sha256:".to_string() + &"1".repeat(64);
+        let config = "sha256:".to_string() + &"2".repeat(64);
+        s.add_image(
+            "docker.io/library/alpine",
+            Some("3.20"),
+            &manifest,
+            &config,
+            123,
+        )
+        .unwrap();
+        let target = s
+            .tag_record(
+                "docker.io/library/alpine",
+                Some("3.20"),
+                None,
+                "ghcr.io/org/app",
+                Some("v1"),
+            )
+            .unwrap();
+        assert_eq!(target.manifest, manifest);
+        assert_eq!(target.config, config);
+        assert_eq!(target.size_bytes, 123);
+        assert!(s
+            .find_record("ghcr.io/org/app", Some("v1"), None)
+            .unwrap()
+            .is_some());
+
+        let retarget = s
+            .tag_record(
+                "ghcr.io/org/app",
+                Some("v1"),
+                None,
+                "ghcr.io/org/app",
+                Some("v2"),
+            )
+            .unwrap();
+        assert_eq!(retarget.manifest, manifest);
+        assert!(s
+            .find_record("ghcr.io/org/app", Some("v2"), None)
+            .unwrap()
+            .is_some());
+
+        let digest_source = s
+            .tag_record(
+                "docker.io/library/alpine",
+                None,
+                Some(&manifest),
+                "localhost:5000/app",
+                Some("latest"),
+            )
+            .unwrap();
+        assert_eq!(digest_source.manifest, manifest);
+        assert!(s
+            .find_record("localhost:5000/app", Some("latest"), None)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn tag_record_rejects_missing_sources() {
+        let s = test_store();
+        let err = s
+            .tag_record(
+                "docker.io/library/missing",
+                None,
+                None,
+                "localhost:5000/app",
+                Some("v1"),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("No such image"));
     }
 
     #[test]
