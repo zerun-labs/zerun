@@ -98,6 +98,10 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--hostname".into());
         run_args.push(v.clone());
     }
+    if let Some(v) = &a.user {
+        run_args.push("--user".into());
+        run_args.push(v.clone());
+    }
     if a.net != NetMode::None {
         run_args.push("--net".into());
         run_args.push(match a.net {

@@ -414,6 +414,7 @@ mod tests {
                 env: vec!["PATH=/usr/bin".to_string()],
                 cmd: vec!["/bin/archived-marker".to_string()],
                 working_dir: "/".to_string(),
+                user: None,
                 comment: Some("archive round-trip".to_string()),
                 author: None,
             },

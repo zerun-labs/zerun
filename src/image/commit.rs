@@ -32,6 +32,8 @@ pub struct CommitOptions {
     /// Full command from lifecycle state (flattens entrypoint/cmd).
     pub cmd: Vec<String>,
     pub working_dir: String,
+    /// Container user (`config.User` in the committed image).
+    pub user: Option<String>,
     pub comment: Option<String>,
     pub author: Option<String>,
 }
@@ -295,6 +297,9 @@ fn build_config_json(options: &CommitOptions, diff_id: &str) -> serde_json::Valu
             "created_by": "zerun commit",
         }],
     });
+    if let Some(user) = &options.user {
+        config["config"]["User"] = serde_json::Value::String(user.clone());
+    }
     if let Some(comment) = &options.comment {
         config["history"][0]["comment"] = serde_json::Value::String(comment.clone());
     }
@@ -375,6 +380,7 @@ mod tests {
             env: vec!["PATH=/usr/bin".to_string()],
             cmd: vec!["/bin/committed-marker".to_string()],
             working_dir: "/".to_string(),
+            user: Some("1000:1000".to_string()),
             comment: Some("test snapshot".to_string()),
             author: Some("TheSkyC <0x4fe6@gmail.com>".to_string()),
         };
@@ -393,6 +399,7 @@ mod tests {
         let config: serde_json::Value = serde_json::from_slice(&config_bytes).unwrap();
         assert_eq!(config["config"]["Env"][0], "PATH=/usr/bin");
         assert_eq!(config["config"]["Cmd"][0], "/bin/committed-marker");
+        assert_eq!(config["config"]["User"], "1000:1000");
         assert_eq!(config["author"], "TheSkyC <0x4fe6@gmail.com>");
         assert_eq!(config["history"][0]["comment"], "test snapshot");
 

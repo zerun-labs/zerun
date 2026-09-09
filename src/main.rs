@@ -107,6 +107,9 @@ struct RunArgs {
     device_read_iops: Vec<cgroup::IoLimit>,
     device_write_iops: Vec<cgroup::IoLimit>,
     hostname: Option<String>,
+    /// Container user (`--user USER[:GROUP]`; image `config.User` wins when no
+    /// explicit flag is given).
+    user: Option<String>,
     net: NetMode,
     /// True after the operator explicitly selected `--net`.
     net_specified: bool,
@@ -170,6 +173,9 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--hostname" | "-h" => {
                 a.hostname = Some(next_value(args, &mut i, s)?);
+            }
+            "--user" | "-u" => {
+                a.user = Some(next_value(args, &mut i, "--user")?);
             }
             "--net" => {
                 let v = next_value(args, &mut i, "--net")?;
@@ -436,7 +442,7 @@ fn cmd_run(args: &[String]) -> i32 {
 
     // Resolve the container root filesystem and, for image mode, the process
     // environment / working directory / default command from the OCI config.
-    let (rootfs, env, cwd, argv) = if let Some(rootfs_str) = &a.rootfs {
+    let (rootfs, env, cwd, user, argv) = if let Some(rootfs_str) = &a.rootfs {
         if !a.env.is_empty() {
             eprintln!("zerun run: -e/--env requires image mode (drop --rootfs)");
             return 2;
@@ -453,7 +459,7 @@ fn cmd_run(args: &[String]) -> i32 {
         if argv.is_empty() {
             argv = vec!["/bin/sh".to_string()];
         }
-        (rootfs, None, None, argv)
+        (rootfs, None, None, None, argv)
     } else {
         let image = a.image.as_deref().expect("image required");
         let reference = match Reference::parse(image) {
@@ -473,7 +479,14 @@ fn cmd_run(args: &[String]) -> i32 {
                 } else {
                     Some(cfg.config.working_dir.clone())
                 };
-                (rootfs, Some(env), cwd, argv)
+                let user = a.user.clone().or_else(|| {
+                    if cfg.config.user.is_empty() {
+                        None
+                    } else {
+                        Some(cfg.config.user.clone())
+                    }
+                });
+                (rootfs, Some(env), cwd, user, argv)
             }
             Err(e) => {
                 eprintln!("zerun: {e}");
@@ -553,6 +566,7 @@ fn cmd_run(args: &[String]) -> i32 {
         id,
         env,
         cwd,
+        user,
         ports: a.ports,
         volumes: a.volumes,
         // Allocated from the file IPAM inside run_container (bridge mode).
@@ -673,6 +687,7 @@ fn run_detached(
         cmd: spec.argv.clone(),
         env,
         cwd: spec.cwd.clone(),
+        user: spec.user.clone(),
         log: log_path.display().to_string(),
         rootfs: state_rootfs.to_string(),
         overlay: container_fs
@@ -821,6 +836,9 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     }
     if let Some(v) = &a.hostname {
         args.extend(["--hostname".to_string(), v.clone()]);
+    }
+    if let Some(v) = &a.user {
+        args.extend(["--user".to_string(), v.clone()]);
     }
     args.extend(["--net".to_string(), net_label(a.net)]);
     if a.use_init {
@@ -1080,6 +1098,7 @@ fn cmd_commit(args: &[String]) -> i32 {
         env: st.env.clone(),
         cmd: st.cmd.clone(),
         working_dir: st.cwd.clone().unwrap_or_else(|| "/".to_string()),
+        user: st.user.clone(),
         comment: message,
         author,
     };
@@ -2898,6 +2917,7 @@ RUN OPTIONS:\n  \
   --device-read-iops DEV:COUNT   cgroup v2 io.max read IOPS (repeatable)\n  \
   --device-write-iops DEV:COUNT  cgroup v2 io.max write IOPS (repeatable)\n  \
   -h, --hostname H    container hostname (new UTS namespace)\n  \
+  -u, --user USER[:GROUP]  run as container user (numeric or /etc/passwd name)\n  \
   --net none|host|bridge\n  \
                       none = fresh netns + loopback; host = share host net;\n  \
                       bridge = zerun0 bridge + NAT (needs CAP_NET_ADMIN;\n  \
@@ -2979,6 +2999,19 @@ mod tests {
         assert!(launch_args.contains(&"--memory-reservation".to_string()));
         assert!(launch_args.contains(&"48M".to_string()));
         assert!(launch_args.contains(&"--oom-group".to_string()));
+    }
+
+    #[test]
+    fn parses_and_captures_user_flag() {
+        let args: Vec<_> = ["--user", "1000:1000", "alpine", "id"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let a = parse_run_args(&args).expect("--user");
+        assert_eq!(a.user.as_deref(), Some("1000:1000"));
+        let launch_args = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+        assert!(launch_args.contains(&"--user".to_string()));
+        assert!(launch_args.contains(&"1000:1000".to_string()));
     }
 
     #[test]

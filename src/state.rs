@@ -171,6 +171,10 @@ pub struct ContainerState {
     pub env: Vec<String>,
     /// Working directory inside the container at start.
     pub cwd: Option<String>,
+    /// Container user (`--user` or the image `config.User`) applied before
+    /// exec; `zerun exec` re-applies it. None = root.
+    #[serde(default)]
+    pub user: Option<String>,
     /// Absolute path to this container's console.log.
     pub log: String,
     /// Container root the process pivoted into (overlay merged dir, or the
@@ -441,6 +445,7 @@ mod tests {
             cmd: vec!["sh".to_string()],
             env: vec![],
             cwd: None,
+            user: None,
             log: format!("{}/x/console.log", std::env::temp_dir().display()),
             rootfs: String::new(),
             overlay: None,

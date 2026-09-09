@@ -256,6 +256,13 @@ fn worker(
         return 1;
     }
 
+    // Drop to the container's configured user (same sequence as `run`), so
+    // exec'd commands see the image/container identity instead of host root.
+    if let Err(e) = crate::security::switch_user(state.user.as_deref(), state.rootless) {
+        eprintln!("zerun exec: {e}");
+        return 1;
+    }
+
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(&resolved[0]);
     cmd.args(resolved.iter().skip(1));

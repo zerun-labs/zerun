@@ -27,6 +27,9 @@ pub struct ConfigSection {
     pub cmd: Vec<String>,
     #[serde(default, rename = "WorkingDir")]
     pub working_dir: String,
+    /// Image user (`USER` in a Dockerfile), e.g. "nginx" or "1000:1000".
+    #[serde(default, rename = "User")]
+    pub user: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -56,6 +59,7 @@ mod tests {
                 "config": {
                     "Env": ["PATH=/usr/local/sbin:/usr/bin:/bin"],
                     "WorkingDir": "/app",
+                    "User": "nginx:nginx",
                     "Cmd": ["/bin/sh"]
                 },
                 "rootfs": {
@@ -68,6 +72,7 @@ mod tests {
         assert_eq!(cfg.architecture, "amd64");
         assert_eq!(cfg.config.env.len(), 1);
         assert_eq!(cfg.config.working_dir, "/app");
+        assert_eq!(cfg.config.user, "nginx:nginx");
         assert_eq!(cfg.config.cmd, vec!["/bin/sh"]);
         assert_eq!(cfg.rootfs.diff_ids.len(), 1);
     }

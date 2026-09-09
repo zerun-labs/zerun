@@ -141,6 +141,9 @@ Run options (current subset):
 --device-read-iops DEV:COUNT  cgroup v2 io.max
 --device-write-iops DEV:COUNT cgroup v2 io.max
 -h, --hostname H     container hostname (new UTS namespace)
+-u, --user USER[:GROUP]
+                     run as a container user (numeric or from the image's /etc/passwd;
+                     image config USER applies automatically when --user is absent)
 --net bridge|none|host
                      bridge = rootful bridge networking on zerun0 (veth + eth0 in container;
                      rootful default); none = fresh netns with loopback only (rootless default);

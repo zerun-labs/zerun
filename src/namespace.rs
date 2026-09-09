@@ -61,6 +61,10 @@ pub struct RunSpec {
     pub env: Option<Vec<(String, String)>>,
     /// Working directory inside the container (None = "/").
     pub cwd: Option<String>,
+    /// Container user (`--user` or the image `config.User`), e.g. "nginx" or
+    /// "1000:1000". None keeps the root user (mapped to the host user in
+    /// rootless mode).
+    pub user: Option<String>,
     /// TCP ports published on the host (`-p HOST:CONTAINER`); only valid with
     /// `NetMode::Bridge`. Served by the built-in userland proxy in network.rs.
     pub ports: Vec<crate::network::PublishedPort>,
@@ -452,6 +456,10 @@ fn child_stage(
 
     // 3. Security hardening: no_new_privs -> capability drop -> seccomp profile.
     security::harden(spec.seccomp)?;
+
+    // 3a. Drop to the requested container user while CAP_SETUID/SETGID are still
+    // effective (the capability set was trimmed but these two are retained).
+    security::switch_user(spec.user.as_deref(), identity.rootless)?;
 
     // 3b. Move to the container working directory before the error pipe closes
     //     so a missing directory is reported to the parent as a setup failure.
