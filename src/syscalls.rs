@@ -123,6 +123,158 @@ pub fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(target: P, link: Q) -> ZResult<()
     Ok(())
 }
 
+// ---------- terminals / pseudo-terminals ----------
+
+/// Allocate a new host-side PTY pair.
+///
+/// The master gets CLOEXEC so a container child cannot accidentally inherit the
+/// host side across `execve`. The caller must dup2 the slave onto container
+/// stdio and close its own slave descriptor after clone.
+pub fn open_pty() -> ZResult<(RawFd, RawFd)> {
+    let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+    if master < 0 {
+        return Err(last_err("posix_openpt"));
+    }
+    if unsafe { libc::grantpt(master) } != 0 || unsafe { libc::unlockpt(master) } != 0 {
+        let e = std::io::Error::last_os_error();
+        close(master);
+        return Err(e.into());
+    }
+    let mut name = [0 as libc::c_char; 256];
+    if unsafe { libc::ptsname_r(master, name.as_mut_ptr(), name.len()) } != 0 {
+        let e = std::io::Error::last_os_error();
+        close(master);
+        return Err(e.into());
+    }
+    if unsafe { libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        let e = std::io::Error::last_os_error();
+        close(master);
+        return Err(e.into());
+    }
+    let slave = unsafe { libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+    if slave < 0 {
+        let e = std::io::Error::last_os_error();
+        close(master);
+        return Err(e.into());
+    }
+    Ok((master, slave))
+}
+
+pub fn is_terminal(fd: RawFd) -> bool {
+    unsafe { libc::isatty(fd) == 1 }
+}
+
+pub fn make_terminal_raw(fd: RawFd) -> ZResult<libc::termios> {
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
+        return Err(last_err("tcgetattr"));
+    }
+    let mut raw = saved;
+    unsafe { libc::cfmakeraw(&mut raw) };
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+        return Err(last_err("tcsetattr(TCSANOW)"));
+    }
+    Ok(saved)
+}
+
+pub fn restore_terminal(fd: RawFd, saved: &libc::termios) {
+    unsafe {
+        libc::tcsetattr(fd, libc::TCSANOW, saved);
+    }
+}
+
+pub fn terminal_window_size(fd: RawFd) -> ZResult<libc::winsize> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } != 0 {
+        return Err(last_err("ioctl(TIOCGWINSZ)"));
+    }
+    Ok(ws)
+}
+
+/// Best-effort terminal resize used when attaching an interactive PTY.
+pub fn copy_window_size(from: RawFd, to: RawFd) -> ZResult<()> {
+    let ws = terminal_window_size(from)?;
+    set_terminal_window_size(to, &ws)
+}
+
+pub fn set_terminal_window_size(fd: RawFd, ws: &libc::winsize) -> ZResult<()> {
+    if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, ws) } != 0 {
+        return Err(last_err("ioctl(TIOCSWINSZ)"));
+    }
+    Ok(())
+}
+
+/// Make `fd` the controlling terminal of the current (already new) session.
+pub fn set_controlling_terminal(fd: RawFd) -> ZResult<()> {
+    if unsafe { libc::ioctl(fd, libc::TIOCSCTTY, 0) } != 0 {
+        return Err(last_err("ioctl(TIOCSCTTY)"));
+    }
+    Ok(())
+}
+
+pub fn new_session() -> ZResult<libc::pid_t> {
+    let rc = unsafe { libc::setsid() };
+    if rc < 0 {
+        return Err(last_err("setsid"));
+    }
+    Ok(rc)
+}
+
+pub fn redirect_stdio(fd: RawFd) -> ZResult<()> {
+    dup2(fd, libc::STDIN_FILENO)?;
+    dup2(fd, libc::STDOUT_FILENO)?;
+    dup2(fd, libc::STDERR_FILENO)
+}
+
+pub fn install_signal_handler(sig: c_int, handler: extern "C" fn(c_int)) -> ZResult<()> {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = handler as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        if libc::sigaction(sig, &sa, std::ptr::null_mut()) != 0 {
+            return Err(last_err("sigaction"));
+        }
+    }
+    Ok(())
+}
+
+pub fn poll_fds(fds: &mut [libc::pollfd], timeout: c_int) -> ZResult<usize> {
+    loop {
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(e.into());
+        }
+        return Ok(n as usize);
+    }
+}
+
+pub fn write_all_fd(fd: RawFd, data: &[u8]) -> ZResult<()> {
+    let mut written = 0;
+    while written < data.len() {
+        let n = unsafe {
+            libc::write(
+                fd,
+                data[written..].as_ptr() as *const c_void,
+                data.len() - written,
+            )
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(e.into());
+        }
+        written += n as usize;
+    }
+    Ok(())
+}
+
 // ---------- prctl / capabilities ----------
 
 pub fn prctl_set(option: c_int, arg: libc::c_ulong) -> ZResult<()> {

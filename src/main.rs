@@ -19,6 +19,7 @@ mod namespace;
 mod netlink;
 mod network;
 mod nfnetlink;
+mod pty;
 mod seccomp;
 mod security;
 mod service;
@@ -98,6 +99,10 @@ struct RunArgs {
     ports: Vec<network::PublishedPort>,
     dns: Vec<String>,
     argv: Vec<String>,
+    /// `-i/--interactive`: keep stdin attached (foreground runs).
+    interactive: bool,
+    /// `-t/--tty`: allocate a PTY for the container (foreground runs).
+    tty: bool,
     /// `-d/--detach`: fork a reaper and return after the container starts.
     detach: bool,
     /// `--name NAME`: assign a human-friendly name (ps/stop/rm/logs/exec).
@@ -149,6 +154,19 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                         return Err(format!("invalid --net value '{other}' (bridge|host|none)"))
                     }
                 };
+            }
+            "-i" | "--interactive" => {
+                a.interactive = true;
+                i += 1;
+            }
+            "-t" | "--tty" => {
+                a.tty = true;
+                i += 1;
+            }
+            "-it" | "-ti" => {
+                a.interactive = true;
+                a.tty = true;
+                i += 1;
             }
             "--init" => {
                 a.use_init = true;
@@ -311,6 +329,13 @@ fn cmd_run(args: &[String]) -> i32 {
         eprintln!("zerun run: -p/--publish requires --net bridge");
         return 2;
     }
+    if a.tty && a.detach {
+        eprintln!("zerun run: -t/--tty cannot be used with -d/--detach yet");
+        return 2;
+    }
+    if a.interactive && a.detach {
+        eprintln!("zerun: warning: -i has no effect with -d (detached stdin is /dev/null)");
+    }
     if !a.dns.is_empty() && a.net != NetMode::Bridge {
         eprintln!("zerun: warning: --dns only applies to --net bridge; ignoring");
     }
@@ -367,7 +392,8 @@ fn cmd_run(args: &[String]) -> i32 {
         };
         match resolve_run_image(&store, &reference, a.platform.as_deref()) {
             Ok((rootfs, cfg)) => {
-                let env = build_image_env(&cfg.config.env, &a.env, a.hostname.as_deref(), &id);
+                let env =
+                    build_image_env(&cfg.config.env, &a.env, a.hostname.as_deref(), &id, a.tty);
                 let argv = resolve_image_argv(&cfg, &a.argv);
                 let cwd = if cfg.config.working_dir.is_empty() {
                     None
@@ -432,6 +458,8 @@ fn cmd_run(args: &[String]) -> i32 {
             pids: a.pids,
         },
         seccomp: a.seccomp,
+        tty: a.tty,
+        interactive: a.interactive,
         overlay,
         id,
         env,
@@ -741,6 +769,7 @@ fn build_image_env(
     overrides: &[String],
     hostname: Option<&str>,
     id: &str,
+    tty: bool,
 ) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = Vec::new();
     for entry in cfg_env {
@@ -770,6 +799,9 @@ fn build_image_env(
     }
     if workload::env_value(&env, "HOSTNAME").is_none() {
         env.push(("HOSTNAME".to_string(), hostname.unwrap_or(id).to_string()));
+    }
+    if tty && workload::env_value(&env, "TERM").is_none() {
+        env.push(("TERM".to_string(), "xterm".to_string()));
     }
     env
 }
@@ -1784,6 +1816,8 @@ RUN OPTIONS:\n  \
                       none = fresh netns + loopback; host = share host net;\n  \
                       bridge = zerun0 bridge + NAT (needs CAP_NET_ADMIN;\n  \
                       rootful default; rootless default is none)\n  \
+  -i, --interactive      keep stdin attached (foreground runs)\n  \
+  -t, --tty              allocate a PTY (foreground runs; combine with -i)\n  \
   -p, --publish HOST:CONTAINER  publish a TCP port on the host (requires --net bridge)\n  \
   --dns IP            container DNS server (repeatable; bridge mode; defaults to the host's)\n  \
   --init              run the built-in mini-init (reap orphans + forward signals)\n  \
@@ -1801,6 +1835,31 @@ ENV:\n  \
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_interactive_and_tty_flags() {
+        let args: Vec<_> = ["-it", "alpine", "echo"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let a = parse_run_args(&args).expect("combined flags");
+        assert!(a.interactive);
+        assert!(a.tty);
+
+        let args: Vec<_> = ["--interactive", "--tty", "alpine"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let a = parse_run_args(&args).expect("long flags");
+        assert!(a.interactive);
+        assert!(a.tty);
+    }
+
+    #[test]
+    fn image_tty_gets_default_term() {
+        let env = build_image_env(&[], &[], None, "abc123", true);
+        assert_eq!(workload::env_value(&env, "TERM"), Some("xterm"));
+    }
 
     #[test]
     fn rootful_defaults_to_bridge_and_rootless_to_none() {

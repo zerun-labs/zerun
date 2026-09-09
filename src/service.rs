@@ -194,6 +194,13 @@ fn validate(a: &RunArgs) -> Result<(), String> {
     if a.rm {
         return Err("--rm cannot be used with generate-service; systemd owns the lifecycle".into());
     }
+    if a.tty || a.interactive {
+        return Err(
+            "-t/--tty and -i/--interactive cannot be used with generate-service; \
+             service units have no attached terminal"
+                .into(),
+        );
+    }
     if a.rootfs.is_some() && a.image.is_some() {
         return Err("--rootfs and IMAGE are mutually exclusive".into());
     }

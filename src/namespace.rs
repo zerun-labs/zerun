@@ -46,6 +46,10 @@ pub struct RunSpec {
     pub use_init: bool,
     pub limits: ResourceLimits,
     pub seccomp: SeccompMode,
+    /// Allocate a PTY for foreground container stdio (`run -t`).
+    pub tty: bool,
+    /// Forward host stdin to the container (`run -i`).
+    pub interactive: bool,
     /// Per-container writable filesystem; None = pivot directly into `rootfs`.
     pub overlay: Option<OverlayPaths>,
     pub id: String,
@@ -117,6 +121,11 @@ where
     };
 
     let (err_r, err_w) = syscalls::pipe2_cloexec()?;
+    let mut pty_pair = if spec.tty {
+        Some(PtyPair::open()?)
+    } else {
+        None
+    };
 
     // Bridge mode needs a second pipe (parent -> child) so the child does not
     // exec before the veth peer has been moved into its netns. See module docs.
@@ -173,12 +182,27 @@ where
     let host_euid = unsafe { libc::geteuid() };
     let host_egid = unsafe { libc::getegid() };
 
+    let slave = pty_pair.as_ref().map_or(-1, |p| p.slave);
     let child_spec = spec.clone();
     let pid = syscalls::clone_into(flags, move || {
         child_main(
-            child_spec, err_w, err_r, net_sync, rootless, host_euid, host_egid,
+            child_spec,
+            ChildIpc {
+                err_w,
+                err_r,
+                net_sync,
+                tty_slave: slave,
+            },
+            ChildIdentity {
+                rootless,
+                host_euid,
+                host_egid,
+            },
         )
     })?;
+    if let Some(pair) = &mut pty_pair {
+        pair.release_slave();
+    }
     trace::mark("parent:clone:done");
 
     // The parent keeps neither the write end nor the child end of the error pipe.
@@ -250,6 +274,13 @@ where
     };
     on_started(&started);
 
+    let pty_pump = pty_pair.as_mut().map(|pair| {
+        // Transfer master ownership to the pump for the wait period. It either
+        // closes it on host-stdin EOF, or the short-lived CLI exits right after
+        // the container closes the PTY.
+        let master = pair.take_master();
+        crate::pty::attach(master, spec.tty && spec.interactive)
+    });
     let code = wait_pid(pid)?;
     if let Some(net) = &host_net {
         crate::network::teardown_host_side(net);
@@ -258,6 +289,9 @@ where
         cg.cleanup();
     }
     release_bridge_ip(&spec);
+    if let Some(handle) = pty_pump {
+        let _ = handle.join();
+    }
     trace::mark("parent:end");
     Ok(code)
 }
@@ -269,44 +303,79 @@ fn release_bridge_ip(spec: &RunSpec) {
     }
 }
 
-fn child_main(
-    spec: RunSpec,
+struct ChildIpc {
     err_w: RawFd,
     err_r: RawFd,
     net_sync: Option<(RawFd, RawFd)>,
+    tty_slave: RawFd,
+}
+
+struct ChildIdentity {
     rootless: bool,
     host_euid: u32,
     host_egid: u32,
-) -> ZResult<()> {
-    syscalls::close(err_r);
+}
+
+fn child_main(spec: RunSpec, ipc: ChildIpc, identity: ChildIdentity) -> ZResult<()> {
+    syscalls::close(ipc.err_r);
     // The net-ready pipe is parent -> child; the child never writes it.
-    let net_r = net_sync.map(|(r, w)| {
+    let net_r = ipc.net_sync.map(|(r, w)| {
         syscalls::close(w);
         r
     });
 
     // Report any failure to the parent over the pipe; the trampoline then exits 1.
-    let result = child_stage(&spec, rootless, host_euid, host_egid, err_w, net_r);
+    let result = child_stage(&spec, &identity, ipc.err_w, net_r, ipc.tty_slave);
     if let Err(e) = result {
         let msg = format!("{e}");
-        syscalls::write_fd(err_w, msg.as_bytes());
-        syscalls::close(err_w);
+        syscalls::write_fd(ipc.err_w, msg.as_bytes());
+        syscalls::close(ipc.err_w);
         return Err(e);
     }
     Ok(())
 }
 
+/// Prepare the process environment for exec. PTY workloads need a TERM value
+/// even when the legacy `--rootfs` path inherited no one from the host.
+fn exec_environment(spec: &RunSpec) -> Option<Vec<(String, String)>> {
+    let mut env = spec.env.clone();
+    if spec.tty {
+        if let Some(pairs) = &mut env {
+            if crate::workload::env_value(pairs, "TERM").is_none() {
+                pairs.push(("TERM".to_string(), "xterm".to_string()));
+            }
+        } else if std::env::var_os("TERM").is_none() {
+            // This runs only in the isolated child before Command inherits env.
+            std::env::set_var("TERM", "xterm");
+        }
+    }
+    env
+}
+
 fn child_stage(
     spec: &RunSpec,
-    rootless: bool,
-    host_euid: u32,
-    host_egid: u32,
+    identity: &ChildIdentity,
     err_w: RawFd,
     net_r: Option<RawFd>,
+    tty_slave: RawFd,
 ) -> ZResult<()> {
+    // 0. Put the container on the requested PTY before other stages can emit
+    // diagnostics; make it the session's controlling terminal so shells/signals
+    // behave normally.
+    if tty_slave >= 0 {
+        syscalls::redirect_stdio(tty_slave)?;
+        syscalls::new_session()?;
+        syscalls::set_controlling_terminal(tty_slave)?;
+        syscalls::close(tty_slave);
+    } else if !spec.interactive {
+        // Docker semantics: unless -i is requested, foreground containers do
+        // not consume the caller's stdin. Detached runs already devnull stdin.
+        syscalls::redirect_stdin_devnull()?;
+    }
+
     // 0. rootless: write the uid/gid mapping before doing any mounts.
-    if rootless {
-        write_self_id_mapping(host_euid, host_egid)?;
+    if identity.rootless {
+        write_self_id_mapping(identity.host_euid, identity.host_egid)?;
         if std::env::var_os("ZERUN_DEBUG").is_some() {
             let st = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
             for l in st.lines().filter(|l| l.starts_with("Cap")) {
@@ -319,7 +388,7 @@ fn child_stage(
     let cfg = RootfsConfig {
         rootfs: &spec.rootfs,
         hostname: spec.hostname.as_deref(),
-        rootless,
+        rootless: identity.rootless,
         overlay: spec.overlay.as_ref(),
     };
     setup_rootfs(&cfg)?;
@@ -378,26 +447,18 @@ fn child_stage(
     //    forever on the sync read.)
     syscalls::close(err_w);
     trace::mark("child:exec:begin");
-    let argv = crate::workload::resolve_argv(spec.env.as_deref(), &spec.argv);
+    let env = exec_environment(spec);
+    let argv = crate::workload::resolve_argv(env.as_deref(), &spec.argv);
     if spec.use_init {
-        let code = crate::mini_init::run(
-            &argv,
-            spec.env.as_deref(),
-            spec.hostname.as_deref(),
-            &spec.id,
-        )?;
+        let code =
+            crate::mini_init::run(&argv, env.as_deref(), spec.hostname.as_deref(), &spec.id)?;
         unsafe { libc::_exit(code) };
     }
 
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(&argv[0]);
     cmd.args(argv.iter().skip(1));
-    crate::workload::apply_env(
-        &mut cmd,
-        spec.env.as_deref(),
-        spec.hostname.as_deref(),
-        &spec.id,
-    );
+    crate::workload::apply_env(&mut cmd, env.as_deref(), spec.hostname.as_deref(), &spec.id);
     let err = cmd.exec(); // only returns on failure
     Err(crate::zerr!("execve failed: {err}"))
 }
@@ -502,6 +563,46 @@ fn read_all(fd: RawFd, buf: &mut [u8]) -> ZResult<usize> {
         total += n as usize;
         if total == buf.len() {
             return Ok(total);
+        }
+    }
+}
+
+/// Owns the parent-side ends of a PTY during clone/setup.
+struct PtyPair {
+    master: Option<RawFd>,
+    slave: RawFd,
+    child_owns_slave: bool,
+}
+
+impl PtyPair {
+    fn open() -> ZResult<Self> {
+        let (master, slave) = syscalls::open_pty()?;
+        Ok(Self {
+            master: Some(master),
+            slave,
+            child_owns_slave: false,
+        })
+    }
+
+    /// After a successful clone the parent must release the slave so the
+    /// container's exit can close the last slave-side descriptors.
+    fn release_slave(&mut self) {
+        syscalls::close(self.slave);
+        self.child_owns_slave = true;
+    }
+
+    fn take_master(&mut self) -> RawFd {
+        self.master.take().unwrap_or(-1)
+    }
+}
+
+impl Drop for PtyPair {
+    fn drop(&mut self) {
+        if let Some(master) = self.master.take() {
+            syscalls::close(master);
+        }
+        if !self.child_owns_slave {
+            syscalls::close(self.slave);
         }
     }
 }

@@ -119,6 +119,8 @@ Run options (current subset):
                      bridge = rootful bridge networking on zerun0 (veth + eth0 in container;
                      rootful default); none = fresh netns with loopback only (rootless default);
                      host = share host net
+-i, --interactive   keep stdin attached (foreground runs; without it stdin is /dev/null)
+-t, --tty           allocate a PTY (foreground runs; often combined as -it)
 --init               run built-in mini-init (reap orphans, forward signals)
 --seccomp default|unconfined   seccomp policy (default: deny-by-default allowlist)
 --platform os/arch[/variant]   pull/run a specific platform
