@@ -32,6 +32,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.14.1
+
       - name: Install cargo-zigbuild
         run: cargo install --locked cargo-zigbuild
 
