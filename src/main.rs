@@ -479,13 +479,17 @@ fn cmd_run(args: &[String]) -> i32 {
                 } else {
                     Some(cfg.config.working_dir.clone())
                 };
-                let user = a.user.clone().or_else(|| {
-                    if cfg.config.user.is_empty() {
-                        None
-                    } else {
-                        Some(cfg.config.user.clone())
-                    }
-                });
+                let rootless = unsafe { libc::geteuid() } != 0;
+                let image_user = if cfg.config.user.is_empty() {
+                    None
+                } else {
+                    Some(cfg.config.user.as_str())
+                };
+                let (user, user_warning) =
+                    resolve_image_user(a.user.as_deref(), image_user, rootless);
+                if let Some(w) = &user_warning {
+                    eprintln!("{w}");
+                }
                 (rootfs, Some(env), cwd, user, argv)
             }
             Err(e) => {
@@ -1277,6 +1281,47 @@ fn resolve_run_image(
 /// Build the container environment from the image config + `-e` overrides.
 /// The environment is fully specified (image mode clears the host env), so
 /// PATH/HOME/HOSTNAME defaults are guaranteed here.
+/// Decide the container user for image mode. An explicit `--user` always wins;
+/// otherwise the image `config.User` applies. Rootless user namespaces map only
+/// uid/gid 0 (the host user), so an image user that is not trivially root
+/// cannot be honored there: warn and degrade to root (the behavior before
+/// `--user` existed) instead of failing a run the operator never constrained.
+fn resolve_image_user(
+    explicit: Option<&str>,
+    image: Option<&str>,
+    rootless: bool,
+) -> (Option<String>, Option<String>) {
+    let Some(user) = explicit
+        .map(str::to_string)
+        .or_else(|| image.map(str::to_string))
+    else {
+        return (None, None);
+    };
+    if rootless && explicit.is_none() && !user_is_mappable_rootless(&user) {
+        (
+            None,
+            Some(format!(
+                "zerun: warning: image user '{user}' is not mappable rootless (only uid 0 is); running as uid 0"
+            )),
+        )
+    } else {
+        (Some(user), None)
+    }
+}
+
+/// True when a user spec can be satisfied by a rootless user namespace, which
+/// maps only uid/gid 0 (the host user). Names other than "root" are assumed
+/// unmappable — resolving them needs the container /etc/passwd.
+fn user_is_mappable_rootless(spec: &str) -> bool {
+    let (user, group) = match spec.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (spec, None),
+    };
+    let root_user = user == "0" || user == "root";
+    let root_group = group.is_none_or(|g| g == "0" || g == "root");
+    root_user && root_group
+}
+
 fn build_image_env(
     cfg_env: &[String],
     overrides: &[String],
@@ -3021,6 +3066,29 @@ mod tests {
         assert!(launch_args.contains(&"--memory-reservation".to_string()));
         assert!(launch_args.contains(&"48M".to_string()));
         assert!(launch_args.contains(&"--oom-group".to_string()));
+    }
+
+    #[test]
+    fn image_user_resolution_honors_explicit_and_degrades_rootless() {
+        // Explicit --user always wins (and rootless keeps the clear child error).
+        let (u, w) = resolve_image_user(Some("1000:1000"), Some("101"), true);
+        assert_eq!(u.as_deref(), Some("1000:1000"));
+        assert!(w.is_none());
+        // Rootful: image config.User applies when no flag is given.
+        let (u, w) = resolve_image_user(None, Some("101"), false);
+        assert_eq!(u.as_deref(), Some("101"));
+        assert!(w.is_none());
+        // Rootless auto image user that is not uid 0: warn and degrade to root.
+        let (u, w) = resolve_image_user(None, Some("101"), true);
+        assert!(u.is_none());
+        assert!(w.unwrap().contains("not mappable rootless"));
+        // Rootless trivial-root image users still apply (no warning).
+        let (u, w) = resolve_image_user(None, Some("0"), true);
+        assert_eq!(u.as_deref(), Some("0"));
+        assert!(w.is_none());
+        let (u, w) = resolve_image_user(None, Some("root:root"), true);
+        assert_eq!(u.as_deref(), Some("root:root"));
+        assert!(w.is_none());
     }
 
     #[test]
