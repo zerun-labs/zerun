@@ -442,6 +442,17 @@ where
 
 // ---------- bring loopback up inside a fresh netns ----------
 
+/// libc's ioctl request type differs between Linux libc ABIs.
+#[cfg(target_env = "musl")]
+fn ioctl_request(request: u64) -> libc::Ioctl {
+    request as libc::Ioctl
+}
+
+#[cfg(not(target_env = "musl"))]
+fn ioctl_request(request: u64) -> libc::Ioctl {
+    request
+}
+
 pub fn bring_loopback_up() -> ZResult<()> {
     unsafe {
         let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
@@ -453,13 +464,13 @@ pub fn bring_loopback_up() -> ZResult<()> {
         for (i, b) in name.iter().enumerate() {
             req.ifr_name[i] = *b as libc::c_char;
         }
-        if libc::ioctl(sock, libc::SIOCGIFFLAGS, &mut req) != 0 {
+        if libc::ioctl(sock, ioctl_request(libc::SIOCGIFFLAGS), &mut req) != 0 {
             libc::close(sock);
             return Err(last_err("SIOCGIFFLAGS"));
         }
         let flags = req.ifr_ifru.ifru_flags;
         req.ifr_ifru.ifru_flags = flags | libc::IFF_UP as i16;
-        if libc::ioctl(sock, libc::SIOCSIFFLAGS, &mut req) != 0 {
+        if libc::ioctl(sock, ioctl_request(libc::SIOCSIFFLAGS), &mut req) != 0 {
             libc::close(sock);
             return Err(last_err("SIOCSIFFLAGS"));
         }
