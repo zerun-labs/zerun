@@ -68,6 +68,9 @@ command. It uses `/usr/local` when it has root access and falls back to
 On Arch Linux, a source package is provided in `packaging/aur/PKGBUILD`. It
 builds the tagged release with Cargo and installs both commands.
 
+A Homebrew source formula is provided in `packaging/homebrew/zerun.rb` for
+Homebrew on Linux.
+
 ## Build
 
 ```bash
