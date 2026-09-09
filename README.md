@@ -131,8 +131,11 @@ Run options (current subset):
 --name NAME          name the container (ps/stop/rm/logs/exec accept it)
 --rm                 remove state + writable layer automatically on exit
 -m, --memory 64M     cgroup v2 memory.max (K/M/G suffixes)
+--memory-reservation 64M
+                     cgroup v2 memory.high soft limit
 --cpus 0.5           cgroup v2 cpu.max (cores)
 --pids 256           cgroup v2 pids.max
+--oom-group          kill the whole cgroup on OOM
 --device-read-bps DEV:RATE    cgroup v2 io.max (e.g. /dev/sda:10mb)
 --device-write-bps DEV:RATE   cgroup v2 io.max (e.g. 8:0:10mb)
 --device-read-iops DEV:COUNT  cgroup v2 io.max

@@ -55,6 +55,10 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--memory".into());
         run_args.push(v.clone());
     }
+    if let Some(v) = &a.memory_reservation {
+        run_args.push("--memory-reservation".into());
+        run_args.push(v.clone());
+    }
     if let Some(v) = a.cpus {
         run_args.push("--cpus".into());
         run_args.push(v.to_string());
@@ -62,6 +66,9 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
     if let Some(v) = a.pids {
         run_args.push("--pids".into());
         run_args.push(v.to_string());
+    }
+    if a.oom_group {
+        run_args.push("--oom-group".into());
     }
     for v in &a.device_read_bps {
         if let Some(limit) = v.read_bps {
@@ -381,6 +388,25 @@ mod tests {
 
         let invalid = args(&["--no-overlay", "--tmpfs-upper", "alpine"]);
         assert!(render(Path::new("/bin/zerun"), &invalid, true).is_err());
+    }
+
+    #[test]
+    fn renders_memory_reservation_and_oom_group() {
+        let a = args(&[
+            "--memory",
+            "64M",
+            "--memory-reservation",
+            "48M",
+            "--oom-group",
+            "--name",
+            "web",
+            "alpine",
+            "true",
+        ]);
+        let unit = render(Path::new("/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains(" --memory 64M "));
+        assert!(unit.contains(" --memory-reservation 48M "));
+        assert!(unit.contains(" --oom-group "));
     }
 
     #[test]

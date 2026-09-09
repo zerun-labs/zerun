@@ -1,7 +1,9 @@
 //! Resource constraints: cgroups v2.
 //!
 //! Implements the direct cgroupfs driver (mkdir under the unified hierarchy).
-//! A systemd-scope driver and a cgroups v1 fallback belong to later milestones.
+//! Besides hard limits it applies `memory.high` (soft reservation) and
+//! `memory.oom.group` for all-at-once OOM behavior. A systemd-scope driver and
+//! a cgroups v1 fallback belong to later milestones.
 use crate::error::{last_err, ZResult};
 use crate::trace;
 use std::collections::BTreeMap;
@@ -13,12 +15,16 @@ use std::path::{Path, PathBuf};
 pub struct ResourceLimits {
     /// Raw size strings such as "64M", "512m", "1G"; None means no limit.
     pub memory: Option<String>,
+    /// Soft memory reservation written to cgroups v2 `memory.high`.
+    pub memory_reservation: Option<String>,
     /// CPU cores (fractional), e.g. 0.5 -> cpu.max "50000 100000".
     pub cpus: Option<f64>,
     /// Process count limit pids.max (default suggestion for low-end hosts: 256).
     pub pids: Option<i64>,
     /// Block I/O limits for cgroups v2 `io.max`, grouped by device on write.
     pub io: Vec<IoLimit>,
+    /// Kill the whole cgroup (not one task) on OOM via `memory.oom.group`.
+    pub oom_group: bool,
 }
 
 /// One device's I/O ceilings. `None` means "leave the kernel default".
@@ -61,6 +67,10 @@ impl CgroupV2 {
             // Lock swap to the same ceiling so memory limits cannot be bypassed.
             let _ = cg.write("memory.swap.max", bytes.to_string());
         }
+        if let Some(high) = &limits.memory_reservation {
+            let bytes = parse_size(high)?;
+            cg.write("memory.high", bytes.to_string())?;
+        }
         if let Some(cpus) = limits.cpus {
             if cpus > 0.0 {
                 let quota = (cpus * 100_000.0).round() as i64;
@@ -73,6 +83,9 @@ impl CgroupV2 {
         if !limits.io.is_empty() {
             require_controller(&parent, "io")?;
             cg.write("io.max", io_max_value(&limits.io))?;
+        }
+        if limits.oom_group {
+            cg.write("memory.oom.group", "1".to_string())?;
         }
         trace::mark("parent:cgroup:configured");
         Ok(cg)

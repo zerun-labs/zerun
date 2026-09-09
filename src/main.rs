@@ -94,8 +94,10 @@ struct RunArgs {
     rootfs: Option<String>,
     image: Option<String>,
     memory: Option<String>,
+    memory_reservation: Option<String>,
     cpus: Option<f64>,
     pids: Option<i64>,
+    oom_group: bool,
     device_read_bps: Vec<cgroup::IoLimit>,
     device_write_bps: Vec<cgroup::IoLimit>,
     device_read_iops: Vec<cgroup::IoLimit>,
@@ -140,6 +142,13 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--memory" | "-m" => {
                 a.memory = Some(next_value(args, &mut i, s)?);
+            }
+            "--memory-reservation" => {
+                a.memory_reservation = Some(next_value(args, &mut i, s)?);
+            }
+            "--oom-group" => {
+                a.oom_group = true;
+                i += 1;
             }
             "--cpus" => {
                 let v = next_value(args, &mut i, "--cpus")?;
@@ -521,8 +530,10 @@ fn cmd_run(args: &[String]) -> i32 {
         use_init: a.use_init,
         limits: ResourceLimits {
             memory: a.memory,
+            memory_reservation: a.memory_reservation,
             cpus: a.cpus,
             pids: a.pids,
+            oom_group: a.oom_group,
             io: [
                 a.device_read_bps,
                 a.device_write_bps,
@@ -759,11 +770,17 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     if let Some(v) = &a.memory {
         args.extend(["--memory".to_string(), v.clone()]);
     }
+    if let Some(v) = &a.memory_reservation {
+        args.extend(["--memory-reservation".to_string(), v.clone()]);
+    }
     if let Some(v) = a.cpus {
         args.extend(["--cpus".to_string(), v.to_string()]);
     }
     if let Some(v) = a.pids {
         args.extend(["--pids".to_string(), v.to_string()]);
+    }
+    if a.oom_group {
+        args.push("--oom-group".to_string());
     }
     for v in &a.device_read_bps {
         if let Some(limit) = v.read_bps {
@@ -2543,8 +2560,10 @@ RUN OPTIONS:\n  \
   --name NAME     assign a name (ps/stop/rm/logs/exec address it by name)\n  \
   --rm            remove state and the writable layer when the container exits\n  \
   -m, --memory 64M    cgroup v2 memory.max (K/M/G suffixes)\n  \
+  --memory-reservation 64M    cgroup v2 memory.high soft limit\n  \
   --cpus 0.5          cgroup v2 cpu.max (cores)\n  \
   --pids 256          cgroup v2 pids.max\n  \
+  --oom-group         kill the whole cgroup on OOM (memory.oom.group)\n  \
   --device-read-bps DEV:BYTES    cgroup v2 io.max read rate (repeatable)\n  \
   --device-write-bps DEV:BYTES   cgroup v2 io.max write rate (repeatable)\n  \
   --device-read-iops DEV:COUNT   cgroup v2 io.max read IOPS (repeatable)\n  \
@@ -2608,6 +2627,29 @@ mod tests {
                 "1"
             ]
         );
+    }
+
+    #[test]
+    fn captures_memory_reservation_and_oom_group() {
+        let args: Vec<_> = [
+            "--memory",
+            "64M",
+            "--memory-reservation",
+            "48M",
+            "--oom-group",
+            "alpine",
+            "true",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_run_args(&args).expect("memory controls");
+        assert_eq!(a.memory_reservation.as_deref(), Some("48M"));
+        assert!(a.oom_group);
+        let launch_args = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+        assert!(launch_args.contains(&"--memory-reservation".to_string()));
+        assert!(launch_args.contains(&"48M".to_string()));
+        assert!(launch_args.contains(&"--oom-group".to_string()));
     }
 
     #[test]
