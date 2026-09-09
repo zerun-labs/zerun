@@ -4,7 +4,7 @@
 //! "container started" (id) and exits; the forked child becomes the reaper —
 //! a per-container, daemonless process that
 //!
-//!   1. redirects its stdio (and therefore the container's) to console.log,
+//!   1. captures container stdout/stderr into a timestamped console.log,
 //!   2. runs the normal isolation path (`namespace::run_container_with_hook`),
 //!   3. persists "running" state and releases the CLI exactly when the
 //!      workload has exec'd,
@@ -20,8 +20,11 @@ use crate::fsutil;
 use crate::namespace::{run_container_with_hook, RunSpec};
 use crate::state::{self, ContainerState, Status};
 use crate::store::{ContainerFs, Store};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::os::fd::RawFd;
 use std::path::Path;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// The detached reaper's whole job. Runs the container, persists state, then
@@ -34,8 +37,22 @@ pub fn run_detached(
     container_fs: Option<ContainerFs>,
     remove_state: bool,
     started_w: RawFd,
+    log_path: &Path,
+    previous_log_fd: RawFd,
 ) -> i32 {
     let id = spec.id.clone();
+    // Replace inherited stdio with a timestamping collector before clone so
+    // the container's real stdout/stderr are the collector's write ends.
+    let mut captured_log = match CapturedLog::install(log_path, previous_log_fd) {
+        Ok(log) => log,
+        Err(e) => {
+            eprintln!("zerun: install log collector: {e}");
+            let msg = format!("1: install log collector: {e}\n");
+            let _ = write_all(started_w, msg.as_bytes());
+            let _ = unsafe { libc::close(started_w) };
+            return 1;
+        }
+    };
     let mut signaled = false;
     let mut code = 1;
     let result = run_container_with_hook(spec, |info| {
@@ -76,6 +93,10 @@ pub fn run_detached(
         let _ = unsafe { libc::close(started_w) };
     }
 
+    // Close the pipe write ends and flush the final partial line before the
+    // state record is marked Exited.
+    captured_log.finish();
+
     // Final state: exited.
     if let Some(mut st) = ContainerState::load(&store, &id) {
         st.status = Status::Exited;
@@ -91,6 +112,74 @@ pub fn run_detached(
         fsutil::remove_dir_all_quiet(&dir);
     }
     code
+}
+
+/// Background pipe -> timestamped console.log collector.
+struct CapturedLog {
+    reader: Option<JoinHandle<()>>,
+}
+
+impl CapturedLog {
+    fn install(log_path: &Path, previous_log_fd: RawFd) -> ZResult<Self> {
+        let log_file = OpenOptions::new().append(true).open(log_path)?;
+        let (read_fd, write_fd) = crate::syscalls::pipe2_cloexec()?;
+
+        // Detached stdin has no terminal. stdout/stderr become the pipe read by
+        // the collector; the container inherits these write ends through clone.
+        // The original log File is no longer needed because the collector owns
+        // its own append-mode handle.
+        crate::syscalls::redirect_stdin_devnull()?;
+        crate::syscalls::dup2(write_fd, libc::STDOUT_FILENO)?;
+        crate::syscalls::dup2(write_fd, libc::STDERR_FILENO)?;
+        crate::syscalls::close(write_fd);
+        crate::syscalls::close(previous_log_fd);
+
+        let reader = std::thread::Builder::new()
+            .name("zerun-log".to_string())
+            .stack_size(64 * 1024)
+            .spawn(move || collect_timestamped(read_fd, log_file))?;
+        Ok(Self {
+            reader: Some(reader),
+        })
+    }
+
+    /// Signal EOF to the collector and wait for it to flush.
+    fn finish(&mut self) {
+        crate::syscalls::close(libc::STDOUT_FILENO);
+        crate::syscalls::close(libc::STDERR_FILENO);
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn collect_timestamped(read_fd: RawFd, mut output: File) {
+    let mut pending: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8 * 1024];
+    loop {
+        match crate::syscalls::read_fd(read_fd, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => pending.extend_from_slice(&buf[..n as usize]),
+            Err(_) => break,
+        }
+        while let Some(end) = pending.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = pending.drain(..=end).collect();
+            if write_timestamped_line(&mut output, &line).is_err() {
+                crate::syscalls::close(read_fd);
+                return;
+            }
+        }
+    }
+    if !pending.is_empty() {
+        let _ = write_timestamped_line(&mut output, &pending);
+    }
+    crate::syscalls::close(read_fd);
+}
+
+fn write_timestamped_line(output: &mut File, line: &[u8]) -> std::io::Result<()> {
+    output.write_all(state::now_rfc3339_nanos().as_bytes())?;
+    output.write_all(b"\t")?;
+    output.write_all(line)
 }
 
 /// Reconcile one stale "running" record (reaper died): mark it exited and

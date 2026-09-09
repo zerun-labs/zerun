@@ -557,12 +557,20 @@ fn run_detached(
             unsafe {
                 libc::setsid();
             }
-            redirect_stdio(log_fd.as_raw_fd());
-            let code = lifecycle::run_detached(store.clone(), spec, container_fs, rm, started_w);
+            let code = lifecycle::run_detached(
+                store.clone(),
+                spec,
+                container_fs,
+                rm,
+                started_w,
+                &log_path,
+                log_fd.as_raw_fd(),
+            );
             unsafe { libc::_exit(code) }
         }
         _ => {
             // --- foreground CLI: wait for the start signal ---
+            drop(log_fd);
             syscalls::close(started_w);
             let mut msg = Vec::new();
             let mut buf = [0u8; 256];
@@ -606,20 +614,6 @@ fn net_label(net: NetMode) -> String {
         NetMode::None => "none".to_string(),
         NetMode::Host => "host".to_string(),
         NetMode::Bridge => "bridge".to_string(),
-    }
-}
-
-/// Point stdin at /dev/null and stdout/stderr at `log_fd` (the reaper and the
-/// container it clones inherit these, which is how `ze logs` works).
-fn redirect_stdio(log_fd: std::os::fd::RawFd) {
-    unsafe {
-        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
-        if devnull >= 0 {
-            libc::dup2(devnull, 0);
-            libc::close(devnull);
-        }
-        libc::dup2(log_fd, 1);
-        libc::dup2(log_fd, 2);
     }
 }
 
@@ -1328,6 +1322,7 @@ fn rm_one(store: &Store, target: &str, force: bool) -> Result<String, String> {
 fn cmd_logs(args: &[String]) -> i32 {
     let mut tail: Option<usize> = None;
     let mut follow = false;
+    let mut timestamps = false;
     let mut targets: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -1350,8 +1345,12 @@ fn cmd_logs(args: &[String]) -> i32 {
                 follow = true;
                 i += 1;
             }
+            "-t" | "--timestamps" => {
+                timestamps = true;
+                i += 1;
+            }
             "-h" | "--help" => {
-                println!("usage: zerun logs [--tail N] [-f] CONTAINER");
+                println!("usage: zerun logs [--tail N] [-f] [-t|--timestamps] CONTAINER");
                 return 0;
             }
             other if other.starts_with('-') && other.len() > 1 => {
@@ -1395,23 +1394,23 @@ fn cmd_logs(args: &[String]) -> i32 {
         }
     };
     let shown = tail_bytes(&bytes, tail.unwrap_or(usize::MAX));
-    write_stdout(shown);
+    write_log_output(shown, timestamps);
     if follow {
-        follow_log(&store, &st, &path, shown.len() as u64);
+        follow_log(&store, &st, &path, shown.len() as u64, timestamps);
     }
     0
 }
 
 /// Print data appended to `console.log` until the container exits.
-fn follow_log(store: &Store, st: &ContainerState, path: &Path, mut pos: u64) {
+fn follow_log(store: &Store, st: &ContainerState, path: &Path, mut pos: u64, timestamps: bool) {
     while container_observable(store, st) {
         std::thread::sleep(Duration::from_millis(200));
-        pos = drain_log(path, pos);
+        pos = drain_log(path, pos, timestamps);
     }
-    drain_log(path, pos);
+    drain_log(path, pos, timestamps);
 }
 
-fn drain_log(path: &Path, pos: u64) -> u64 {
+fn drain_log(path: &Path, pos: u64, timestamps: bool) -> u64 {
     use std::io::{Read, Seek};
     let Ok(mut f) = std::fs::File::open(path) else {
         return pos;
@@ -1427,7 +1426,7 @@ fn drain_log(path: &Path, pos: u64) -> u64 {
     }
     let mut buf = Vec::new();
     if f.read_to_end(&mut buf).is_ok() {
-        write_stdout(&buf);
+        write_log_output(&buf, timestamps);
     }
     len
 }
@@ -1574,6 +1573,55 @@ fn wait_pid_gone(pid: i32, timeout: Duration) -> bool {
     !pid_alive(pid)
 }
 
+/// `console.log` stores timestamps at capture time. Docker-style default
+/// output omits them, while `-t` displays the recorded timestamps verbatim.
+/// Legacy logs without the known prefix pass through unchanged.
+fn write_log_output(data: &[u8], timestamps: bool) {
+    if timestamps {
+        write_stdout(data);
+    } else {
+        write_stdout(&strip_log_timestamps(data));
+    }
+}
+
+fn strip_log_timestamps(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut start = 0;
+    while start < data.len() {
+        let end = data[start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| start + p + 1)
+            .unwrap_or(data.len());
+        let line = &data[start..end];
+        if let Some(content) = timestamp_prefix(line) {
+            out.extend_from_slice(content);
+        } else {
+            out.extend_from_slice(line);
+        }
+        start = end;
+    }
+    out
+}
+
+/// Return the line content after an RFC3339 nanosecond timestamp + TAB.
+fn timestamp_prefix(line: &[u8]) -> Option<&[u8]> {
+    const TS_LEN: usize = 30; // 2026-01-01T00:00:00.000000000Z
+    if line.len() <= TS_LEN + 1 || line[TS_LEN] != b'\t' || !is_utc_rfc3339(&line[..TS_LEN]) {
+        return None;
+    }
+    Some(&line[TS_LEN + 1..])
+}
+
+fn is_utc_rfc3339(b: &[u8]) -> bool {
+    const SEPARATORS: [u8; 30] = *b"YYYY-MM-DDTHH:MM:SS.NNNNNNNNNZ";
+    b.len() == 30
+        && b.iter().zip(SEPARATORS).all(|(got, want)| match want {
+            b'Y' | b'M' | b'D' | b'H' | b'S' | b'N' => got.is_ascii_digit(),
+            _ => *got == want,
+        })
+}
+
 /// Keep only the last `n` lines of `data` (newline-terminated lines; a
 /// trailing newline does not produce an extra empty line).
 fn tail_bytes(data: &[u8], n: usize) -> &[u8] {
@@ -1693,7 +1741,7 @@ USAGE:\n  \
   zerun ps [-a]                         list containers (detached)\n  \
   zerun stop [--time S] CONTAINER...    SIGTERM, then SIGKILL after the timeout\n  \
   zerun rm [-f] CONTAINER...            remove stopped containers (-f: kill first)\n  \
-  zerun logs [--tail N] [-f] CONTAINER  show a container's console.log\n  \
+  zerun logs [--tail N] [-f] [-t] CONTAINER  show a container's console.log\n  \
   zerun exec [-e K=V] [-w DIR] CONTAINER CMD [ARG...]\n  \
                                         run a command in a running container\n  \
   zerun pull [--platform ...] IMAGE...   pull OCI images (Docker Hub, mirrors)\n  \
@@ -1726,4 +1774,21 @@ ENV:\n  \
   ZERUN_TRACE=1   print per-stage nanosecond timings to stderr (bench harness)\n  \
   ZERUN_REGISTRY_MIRRORS=...  comma-separated Docker Hub mirrors"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_timestamps_are_hidden_by_default_and_shown_on_request() {
+        const RAW: &[u8] = b"2026-01-01T00:00:00.123456789Z\thello\nlegacy\npartial";
+        assert_eq!(strip_log_timestamps(RAW), b"hello\nlegacy\npartial");
+        assert_eq!(timestamp_prefix(RAW), Some(&b"hello\nlegacy\npartial"[..]));
+        let first_line_end = RAW.iter().position(|&b| b == b'\n').unwrap() + 1;
+        assert_eq!(
+            timestamp_prefix(&RAW[..first_line_end]),
+            Some(&b"hello\n"[..])
+        );
+    }
 }

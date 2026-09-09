@@ -150,6 +150,26 @@ pub fn now_rfc3339() -> String {
     )
 }
 
+/// RFC3339 timestamp with nanosecond precision for captured log lines.
+///
+/// Log timestamps must identify individual writes; second precision can make
+/// an entire burst of output look simultaneous and reorder ambiguously.
+pub fn now_rfc3339_nanos() -> String {
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let days = (d.as_secs() / 86400) as i64;
+    let rem = d.as_secs() % 86400;
+    let (y, m, day) = civil_from_days(days);
+    format!(
+        "{y:04}-{m:02}-{day:02}T{:02}:{:02}:{:02}.{:09}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60,
+        d.subsec_nanos()
+    )
+}
+
 /// Howard Hinnant's civil_from_days algorithm (days since 1970-01-01).
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
@@ -213,6 +233,15 @@ pub fn list(store: &Store) -> Vec<ContainerState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_timestamp_has_nanosecond_precision() {
+        let ts = now_rfc3339_nanos();
+        assert_eq!(ts.len(), 30);
+        assert!(ts.ends_with('Z'));
+        assert_eq!(ts.as_bytes()[10], b'T');
+        assert_eq!(ts.as_bytes()[19], b'.');
+    }
 
     #[test]
     fn timestamps_look_rfc3339() {

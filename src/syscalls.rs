@@ -4,7 +4,7 @@
 use crate::error::{last_err, ZResult};
 use libc::{c_int, c_void};
 use std::ffi::{CStr, CString};
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
 
 // ---------- mounts ----------
@@ -164,6 +164,20 @@ pub fn close(fd: RawFd) {
     unsafe {
         libc::close(fd);
     }
+}
+
+/// Duplicate a file descriptor (`new` replaces it and is not CLOEXEC).
+pub fn dup2(old: RawFd, new: RawFd) -> ZResult<()> {
+    if unsafe { libc::dup2(old, new) } < 0 {
+        return Err(last_err("dup2"));
+    }
+    Ok(())
+}
+
+/// Point stdin at /dev/null so a detached container has no controlling CLI.
+pub fn redirect_stdin_devnull() -> ZResult<()> {
+    let devnull = std::fs::File::open("/dev/null")?;
+    dup2(devnull.as_raw_fd(), libc::STDIN_FILENO)
 }
 
 pub fn read_fd(fd: RawFd, buf: &mut [u8]) -> ZResult<isize> {

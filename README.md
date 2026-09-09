@@ -139,6 +139,7 @@ sudo target/release/zerun run -d --name web -p 18080:80 --net bridge --init \
 
 sudo target/release/zerun ps                          # running containers
 sudo target/release/zerun logs --tail 20 web          # container console.log
+sudo target/release/zerun logs -t web                 # include capture timestamps
 sudo target/release/zerun exec web /bin/sh            # join the container
 sudo target/release/zerun stop --time 3 web           # SIGTERM, then SIGKILL
 sudo target/release/zerun rm web                      # remove the stopped container
@@ -147,6 +148,7 @@ sudo target/release/zerun rm web                      # remove the stopped conta
 Detached containers keep no daemon: the per-container reaper is a tiny process that
 disappears when the container exits. If the host crashes (or the reaper is killed), the
 next `ps`/`rm` reconciles the stale record and reclaims host-side resources.
+`logs` hides capture-time timestamps by default; `-t/--timestamps` shows them.
 
 ### systemd integration (M6)
 
