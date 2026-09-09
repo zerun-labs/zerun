@@ -11,14 +11,16 @@
 //! host-side failure). The child configures `eth0` only after the signal, so
 //! networking is up before the workload starts.
 //!
-//! `run_container_with_hook` exposes the moment the workload has exec'd
+//! `run_container_with_report` exposes the moment the workload has exec'd
 //! (`StartedInfo`) so the detached reaper (src/lifecycle.rs) can persist
-//! "running" state and release the foreground CLI at exactly the right time.
+//! "running" state and release the foreground CLI at exactly the right time,
+//! and returns final cgroup metrics before cleanup.
 use crate::cgroup::{CgroupV2, ResourceLimits};
 use crate::error::ZResult;
 use crate::mounts::{setup_rootfs, BindMount, OverlayPaths, RootfsConfig};
 use crate::seccomp::SeccompMode;
 use crate::security;
+use crate::state::ContainerMetrics;
 use crate::syscalls;
 use crate::trace;
 use std::os::fd::RawFd;
@@ -96,16 +98,22 @@ pub struct StartedInfo {
     pub cgroup: Option<String>,
 }
 
-/// Full run path without a lifecycle hook. Returns the workload exit code.
-pub fn run_container(spec: RunSpec) -> ZResult<i32> {
-    run_container_with_hook(spec, |_| {})
+/// Result of the parent's full run path.
+pub struct RunExit {
+    pub code: i32,
+    /// Metrics captured just before the cgroup is cleaned up. `None` when no
+    /// cgroup was created or the control files were unavailable.
+    pub metrics: Option<ContainerMetrics>,
 }
 
-/// Full run path. `on_started` fires in the parent exactly when the child has
-/// exec'd the workload (error-pipe EOF), before the parent blocks on waitpid;
-/// detached mode uses it to persist state and release the foreground CLI.
-/// Returns the workload exit code.
-pub fn run_container_with_hook<F>(spec: RunSpec, on_started: F) -> ZResult<i32>
+/// Full run path without a lifecycle hook. Returns the workload exit code.
+pub fn run_container(spec: RunSpec) -> ZResult<i32> {
+    Ok(run_container_with_report(spec, |_| {})?.code)
+}
+
+/// Full run path, returning both the exit code and final cgroup metrics. This
+/// is the implementation used by `run_container` and `run_container_with_hook`.
+pub fn run_container_with_report<F>(spec: RunSpec, on_started: F) -> ZResult<RunExit>
 where
     F: FnOnce(&StartedInfo),
 {
@@ -115,8 +123,10 @@ where
     // Create the cgroup on the parent side first (attach right after clone).
     // Skipped when no limits are set (typical rootless without delegation).
     let has_limits = spec.limits.memory.is_some()
+        || spec.limits.memory_reservation.is_some()
         || spec.limits.cpus.is_some()
         || spec.limits.pids.is_some()
+        || spec.limits.oom_group
         || !spec.limits.io.is_empty();
     let cg = if has_limits {
         Some(CgroupV2::create(&spec.id, &spec.limits)?)
@@ -263,7 +273,10 @@ where
             cg.cleanup();
         }
         release_bridge_ip(&spec);
-        return Ok(1);
+        return Ok(RunExit {
+            code: 1,
+            metrics: None,
+        });
     }
     trace::mark("parent:child-execved");
 
@@ -289,6 +302,12 @@ where
     if let Some(net) = &host_net {
         crate::network::teardown_host_side(net);
     }
+    // Read metrics while the cgroup still exists; it is removed immediately
+    // below and detached state needs the final snapshot for `stats`.
+    let metrics = cg
+        .as_ref()
+        .filter(|cg| cg.path().exists())
+        .map(|cg| ContainerMetrics::from_cgroup_path(cg.path()));
     if let Some(cg) = cg {
         cg.cleanup();
     }
@@ -297,7 +316,7 @@ where
         let _ = handle.join();
     }
     trace::mark("parent:end");
-    Ok(code)
+    Ok(RunExit { code, metrics })
 }
 
 /// Best-effort release of a bridge IP back to the file IPAM.

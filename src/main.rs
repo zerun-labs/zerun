@@ -54,6 +54,7 @@ fn main() {
         Some("restart") => cmd_restart(&args[2..]),
         Some("rm") => cmd_rm(&args[2..]),
         Some("logs") => cmd_logs(&args[2..]),
+        Some("stats") => cmd_stats(&args[2..]),
         Some("exec") => cmd_exec(&args[2..]),
         Some("login") => cmd_login(&args[2..]),
         Some("logout") => cmd_logout(&args[2..]),
@@ -680,6 +681,7 @@ fn run_detached(
         table: None,
         veth: None,
         cgroup: None,
+        metrics: None,
     };
     if let Err(e) = st.save() {
         eprintln!("zerun: {e}");
@@ -2300,6 +2302,131 @@ fn container_observable(store: &Store, st: &ContainerState) -> bool {
     }
 }
 
+fn cmd_stats(args: &[String]) -> i32 {
+    let mut all = false;
+    let mut targets: Vec<String> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "-a" | "--all" => all = true,
+            // Docker-compatible spelling for a single sample. This command is
+            // intentionally one-shot; it never tails the control files.
+            "--no-stream" => {}
+            "-h" | "--help" => {
+                println!("usage: zerun stats [-a] [--no-stream] [CONTAINER...]");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun stats: unknown option {other}");
+                return 2;
+            }
+            other => targets.push(other.to_string()),
+        }
+    }
+    if !all && targets.is_empty() {
+        eprintln!("zerun stats: specify at least one CONTAINER or use -a for all containers");
+        return 2;
+    }
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let mut states: Vec<state::ContainerState> = Vec::new();
+    if all {
+        for mut st in state::list(&store) {
+            if lifecycle::reconcile_stale(&store, &mut st) {
+                let _ = st.save();
+            }
+            states.push(st);
+        }
+    } else {
+        for target in &targets {
+            match state::resolve(&store, target) {
+                Ok(mut st) => {
+                    if lifecycle::reconcile_stale(&store, &mut st) {
+                        let _ = st.save();
+                    }
+                    states.push(st);
+                }
+                Err(e) => {
+                    eprintln!("zerun stats: {e}");
+                    return 1;
+                }
+            }
+        }
+    }
+
+    let headers = [
+        "NAME".to_string(),
+        "CPU TIME".to_string(),
+        "MEM USAGE".to_string(),
+        "MEM PEAK".to_string(),
+        "PIDS".to_string(),
+        "BLOCK I/O".to_string(),
+    ];
+    let rows: Vec<Vec<String>> = states
+        .iter()
+        .map(|st| {
+            let metrics = if st.status == state::Status::Running {
+                st.cgroup
+                    .as_deref()
+                    .map(Path::new)
+                    .filter(|p| p.exists())
+                    .map(state::ContainerMetrics::from_cgroup_path)
+                    .or(st.metrics)
+            } else {
+                st.metrics
+            };
+            stats_row(display_name(st), metrics)
+        })
+        .collect();
+    print!("{}", render_table(&headers, &rows));
+    0
+}
+
+fn stats_row(name: String, metrics: Option<state::ContainerMetrics>) -> Vec<String> {
+    let m = metrics.unwrap_or_default();
+    vec![
+        name,
+        m.cpu_usage_usec
+            .map(human_duration)
+            .unwrap_or_else(|| "-".into()),
+        m.memory_bytes
+            .map(fsutil::human_size)
+            .unwrap_or_else(|| "-".into()),
+        m.memory_peak_bytes
+            .map(fsutil::human_size)
+            .unwrap_or_else(|| "-".into()),
+        m.pids.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+        match (m.io_read_bytes, m.io_write_bytes) {
+            (Some(read), Some(write)) => format!(
+                "{} / {}",
+                fsutil::human_size(read),
+                fsutil::human_size(write)
+            ),
+            (None, Some(write)) => format!("- / {}", fsutil::human_size(write)),
+            (Some(read), None) => format!("{} / -", fsutil::human_size(read)),
+            (None, None) => "-".to_string(),
+        },
+    ]
+}
+
+/// Render cumulative microseconds compactly for CLI tables.
+fn human_duration(usec: u64) -> String {
+    let secs_f = usec as f64 / 1_000_000.0;
+    if secs_f < 1.0 {
+        format!("{usec}us")
+    } else if secs_f < 60.0 {
+        format!("{secs_f:.2}s")
+    } else {
+        let mins = (secs_f / 60.0).floor() as u64;
+        let secs = secs_f - mins as f64 * 60.0;
+        format!("{mins}m{secs:04.1}s")
+    }
+}
+
 fn cmd_exec(args: &[String]) -> i32 {
     let mut env_extra: Vec<String> = Vec::new();
     let mut workdir: Option<String> = None;
@@ -2606,6 +2733,7 @@ USAGE:\n  \
   zerun restart [--time S] CONTAINER... restart detached containers\n  \
   zerun rm [-f] CONTAINER...            remove stopped containers (-f: kill first)\n  \
   zerun logs [--tail N] [-f] [-t] CONTAINER  show a container's console.log\n  \
+  zerun stats [-a] [CONTAINER...]        one-shot resource metrics\n  \
   zerun exec [-e K=V] [-w DIR] CONTAINER CMD [ARG...]\n  \
                                         run a command in a running container\n  \
   zerun pull [--platform ...] IMAGE...   pull OCI images (Docker Hub, mirrors)\n  \

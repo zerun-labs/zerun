@@ -27,6 +27,116 @@ pub enum Status {
     Exited,
 }
 
+/// Final cgroup metrics captured by the reaper before cleanup.
+///
+/// Running containers are read directly from the live cgroup; exited
+/// containers keep this snapshot so `stats` remains useful after the cgroup
+/// directory is removed. Fields are optional because older kernels may not
+/// expose every control file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerMetrics {
+    /// Current or final memory usage in bytes (`memory.current`).
+    pub memory_bytes: Option<u64>,
+    /// Highest observed memory usage in bytes (`memory.peak`).
+    pub memory_peak_bytes: Option<u64>,
+    /// Cumulative CPU time in microseconds (`cpu.stat usage_usec`).
+    pub cpu_usage_usec: Option<u64>,
+    /// PIDs observed at capture time (`pids.current`).
+    pub pids: Option<u64>,
+    /// Sum of `rbps` values across devices (`io.stat`).
+    pub io_read_bytes: Option<u64>,
+    /// Sum of `wbps` values across devices (`io.stat`).
+    pub io_write_bytes: Option<u64>,
+}
+
+/// Parse a cgroup v2 key/value stat file. Missing files yield `None`.
+impl ContainerMetrics {
+    pub fn from_cgroup_path(path: &Path) -> Self {
+        let memory_bytes = read_u64(&path.join("memory.current"));
+        let memory_peak_bytes = read_u64(&path.join("memory.peak"));
+        let cpu_stat = std::fs::read_to_string(path.join("cpu.stat")).ok();
+        let cpu_usage_usec = cpu_stat
+            .as_deref()
+            .and_then(|text| stat_value(text, "usage_usec"));
+        let pids = read_u64(&path.join("pids.current"));
+        let io_stat = std::fs::read_to_string(path.join("io.stat")).ok();
+        let (io_read_bytes, io_write_bytes) =
+            io_stat.as_deref().map(io_bytes).unwrap_or((None, None));
+        Self {
+            memory_bytes,
+            memory_peak_bytes,
+            cpu_usage_usec,
+            pids,
+            io_read_bytes,
+            io_write_bytes,
+        }
+    }
+}
+
+fn read_u64(path: &Path) -> Option<u64> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+}
+
+/// Extract the unsigned value for `key` from whitespace-separated stat lines.
+fn stat_value(text: &str, key: &str) -> Option<u64> {
+    let mut fields = text.split_whitespace();
+    while let (Some(k), Some(v)) = (fields.next(), fields.next()) {
+        if k == key {
+            return v.parse::<u64>().ok();
+        }
+    }
+    None
+}
+
+/// Aggregate `io.stat` byte counters across all listed devices.
+///
+/// Each line is `<MAJOR:MINOR> key=value...`; parse line-by-line so the device
+/// identifier does not become a value in a flat key/value stream.
+fn io_bytes(text: &str) -> (Option<u64>, Option<u64>) {
+    let mut read_bytes = 0_u64;
+    let mut write_bytes = 0_u64;
+    let mut saw_read = false;
+    let mut saw_write = false;
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        // The first token is the device; the remaining tokens are key/value
+        // pairs such as `rbps=1024` or separate `rbps 1024` forms.
+        if fields.next().is_none() {
+            continue;
+        }
+        while let Some(token) = fields.next() {
+            // The kernel emits `key=value`; also accept `key value` for tests
+            // and hand-written fixtures.
+            let (key, value) = if let Some(pair) = token.split_once('=') {
+                pair
+            } else {
+                let Some(value) = fields.next() else { break };
+                (token, value)
+            };
+            let Ok(value) = value.parse::<u64>() else {
+                continue;
+            };
+            match key {
+                "rbps" => {
+                    read_bytes = read_bytes.saturating_add(value);
+                    saw_read = true;
+                }
+                "wbps" => {
+                    write_bytes = write_bytes.saturating_add(value);
+                    saw_write = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    (
+        saw_read.then_some(read_bytes),
+        saw_write.then_some(write_bytes),
+    )
+}
+
 /// Persistent per-container record (versioned for future migrations).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerState {
@@ -83,6 +193,9 @@ pub struct ContainerState {
     pub veth: Option<String>,
     /// cgroup v2 directory path, when limits were applied.
     pub cgroup: Option<String>,
+    /// Final metrics captured before cgroup cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<ContainerMetrics>,
 }
 
 impl ContainerState {
@@ -264,6 +377,50 @@ mod tests {
     }
 
     #[test]
+    fn reads_metrics_from_cgroup_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-cgroup-metrics-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("memory.current"), b"4096\n").unwrap();
+        std::fs::write(dir.join("memory.peak"), b"8192\n").unwrap();
+        std::fs::write(dir.join("pids.current"), b"3\n").unwrap();
+        std::fs::write(
+            dir.join("cpu.stat"),
+            b"usage_usec 123456\nuser_usec 1000\nsystem_usec 2000\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("io.stat"),
+            b"8:0 rbps=1024 wbps=128 riops=1 wiops=2\n8:16 rbps=256 wbps=64 riops=3 wiops=4\n",
+        )
+        .unwrap();
+        let m = ContainerMetrics::from_cgroup_path(&dir);
+        assert_eq!(m.memory_bytes, Some(4096));
+        assert_eq!(m.memory_peak_bytes, Some(8192));
+        assert_eq!(m.cpu_usage_usec, Some(123456));
+        assert_eq!(m.pids, Some(3));
+        assert_eq!(m.io_read_bytes, Some(1280));
+        assert_eq!(m.io_write_bytes, Some(192));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stat_values_tolerate_missing_or_malformed_fields() {
+        assert_eq!(stat_value("usage_usec abc\nother 3", "other"), Some(3));
+        assert_eq!(stat_value("usage_usec x", "usage_usec"), None);
+        assert_eq!(stat_value("other 1", "usage_usec"), None);
+        let (read, write) = io_bytes("8:0 rbps notanumber wbps 10\n8:16 rbps=2 wbps=3");
+        assert_eq!(read, Some(2));
+        // The malformed rbps contributes no aggregate.
+        assert_eq!(write, Some(13));
+        assert_eq!(io_bytes(""), (None, None));
+    }
+
+    #[test]
     fn resolve_matches_name_and_prefix() {
         let mut a = ContainerState {
             version: 1,
@@ -292,6 +449,7 @@ mod tests {
             table: None,
             veth: None,
             cgroup: None,
+            metrics: None,
         };
         // The struct has no store; save requires a writable dir under the log path.
         // Exercise save/load round trip through a temp dir instead.

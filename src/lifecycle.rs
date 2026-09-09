@@ -17,7 +17,7 @@
 //! so the leftover nft table / veth / cgroup / IPAM record are reclaimed.
 use crate::error::ZResult;
 use crate::fsutil;
-use crate::namespace::{run_container_with_hook, RunSpec};
+use crate::namespace::{run_container_with_report, RunSpec};
 use crate::state::{self, ContainerState, Status};
 use crate::store::{ContainerFs, Store};
 use std::fs::{File, OpenOptions};
@@ -55,7 +55,7 @@ pub fn run_detached(
     };
     let mut signaled = false;
     let mut code = 1;
-    let result = run_container_with_hook(spec, |info| {
+    let result = run_container_with_report(spec, |info| {
         // Persist "running" before releasing the CLI so `ze ps` never sees a
         // Created-but-alive container.
         if let Some(mut st) = ContainerState::load(&store, &id) {
@@ -72,8 +72,12 @@ pub fn run_detached(
         let _ = write_all(started_w, b"0\n");
         let _ = unsafe { libc::close(started_w) };
     });
+    let mut metrics = None;
     match result {
-        Ok(c) => code = c,
+        Ok(exit) => {
+            code = exit.code;
+            metrics = exit.metrics;
+        }
         Err(e) => {
             // Setup failed before the child could exec (cgroup create, bridge
             // allocation...). The error pipe path inside namespace.rs prints its
@@ -97,8 +101,10 @@ pub fn run_detached(
     // state record is marked Exited.
     captured_log.finish();
 
-    // Final state: exited.
+    // Final state: exited. Namespace capture already snapshotted metrics just
+    // before cgroup cleanup; keep any older snapshot when unavailable.
     if let Some(mut st) = ContainerState::load(&store, &id) {
+        st.metrics = metrics.or(st.metrics);
         st.status = Status::Exited;
         st.exit_code = Some(code);
         st.finished = Some(state::now_rfc3339());
@@ -201,7 +207,11 @@ pub fn reconcile_stale(store: &Store, st: &mut ContainerState) -> bool {
         crate::network::teardown_named(veth, table);
     }
     if let Some(cg) = st.cgroup.as_deref() {
-        let _ = std::fs::remove_dir(cg);
+        let path = Path::new(cg);
+        if path.exists() {
+            st.metrics = Some(state::ContainerMetrics::from_cgroup_path(path));
+        }
+        let _ = std::fs::remove_dir(path);
     }
     if st.net == "bridge" {
         crate::network::release_ip(store.run_root(), &st.id);
