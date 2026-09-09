@@ -482,8 +482,7 @@ fn apply_masked_and_readonly() -> ZResult<()> {
     Ok(())
 }
 
-/// Bind a host file into the container (currently only simple binds such as
-/// resolv.conf/hosts; volumes arrive in a later milestone).
+/// Bind a host file into the container (internal /etc files and DNS setup).
 #[allow(dead_code)]
 pub fn bind_file_into(src_on_host: &Path, target_in_root: &str) -> ZResult<()> {
     let _ = src_on_host;

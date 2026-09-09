@@ -2,7 +2,7 @@
 //!
 //! Scope: authenticated OCI `pull`, `login`, and `logout`. It implements the
 //! Docker v2 token flow (WWW-Authenticate challenge -> Bearer token), Basic
-//! challenges, multi-arch manifest resolution, and Docker Hub mirror
+//! challenges, multi-arch manifest resolution with transient retries, and Docker Hub mirror
 //! inheritance. Mirror priority: env `ZERUN_REGISTRY_MIRRORS`, then the zerun
 //! config file (`/etc/zerun/config.toml`, or `ZERUN_CONFIG` / user config;
 //! `[registry] mirrors = [...]`), then `/etc/docker/daemon.json`'s
@@ -11,6 +11,7 @@
 use crate::error::ZResult;
 use crate::image::auth::{normalize_registry, Credential, CredentialStore};
 use std::collections::{BTreeMap, HashMap};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const USER_AGENT: &str = concat!("zerun/", env!("CARGO_PKG_VERSION"));
@@ -92,31 +93,56 @@ impl RegistryClient {
                     req = req.set("Authorization", &tok.authorization);
                 }
             }
-            match req.call() {
-                Ok(resp) => return Ok(resp),
-                Err(ureq::Error::Status(401, resp)) => {
-                    let challenge = resp.header("www-authenticate").unwrap_or("").to_string();
-                    self.tokens.remove(&scope);
-                    let credential = self.credential_for(registry, url).cloned();
-                    let authorization =
-                        self.authorization_for_challenge(&challenge, repo, credential.as_ref())?;
-                    self.tokens.insert(
-                        scope.clone(),
-                        CachedToken {
-                            authorization,
-                            expires_at: now() + 55,
-                        },
-                    );
+            for attempt in 0..3 {
+                let mut req = self.agent.get(url).set("User-Agent", USER_AGENT);
+                if let Some(a) = accept {
+                    req = req.set("Accept", a);
                 }
-                Err(ureq::Error::Status(code, resp)) => {
-                    let body = resp.into_string().unwrap_or_default();
-                    let snippet: String = body.chars().take(300).collect();
-                    return Err(crate::zerr!(
-                        "registry request failed: {url}: HTTP {code}: {snippet}"
-                    ));
+                if let Some(tok) = cached.as_ref() {
+                    if now() < tok.expires_at {
+                        req = req.set("Authorization", &tok.authorization);
+                    }
                 }
-                Err(e) => {
-                    return Err(crate::zerr!("registry request failed: {url}: {e}"));
+                match req.call() {
+                    Ok(resp) => return Ok(resp),
+                    Err(ureq::Error::Status(401, resp)) => {
+                        let challenge = resp.header("www-authenticate").unwrap_or("").to_string();
+                        self.tokens.remove(&scope);
+                        let credential = self.credential_for(registry, url).cloned();
+                        let authorization = self.authorization_for_challenge(
+                            &challenge,
+                            repo,
+                            credential.as_ref(),
+                        )?;
+                        self.tokens.insert(
+                            scope.clone(),
+                            CachedToken {
+                                authorization,
+                                expires_at: now() + 55,
+                            },
+                        );
+                        break;
+                    }
+                    Err(ureq::Error::Status(code, resp)) => {
+                        let retry_after = retry_after(&resp);
+                        let body = resp.into_string().unwrap_or_default();
+                        let snippet: String = body.chars().take(300).collect();
+                        let err =
+                            crate::zerr!("registry request failed: {url}: HTTP {code}: {snippet}");
+                        if is_retryable_status(code) && attempt < 2 {
+                            thread::sleep(retry_delay(attempt, retry_after));
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                    Err(e) => {
+                        let err = crate::zerr!("registry request failed: {url}: {e}");
+                        if attempt < 2 {
+                            thread::sleep(retry_delay(attempt, None));
+                            continue;
+                        }
+                        return Err(err);
+                    }
                 }
             }
         }
@@ -205,17 +231,37 @@ impl RegistryClient {
             url.push_str(&encode_query(&format!("repository:{repo}:pull")));
         }
 
-        let mut request = self.agent.get(&url).set("User-Agent", USER_AGENT);
-        if let Some(credential) = credential {
-            request = request.set("Authorization", &credential.authorization());
-        }
-        let resp = request.call().map_err(|e| match e {
-            ureq::Error::Status(code, r) => {
-                let body = r.into_string().unwrap_or_default();
-                crate::zerr!("token endpoint {url}: HTTP {code}: {body}")
-            }
-            other => crate::zerr!("token endpoint {url}: {other}"),
-        })?;
+        let resp = (0..3)
+            .find_map(|attempt| {
+                let mut request = self.agent.get(&url).set("User-Agent", USER_AGENT);
+                if let Some(credential) = credential {
+                    request = request.set("Authorization", &credential.authorization());
+                }
+                match request.call() {
+                    Ok(resp) => Some(Ok(resp)),
+                    Err(ureq::Error::Status(code, resp)) => {
+                        let retry_after = retry_after(&resp);
+                        let body = resp.into_string().unwrap_or_default();
+                        let err = crate::zerr!("token endpoint {url}: HTTP {code}: {body}");
+                        if is_retryable_status(code) && attempt < 2 {
+                            thread::sleep(retry_delay(attempt, retry_after));
+                            None
+                        } else {
+                            Some(Err(err))
+                        }
+                    }
+                    Err(other) => {
+                        let err = crate::zerr!("token endpoint {url}: {other}");
+                        if attempt < 2 {
+                            thread::sleep(retry_delay(attempt, None));
+                            None
+                        } else {
+                            Some(Err(err))
+                        }
+                    }
+                }
+            })
+            .expect("retry loop always returns a final result")?;
         let body = resp
             .into_string()
             .map_err(|e| crate::zerr!("read token response: {e}"))?;
@@ -387,6 +433,27 @@ fn encode_query(s: &str) -> String {
     out
 }
 
+/// Transport failures and transient HTTP responses are worth one or two quick retries.
+fn is_retryable_status(code: u16) -> bool {
+    code == 408 || code == 429 || (500..600).contains(&code)
+}
+
+fn retry_after(resp: &ureq::Response) -> Option<Duration> {
+    resp.header("retry-after")?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+fn retry_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
+    let mut delay = Duration::from_millis(250 << attempt);
+    if let Some(wait) = retry_after {
+        delay = delay.max(wait.min(Duration::from_secs(5)));
+    }
+    delay.min(Duration::from_secs(5))
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -397,6 +464,21 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retries_only_transient_http_statuses() {
+        assert!(is_retryable_status(408));
+        assert!(is_retryable_status(429));
+        assert!(is_retryable_status(503));
+        assert!(!is_retryable_status(401));
+        assert!(!is_retryable_status(404));
+        assert_eq!(retry_delay(0, None), Duration::from_millis(250));
+        assert_eq!(retry_delay(1, None), Duration::from_millis(500));
+        assert_eq!(
+            retry_delay(0, Some(Duration::from_secs(30))),
+            Duration::from_secs(5)
+        );
+    }
 
     #[test]
     fn parses_bearer_challenge() {

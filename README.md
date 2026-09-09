@@ -24,7 +24,8 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   volumes with `-v HOST:CONTAINER[:ro|rw]`; optional ephemeral `--tmpfs-upper` writable layers.
 - **M3 — OCI image engine (done)**: `zerun login / logout / pull / images / rmi`; Docker v2
   pull with Bearer token auth, private-registry credentials, multi-arch platform selection (`--platform`), compressed-blob and
-  diff_id double verification, zstd layer decode + magic sniffing, mirror inheritance
+  diff_id double verification, zstd layer decode + magic sniffing, transient request retries,
+  mirror inheritance
   (env, zerun `config.toml`, `/etc/docker/daemon.json`), and per-layer pull progress;
   `zerun run IMAGE` auto-pulls and applies image env/entrypoint/cmd/working-dir.
 - **M4 — kernel networking (done)**: `--net bridge` (rootful) creates the `zerun0` bridge
