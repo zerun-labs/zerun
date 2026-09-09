@@ -1,0 +1,35 @@
+# Maintainer: TheSkyC <0x4fe6@gmail.com>
+pkgname=zerun
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="Daemonless, single-binary Linux container runtime for low-end and edge hosts"
+arch=('x86_64' 'aarch64' 'armv7h' 'riscv64')
+url="https://github.com/zerun-labs/zerun"
+license=('Apache-2.0')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo' 'git')
+source=("git+$url.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "zerun"
+  cargo fetch --locked
+}
+
+build() {
+  cd "zerun"
+  cargo build --locked --release
+}
+
+check() {
+  cd "zerun"
+  cargo test --locked --release
+}
+
+package() {
+  cd "zerun"
+  install -Dm0755 target/release/zerun "$pkgdir/usr/bin/zerun"
+  ln -s zerun "$pkgdir/usr/bin/ze"
+  install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/zerun/LICENSE"
+  install -Dm0644 README.md "$pkgdir/usr/share/doc/zerun/README.md"
+}

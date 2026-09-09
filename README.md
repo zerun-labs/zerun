@@ -65,6 +65,9 @@ musl build, verifies SHA-256, and creates `zerun` plus the shorter `ze`
 command. It uses `/usr/local` when it has root access and falls back to
 `~/.local` for rootless hosts.
 
+On Arch Linux, a source package is provided in `packaging/aur/PKGBUILD`. It
+builds the tagged release with Cargo and installs both commands.
+
 ## Build
 
 ```bash
