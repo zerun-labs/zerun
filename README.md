@@ -32,8 +32,8 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   (pure netlink), `-p HOST:CONTAINER` publishing through a built-in userland proxy
   (Docker's docker-proxy in-binary), and `--dns` / host resolv.conf inheritance.
 - **M5 — detached lifecycle (done)**: `run -d` forks a tiny per-container reaper that
-  redirects stdio to `console.log` and persists state to disk; `ps [-a]`, `stop`, `rm`,
-  `logs [-f]`, and `exec` address containers by id/name with crash reconcile of stale
+  redirects stdio to `console.log` and persists state to disk; `ps [-a]`, `stop`, `restart`,
+  `rm`, `logs [-f]`, and `exec` address containers by id/name with crash reconcile of stale
   records; file-based IPAM; `--rm` for auto-removal (see AGENTS.md).
 
 ## Highlights
@@ -47,8 +47,8 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
 - **Secure defaults**: `PR_SET_NO_NEW_PRIVS`, capability bounding-set cleared, masked
   `/proc`/`/sys` paths, and a deny-by-default seccomp allowlist (opt out with
   `--seccomp unconfined`).
-- **Docker-compatible top 20% CLI**: `run / ps / stop / rm / logs / exec / pull / images /
-  rmi / generate-service / doctor`.
+- **Docker-compatible top 20% CLI**: `run / ps / stop / restart / rm / logs / exec / pull /
+  images / rmi / generate-service / doctor`.
 
 ## Install
 
@@ -145,6 +145,7 @@ sudo target/release/zerun logs --tail 20 web          # container console.log
 sudo target/release/zerun logs -t web                 # include capture timestamps
 sudo target/release/zerun exec web /bin/sh            # join the container
 sudo target/release/zerun stop --time 3 web           # SIGTERM, then SIGKILL
+sudo target/release/zerun restart --time 3 web        # stop, then recreate from saved options
 sudo target/release/zerun rm web                      # remove the stopped container
 ```
 
@@ -152,6 +153,8 @@ Detached containers keep no daemon: the per-container reaper is a tiny process t
 disappears when the container exits. If the host crashes (or the reaper is killed), the
 next `ps`/`rm` reconciles the stale record and reclaims host-side resources.
 `logs` hides capture-time timestamps by default; `-t/--timestamps` shows them.
+`restart` recreates a detached container from the canonical launch options saved in
+`state.json`; containers created before this metadata was added are not restartable.
 
 ### systemd integration (M6)
 

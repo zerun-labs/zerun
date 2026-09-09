@@ -47,6 +47,7 @@ fn main() {
         Some("run") => cmd_run(&args[2..]),
         Some("ps") => cmd_ps(&args[2..]),
         Some("stop") => cmd_stop(&args[2..]),
+        Some("restart") => cmd_restart(&args[2..]),
         Some("rm") => cmd_rm(&args[2..]),
         Some("logs") => cmd_logs(&args[2..]),
         Some("exec") => cmd_exec(&args[2..]),
@@ -376,7 +377,7 @@ fn cmd_run(args: &[String]) -> i32 {
             );
             return 2;
         }
-        let mut argv = a.argv;
+        let mut argv = a.argv.clone();
         if argv.is_empty() {
             argv = vec!["/bin/sh".to_string()];
         }
@@ -434,6 +435,12 @@ fn cmd_run(args: &[String]) -> i32 {
         None => (rootfs.clone(), None),
     };
 
+    let launch_args = if a.detach {
+        detached_launch_args(&a, &rootfs)
+    } else {
+        Vec::new()
+    };
+
     let image_desc = match &a.image {
         Some(i) => i.clone(),
         None => format!("rootfs:{}", rootfs.display()),
@@ -477,8 +484,11 @@ fn cmd_run(args: &[String]) -> i32 {
             container_fs,
             &image_desc,
             &state_rootfs,
-            a.name,
-            a.rm,
+            DetachedInfo {
+                launch_args,
+                name: a.name,
+                rm: a.rm,
+            },
         );
     }
 
@@ -502,19 +512,24 @@ fn cmd_run(args: &[String]) -> i32 {
 /// reaper child (src/lifecycle.rs); it writes `0` / `1:<error>` over the
 /// started pipe so the CLI never reports success for a container that failed
 /// to start.
+struct DetachedInfo {
+    launch_args: Vec<String>,
+    name: Option<String>,
+    rm: bool,
+}
+
 fn run_detached(
     store: &Store,
     spec: RunSpec,
     container_fs: Option<store::ContainerFs>,
     image_desc: &str,
     state_rootfs: &str,
-    name: Option<String>,
-    rm: bool,
+    info: DetachedInfo,
 ) -> i32 {
     use std::os::unix::io::AsRawFd;
 
     let id = spec.id.clone();
-    if let Some(n) = &name {
+    if let Some(n) = &info.name {
         if state::list(store)
             .iter()
             .any(|c| c.name.as_deref() == Some(n))
@@ -550,7 +565,7 @@ fn run_detached(
     let st = state::ContainerState {
         version: 1,
         id: id.clone(),
-        name,
+        name: info.name,
         image: image_desc.to_string(),
         pid: None,
         status: state::Status::Created,
@@ -570,6 +585,7 @@ fn run_detached(
         overlay: container_fs
             .as_ref()
             .map(|fs| fs.dir().display().to_string()),
+        launch_args: Some(info.launch_args),
         table: None,
         veth: None,
         cgroup: None,
@@ -605,7 +621,7 @@ fn run_detached(
                 store.clone(),
                 spec,
                 container_fs,
-                rm,
+                info.rm,
                 started_w,
                 &log_path,
                 log_fd.as_raw_fd(),
@@ -650,6 +666,151 @@ fn run_detached(
                 1
             }
         }
+    }
+}
+
+/// Canonical arguments used to recreate a detached container. Capturing the
+/// resolved options makes `restart` deterministic even if the caller's working
+/// directory or shell aliases have changed.
+fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
+    let mut args = vec!["-d".to_string()];
+    if let Some(name) = &a.name {
+        args.extend(["--name".to_string(), name.clone()]);
+    }
+    if let Some(v) = &a.memory {
+        args.extend(["--memory".to_string(), v.clone()]);
+    }
+    if let Some(v) = a.cpus {
+        args.extend(["--cpus".to_string(), v.to_string()]);
+    }
+    if let Some(v) = a.pids {
+        args.extend(["--pids".to_string(), v.to_string()]);
+    }
+    if let Some(v) = &a.hostname {
+        args.extend(["--hostname".to_string(), v.clone()]);
+    }
+    args.extend(["--net".to_string(), net_label(a.net)]);
+    if a.use_init {
+        args.push("--init".to_string());
+    }
+    if matches!(a.seccomp, SeccompMode::Unconfined) {
+        args.extend(["--seccomp".to_string(), "unconfined".to_string()]);
+    }
+    if a.no_overlay {
+        args.push("--no-overlay".to_string());
+    }
+    if let Some(v) = &a.platform {
+        args.extend(["--platform".to_string(), v.clone()]);
+    }
+    for v in &a.env {
+        args.extend(["--env".to_string(), v.clone()]);
+    }
+    for p in &a.ports {
+        args.extend([
+            "--publish".to_string(),
+            format!("{}:{}", p.host, p.container),
+        ]);
+    }
+    for v in &a.dns {
+        args.extend(["--dns".to_string(), v.clone()]);
+    }
+    if a.rm {
+        args.push("--rm".to_string());
+    }
+    if a.rootfs.is_some() {
+        args.extend(["--rootfs".to_string(), rootfs.display().to_string()]);
+    } else if let Some(image) = &a.image {
+        args.push(image.clone());
+    }
+    if !a.argv.is_empty() {
+        args.push("--".to_string());
+        args.extend(a.argv.iter().cloned());
+    }
+    args
+}
+
+fn cmd_restart(args: &[String]) -> i32 {
+    let mut timeout_secs: u64 = 10;
+    let mut targets: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "-t" | "--time" => match next_value(args, &mut i, a) {
+                Ok(v) => match v.parse::<u64>() {
+                    Ok(n) => timeout_secs = n,
+                    Err(_) => {
+                        eprintln!("zerun restart: invalid --time value '{v}'");
+                        return 2;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("zerun restart: {e}");
+                    return 2;
+                }
+            },
+            "-h" | "--help" => {
+                println!("usage: zerun restart [--time SECONDS] CONTAINER...");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun restart: unknown option {other}");
+                return 2;
+            }
+            _ => {
+                targets.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    if targets.is_empty() {
+        eprintln!("zerun restart: at least one CONTAINER is required");
+        return 2;
+    }
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let mut failed = false;
+    for target in targets {
+        let launch_args = match state::resolve(&store, &target) {
+            Ok(st) => match st.launch_args.clone() {
+                Some(args) if args.first().map(String::as_str) == Some("-d") => args,
+                _ => {
+                    eprintln!(
+                        "zerun restart: container {} predates restart metadata and cannot be restarted",
+                        display_name(&st)
+                    );
+                    failed = true;
+                    continue;
+                }
+            },
+            Err(e) => {
+                eprintln!("zerun restart: {e}");
+                failed = true;
+                continue;
+            }
+        };
+        if let Err(e) = stop_one(&store, &target, timeout_secs) {
+            eprintln!("zerun restart: {e}");
+            failed = true;
+            continue;
+        }
+        if let Ok(st) = state::resolve(&store, &target) {
+            fsutil::remove_dir_all_quiet(&state::ContainerState::dir(&store, &st.id));
+        }
+        let code = cmd_run(&launch_args);
+        if code != 0 {
+            failed = true;
+        }
+    }
+    if failed {
+        1
+    } else {
+        0
     }
 }
 
@@ -1793,6 +1954,7 @@ USAGE:\n  \
                                         run detached (logs/ps/stop/rm/exec)\n  \
   zerun ps [-a]                         list containers (detached)\n  \
   zerun stop [--time S] CONTAINER...    SIGTERM, then SIGKILL after the timeout\n  \
+  zerun restart [--time S] CONTAINER... restart detached containers\n  \
   zerun rm [-f] CONTAINER...            remove stopped containers (-f: kill first)\n  \
   zerun logs [--tail N] [-f] [-t] CONTAINER  show a container's console.log\n  \
   zerun exec [-e K=V] [-w DIR] CONTAINER CMD [ARG...]\n  \
@@ -1835,6 +1997,39 @@ ENV:\n  \
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detached_launch_args_capture_resolved_options() {
+        let mut a = parse_run_args(&["alpine".to_string(), "sleep".to_string(), "1".to_string()])
+            .expect("valid run args");
+        a.detach = true;
+        a.name = Some("web".to_string());
+        a.net = NetMode::Bridge;
+        a.memory = Some("64M".to_string());
+        a.ports.push(network::PublishedPort {
+            host: 8080,
+            container: 80,
+        });
+        let args = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+        assert_eq!(
+            args,
+            vec![
+                "-d",
+                "--name",
+                "web",
+                "--memory",
+                "64M",
+                "--net",
+                "bridge",
+                "--publish",
+                "8080:80",
+                "alpine",
+                "--",
+                "sleep",
+                "1"
+            ]
+        );
+    }
 
     #[test]
     fn parses_interactive_and_tty_flags() {

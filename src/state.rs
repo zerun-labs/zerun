@@ -66,6 +66,11 @@ pub struct ContainerState {
     /// When set, the per-run overlay directory `rm` should delete on top of
     /// the state directory (legacy `--rootfs` runs keep nothing to remove).
     pub overlay: Option<String>,
+    /// Canonical `zerun run` arguments (without the leading `run`) captured
+    /// for detached containers. Older v1 records have no value and cannot be
+    /// restarted directly.
+    #[serde(default)]
+    pub launch_args: Option<Vec<String>>,
     /// nft table name for this container's egress NAT (crash reconcile).
     pub table: Option<String>,
     /// veth host-end name (crash reconcile).
@@ -275,6 +280,7 @@ mod tests {
             log: format!("{}/x/console.log", std::env::temp_dir().display()),
             rootfs: String::new(),
             overlay: None,
+            launch_args: None,
             table: None,
             veth: None,
             cgroup: None,
