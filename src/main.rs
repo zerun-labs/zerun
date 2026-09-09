@@ -63,6 +63,8 @@ fn main() {
         Some("tag") => cmd_tag(&args[2..]),
         Some("rmi") => cmd_rmi(&args[2..]),
         Some("push") => cmd_push(&args[2..]),
+        Some("save") => cmd_save(&args[2..]),
+        Some("load") => cmd_load(&args[2..]),
         Some("commit") => cmd_commit(&args[2..]),
         Some("generate-service") => cmd_generate_service(&args[2..]),
         Some("doctor") => cmd_doctor(),
@@ -1746,6 +1748,137 @@ fn cmd_push(args: &[String]) -> i32 {
     }
 }
 
+fn cmd_save(args: &[String]) -> i32 {
+    let mut output: Option<PathBuf> = None;
+    let mut images = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" | "--output" => match next_value(args, &mut i, "-o") {
+                Ok(v) => output = Some(PathBuf::from(v)),
+                Err(e) => {
+                    eprintln!("zerun save: {e}");
+                    return 2;
+                }
+            },
+            "-h" | "--help" => {
+                println!("usage: zerun save -o FILE.tar IMAGE[:TAG]...");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun save: unknown option {other}");
+                return 2;
+            }
+            _ => {
+                images.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    let output = match output {
+        Some(p) => p,
+        None => {
+            eprintln!("zerun save: -o FILE.tar is required");
+            return 2;
+        }
+    };
+    if images.is_empty() {
+        eprintln!("zerun save: at least one IMAGE is required");
+        return 2;
+    }
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let imgstore = match image::store::ImageStore::open(&store) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    match image::archive::save_images(&imgstore, &images, &output) {
+        Ok(records) => {
+            println!("Saved {} image(s) to {}", records.len(), output.display());
+            for r in &records {
+                let tag = r.tag.as_deref().unwrap_or("<none>");
+                println!("  {}:{} {}", r.name, tag, r.manifest);
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("zerun save: {e}");
+            1
+        }
+    }
+}
+
+fn cmd_load(args: &[String]) -> i32 {
+    let mut input: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-i" | "--input" => match next_value(args, &mut i, "-i") {
+                Ok(v) => input = Some(PathBuf::from(v)),
+                Err(e) => {
+                    eprintln!("zerun load: {e}");
+                    return 2;
+                }
+            },
+            "-h" | "--help" => {
+                println!("usage: zerun load -i FILE.tar");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun load: unknown option {other}");
+                return 2;
+            }
+            other => {
+                eprintln!("zerun load: unexpected argument '{other}'");
+                return 2;
+            }
+        }
+    }
+    let input = match input {
+        Some(p) => p,
+        None => {
+            eprintln!("zerun load: -i FILE.tar is required");
+            return 2;
+        }
+    };
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let imgstore = match image::store::ImageStore::open(&store) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    match image::archive::load_archive(&imgstore, &input) {
+        Ok(records) => {
+            println!("Loaded image(s) from {}", input.display());
+            for r in &records {
+                let tag = r.tag.as_deref().unwrap_or("<none>");
+                println!("  {}:{} {}", r.name, tag, r.manifest);
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("zerun load: {e}");
+            1
+        }
+    }
+}
+
 fn cmd_generate_service(args: &[String]) -> i32 {
     if args.iter().any(|a| a == "--help") {
         service::print_usage();
@@ -2744,6 +2877,8 @@ USAGE:\n  \
   zerun rmi IMAGE...                     remove local images\n  \
   zerun tag SOURCE TARGET[:TAG]          add a local tag to an image\n  \
   zerun push IMAGE[:TAG]                 push a local image to a registry\n  \
+  zerun save -o FILE.tar IMAGE...        export images as an OCI archive\n  \
+  zerun load -i FILE.tar                import images from an OCI archive\n  \
   zerun commit [-m MSG] CONTAINER IMAGE[:TAG]  save a container as an image\n  \
   zerun generate-service [opts] IMAGE    write a systemd unit to stdout\n  \
   zerun doctor                           environment diagnostics\n\

@@ -22,7 +22,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
 - **M2 — storage & security (done)**: deny-by-default seccomp allowlist; per-run OverlayFS
   with disk upper and automatic cleanup; OCI whiteout materialization; safe host bind-mount
   volumes with `-v HOST:CONTAINER[:ro|rw]`; optional ephemeral `--tmpfs-upper` writable layers.
-- **M3 — OCI image engine (done)**: `zerun login / logout / pull / push / tag / images / rmi`; Docker v2
+- **M3 — OCI image engine (done)**: `zerun login / logout / pull / push / tag / save / load / images / rmi`; Docker v2
   pull with Bearer token auth, private-registry credentials, multi-arch platform selection (`--platform`), compressed-blob and
   diff_id double verification, zstd layer decode + magic sniffing, transient request retries,
   mirror inheritance
@@ -50,7 +50,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   `/proc`/`/sys` paths, and a deny-by-default seccomp allowlist (opt out with
   `--seccomp unconfined`).
 - **Docker-compatible top 20% CLI**: `run / ps / wait / stop / restart / rm / logs / exec / pull /
-  push / tag / login / logout / images / rmi / commit / generate-service / doctor`.
+  push / tag / save / load / login / logout / images / rmi / commit / generate-service / doctor`.
 
 ## Install
 
@@ -194,6 +194,23 @@ zerun push registry.example:5000/team/app:v1
 
 Local registries on `localhost[:PORT]` accept plain HTTP as an insecure dev endpoint;
 remote registries always use HTTPS.
+
+### Offline image transfer (save / load)
+
+Export any local image (or several, sharing blobs by digest) as a standard OCI image
+layout tarball, then import it on another host that already has the `zerun` binary:
+
+```bash
+zerun save -o images.tar alpine:3.20 myapp:v1
+# ... copy images.tar to the target ...
+zerun load -i images.tar
+```
+
+`save` writes `oci-layout`, `index.json`, and content-addressed `blobs/sha256/*`; `load`
+verifies every blob digest while importing, materializes the rootfs, and recreates the tag
+index — so imported images are immediately runnable with `zerun run IMAGE`. There is no
+registry or daemon involved anywhere in the path.
+
 
 ### Detached lifecycle (M5)
 

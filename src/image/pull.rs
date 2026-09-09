@@ -266,15 +266,36 @@ fn ensure_blob(
     Err(last_err.unwrap_or_else(|| crate::zerr!("no endpoint served blob {digest}")))
 }
 
-/// Unpack all layers (in order) into the content-addressed rootfs directory.
-/// Unpacking goes to a temp dir first and is renamed into place only on success,
-/// so a failed/interrupted pull never leaves a half-built rootfs behind.
+/// Download all manifest blobs (if needed), then materialize the rootfs from
+/// the local blob store.
 fn materialize_rootfs(
     store: &ImageStore,
     client: &mut RegistryClient,
     endpoints: &[String],
     registry: &str,
     repo: &str,
+    manifest: &manifest::Manifest,
+    config: &ImageConfig,
+) -> ZResult<std::path::PathBuf> {
+    for (i, layer) in manifest.layers.iter().enumerate() {
+        println!(
+            "  layer {}/{}: {} ({})",
+            i + 1,
+            manifest.layers.len(),
+            short_digest(&layer.digest),
+            crate::fsutil::human_size(layer.size)
+        );
+        ensure_blob(store, client, endpoints, registry, repo, &layer.digest)?;
+    }
+    materialize_local_rootfs(store, manifest, config)
+}
+
+/// Unpack all locally stored layers (in order) into the content-addressed
+/// rootfs directory. Unpacking goes to a temp dir first and is renamed into
+/// place only on success, so a failed/interrupted operation never leaves a
+/// half-built rootfs behind.
+pub(crate) fn materialize_local_rootfs(
+    store: &ImageStore,
     manifest: &manifest::Manifest,
     config: &ImageConfig,
 ) -> ZResult<std::path::PathBuf> {
@@ -295,14 +316,6 @@ fn materialize_rootfs(
     fsutil::remove_dir_all_quiet(&tmp);
     fs::create_dir_all(&tmp).map_err(|e| crate::zerr!("create rootfs staging dir: {e}"))?;
     for (i, layer) in manifest.layers.iter().enumerate() {
-        println!(
-            "  layer {}/{}: {} ({})",
-            i + 1,
-            manifest.layers.len(),
-            short_digest(&layer.digest),
-            crate::fsutil::human_size(layer.size)
-        );
-        ensure_blob(store, client, endpoints, registry, repo, &layer.digest)?;
         let blob_path = store.blob_path(&layer.digest)?;
         let expected_diff = config.rootfs.diff_ids[i].clone();
         let hint = format!("layer {} ({})", i + 1, layer.digest);
