@@ -5,6 +5,9 @@ Cargo.lock.orig
 # --- Design document (reference only; must never be committed) ---
 /ZerunDesignDoc.md
 
+# --- Local AI/developer maintenance guide (working notes; must never be committed) ---
+/AGENTS.md
+
 # --- bench runtime artifacts (example-* are kept in-repo) ---
 bench/results/latency-*.csv
 bench/results/mem-*.csv
