@@ -58,7 +58,7 @@ pub fn unpack_layer<R: Read>(reader: R, root: &Path, media_hint: &str) -> ZResul
         }
         if let Some(rest) = name.strip_prefix(WHITEOUT_PREFIX) {
             if !rest.is_empty() {
-                let victim = safe_join(root, &parent_rel.join(rest))?;
+                let victim = safe_join_leaf(root, &parent_rel.join(rest))?;
                 fsutil::remove_dir_all_quiet(&victim);
                 let _ = fs::remove_file(&victim); // in case it was a file/symlink
             }
@@ -79,7 +79,7 @@ fn apply_entry<R: Read>(
     parent_abs: &Path,
     media_hint: &str,
 ) -> ZResult<()> {
-    let dest = safe_join(root, rel)?;
+    let dest = safe_join_leaf(root, rel)?;
     let kind = header.entry_type();
     fs::create_dir_all(parent_abs).map_err(|e| {
         crate::zerr!(
@@ -91,13 +91,26 @@ fn apply_entry<R: Read>(
 
     match kind {
         tar::EntryType::Directory => {
+            // A directory entry never wipes existing contents (overlay
+            // semantics); it only shadows a non-directory of the same name.
+            if let Ok(md) = fs::symlink_metadata(&dest) {
+                if !md.file_type().is_dir() {
+                    let _ = fs::remove_file(&dest); // file or symlink shadowed by a dir
+                }
+            }
             fs::create_dir_all(&dest).map_err(|e| crate::zerr!("mkdir {}: {e}", dest.display()))?;
             set_mode_if_possible(&dest, header.mode()?);
         }
         tar::EntryType::Regular | tar::EntryType::Continuous => {
-            // Replace a directory of the same name (overlay semantics).
-            if dest.is_dir() {
-                fsutil::remove_dir_all_quiet(&dest);
+            // Replace whatever is already there (overlay semantics) *without*
+            // following it: a previous layer's symlink must not redirect this
+            // write outside the rootfs.
+            if let Ok(md) = fs::symlink_metadata(&dest) {
+                if md.file_type().is_dir() {
+                    fsutil::remove_dir_all_quiet(&dest);
+                } else {
+                    let _ = fs::remove_file(&dest); // file or symlink replaced by a file
+                }
             }
             let mut f = fs::File::create(&dest)
                 .map_err(|e| crate::zerr!("create {}: {e}", dest.display()))?;
@@ -105,14 +118,17 @@ fn apply_entry<R: Read>(
             set_mode_if_possible(&dest, header.mode()?);
         }
         tar::EntryType::Symlink => {
-            if dest.is_dir() {
-                fsutil::remove_dir_all_quiet(&dest);
+            if let Ok(md) = fs::symlink_metadata(&dest) {
+                if md.file_type().is_dir() {
+                    fsutil::remove_dir_all_quiet(&dest);
+                } else {
+                    let _ = fs::remove_file(&dest);
+                }
             }
             let target = header
                 .link_name()
                 .map_err(|e| crate::zerr!("bad symlink target in {rel:?}: {e}"))?
                 .ok_or_else(|| crate::zerr!("symlink {rel:?} has no target"))?;
-            let _ = fs::remove_file(&dest);
             std::os::unix::fs::symlink(&target, &dest).map_err(|e| {
                 crate::zerr!("symlink {} -> {}: {e}", dest.display(), target.display())
             })?;
@@ -123,8 +139,12 @@ fn apply_entry<R: Read>(
                 .map_err(|e| crate::zerr!("bad hardlink target in {rel:?}: {e}"))?
                 .ok_or_else(|| crate::zerr!("hardlink {rel:?} has no target"))?;
             let target_abs = safe_join(root, &target_name)?;
-            if dest.exists() {
-                let _ = fs::remove_file(&dest);
+            if let Ok(md) = fs::symlink_metadata(&dest) {
+                if md.file_type().is_dir() {
+                    fsutil::remove_dir_all_quiet(&dest);
+                } else {
+                    let _ = fs::remove_file(&dest);
+                }
             }
             fs::hard_link(&target_abs, &dest).map_err(|e| {
                 crate::zerr!(
@@ -146,6 +166,137 @@ fn apply_entry<R: Read>(
     Ok(())
 }
 
+/// Join `rel` below `root`, resolving symlinked directories *inside the
+/// rootfs* (chroot semantics: an absolute link target means below `root`, not
+/// below the host `/`). Any component that would escape `root` is refused.
+/// The final component is resolved too, so callers get the real directory or
+/// file a path refers to.
+fn safe_join(root: &Path, rel: &Path) -> ZResult<PathBuf> {
+    safe_walk(root, rel, true, 0)
+}
+
+/// Like [`safe_join`], but the final component is kept as a literal leaf and
+/// never followed. Used for paths we are about to create or remove, where an
+/// existing symlink must be replaced/deleted rather than traversed — OCI layers
+/// commonly re-declare the same symlink across consecutive layers (e.g.
+/// `/etc/nginx/modules -> /usr/lib/nginx/modules`).
+fn safe_join_leaf(root: &Path, rel: &Path) -> ZResult<PathBuf> {
+    safe_walk(root, rel, false, 0)
+}
+
+/// Upper bound on symlink hops while resolving a path (defends loops).
+const MAX_SYMLINK_DEPTH: usize = 64;
+
+fn safe_walk(root: &Path, rel: &Path, resolve_last: bool, depth: usize) -> ZResult<PathBuf> {
+    if depth > MAX_SYMLINK_DEPTH {
+        return Err(crate::zerr!(
+            "symlink chain too deep while resolving {rel:?} (loop?)"
+        ));
+    }
+    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let comps: Vec<Component<'_>> = rel.components().collect();
+    let mut cur = root.clone();
+    let count = comps.len();
+    for (i, comp) in comps.iter().enumerate() {
+        match comp {
+            Component::Normal(c) => {
+                let next = cur.join(c);
+                let is_last = i + 1 == count;
+                cur = if is_last && !resolve_last {
+                    next
+                } else {
+                    resolve_component(&root, &next, rel, depth)?
+                };
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(crate::zerr!(
+                    "unsafe path component in {rel:?} (must stay under the rootfs)"
+                ));
+            }
+        }
+    }
+    Ok(cur)
+}
+
+/// If `path` is a symlink, resolve the whole chain to its real location inside
+/// `root`; otherwise return it unchanged.
+fn resolve_component(root: &Path, path: &Path, rel: &Path, depth: usize) -> ZResult<PathBuf> {
+    let md = match fs::symlink_metadata(path) {
+        Ok(md) => md,
+        Err(_) => return Ok(path.to_path_buf()), // does not exist (yet)
+    };
+    if !md.file_type().is_symlink() {
+        return Ok(path.to_path_buf());
+    }
+    if depth >= MAX_SYMLINK_DEPTH {
+        return Err(crate::zerr!(
+            "symlink chain too deep while resolving {} (path {rel:?})",
+            path.display()
+        ));
+    }
+    let target =
+        fs::read_link(path).map_err(|e| crate::zerr!("read symlink {}: {e}", path.display()))?;
+    let base = if target.is_absolute() {
+        root.to_path_buf()
+    } else {
+        path.parent().unwrap_or(root).to_path_buf()
+    };
+    let joined = normalize_under(root, &base, &target).map_err(|e| {
+        crate::zerr!(
+            "refusing path {rel:?}: symlink {} escapes the rootfs: {e}",
+            path.display()
+        )
+    })?;
+    let target_rel = joined.strip_prefix(root).map_err(|_| {
+        crate::zerr!(
+            "refusing path {rel:?}: symlink {} resolves outside the rootfs",
+            path.display()
+        )
+    })?;
+    // Walk the target itself component by component: it may pass through
+    // further symlinked directories.
+    safe_walk(root, target_rel, true, depth + 1)
+}
+
+/// Lexically combine `base` + `target` and require the result to stay under
+/// `root`. Absolute `target`s restart at `root` (chroot semantics).
+fn normalize_under(root: &Path, base: &Path, target: &Path) -> ZResult<PathBuf> {
+    let mut stack: Vec<std::ffi::OsString> = Vec::new();
+    let base_rel = base
+        .strip_prefix(root)
+        .map_err(|_| crate::zerr!("symlink base {} is outside the rootfs", base.display()))?;
+    for c in base_rel.components() {
+        match c {
+            Component::Normal(c) => stack.push(c.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if stack.pop().is_none() {
+                    return Err(crate::zerr!("path escapes the rootfs"));
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    for c in target.components() {
+        match c {
+            Component::RootDir | Component::Prefix(_) => stack.clear(), // absolute: back to root
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if stack.pop().is_none() {
+                    return Err(crate::zerr!("path escapes the rootfs"));
+                }
+            }
+            Component::Normal(c) => stack.push(c.to_os_string()),
+        }
+    }
+    let mut out = root.to_path_buf();
+    for s in &stack {
+        out.push(s);
+    }
+    Ok(out)
+}
+
 /// Convert a tar path to a safe relative path. Returns None for absolute paths,
 /// parent traversal, or empty results.
 fn sanitize_rel_path(p: &Path) -> Option<PathBuf> {
@@ -162,42 +313,6 @@ fn sanitize_rel_path(p: &Path) -> Option<PathBuf> {
     } else {
         Some(out)
     }
-}
-
-/// Join `rel` below `root`, refusing any intermediate symlink that escapes root.
-fn safe_join(root: &Path, rel: &Path) -> ZResult<PathBuf> {
-    let mut cur = root.to_path_buf();
-    for comp in rel.components() {
-        match comp {
-            Component::Normal(c) => {
-                let next = cur.join(c);
-                // Reject escaping through a symlinked intermediate directory.
-                if let Ok(md) = fs::symlink_metadata(&next) {
-                    if md.file_type().is_symlink() {
-                        let target = fs::canonicalize(&next)
-                            .map_err(|e| crate::zerr!("resolve symlink {}: {e}", next.display()))?;
-                        let root_canon =
-                            fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-                        if !target.starts_with(&root_canon) {
-                            return Err(crate::zerr!(
-                                "refusing path {}: intermediate symlink escapes the rootfs",
-                                rel.display()
-                            ));
-                        }
-                        // Resolve: continue from the symlink target directory.
-                        cur = target;
-                        continue;
-                    }
-                }
-                cur = next;
-            }
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(crate::zerr!("unsafe path component in {rel:?}"));
-            }
-        }
-    }
-    Ok(cur)
 }
 
 fn set_mode_if_possible(p: &Path, mode: u32) {
@@ -228,6 +343,24 @@ mod tests {
             let mut header = tar::Header::new_gnu();
             header.set_size(content.len() as u64);
             header.set_mode(0o644);
+            header.set_cksum();
+            b.append_data(&mut header, path, &content[..]).unwrap();
+        }
+        b.into_inner().unwrap()
+    }
+
+    fn make_tar(entries: &[(String, tar::EntryType, Option<String>, Vec<u8>)]) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        for (path, ty, link, content) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(*ty);
+            header.set_mode(0o755);
+            if let Some(l) = link {
+                header.set_link_name(l).unwrap();
+                header.set_size(0);
+            } else {
+                header.set_size(content.len() as u64);
+            }
             header.set_cksum();
             b.append_data(&mut header, path, &content[..]).unwrap();
         }
@@ -297,5 +430,143 @@ mod tests {
             sanitize_rel_path(Path::new("usr/bin/tool")).unwrap(),
             Path::new("usr/bin/tool")
         );
+    }
+
+    #[test]
+    fn symlink_redeclared_across_layers_is_replaced_not_followed() {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-unpack-symlink-redecl-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let symlink_nginx_modules = (
+            "etc/nginx/modules".to_string(),
+            tar::EntryType::Symlink,
+            Some("/usr/lib/nginx/modules".to_string()),
+            b"".to_vec(),
+        );
+        let l1 = make_tar(&[
+            (
+                "usr/lib/nginx/modules".to_string(),
+                tar::EntryType::Directory,
+                None,
+                b"".to_vec(),
+            ),
+            symlink_nginx_modules.clone(),
+        ]);
+        unpack_layer(&l1[..], &dir, "test").unwrap();
+
+        // A later layer re-declaring the same symlink used to abort: the leaf
+        // was canonicalized against the *host* /usr/lib/nginx/modules.
+        let l2 = make_tar(&[symlink_nginx_modules]);
+        unpack_layer(&l2[..], &dir, "test").unwrap();
+
+        let link = fs::read_link(dir.join("etc/nginx/modules")).unwrap();
+        assert_eq!(link, Path::new("/usr/lib/nginx/modules"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn files_below_an_absolute_symlink_land_inside_the_rootfs() {
+        let dir =
+            std::env::temp_dir().join(format!("zerun-unpack-symlink-abs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let l1 = make_tar(&[
+            (
+                "usr/lib/nginx/modules".to_string(),
+                tar::EntryType::Directory,
+                None,
+                b"".to_vec(),
+            ),
+            (
+                "etc/nginx/modules".to_string(),
+                tar::EntryType::Symlink,
+                Some("/usr/lib/nginx/modules".to_string()),
+                b"".to_vec(),
+            ),
+        ]);
+        unpack_layer(&l1[..], &dir, "test").unwrap();
+
+        // Writing through the absolute symlink must resolve *inside* the
+        // rootfs (chroot semantics), not against the host filesystem.
+        let l2 = make_tar(&[(
+            "etc/nginx/modules/ngx_http_js_module.so".to_string(),
+            tar::EntryType::Regular,
+            None,
+            b"module".to_vec(),
+        )]);
+        unpack_layer(&l2[..], &dir, "test").unwrap();
+
+        assert_eq!(
+            fs::read(dir.join("usr/lib/nginx/modules/ngx_http_js_module.so")).unwrap(),
+            b"module"
+        );
+        assert!(!Path::new("/usr/lib/nginx/modules/ngx_http_js_module.so").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relative_symlink_escape_is_rejected() {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-unpack-symlink-escape-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let l1 = make_tar(&[(
+            "etc/out".to_string(),
+            tar::EntryType::Symlink,
+            Some("../../escape-me".to_string()),
+            b"".to_vec(),
+        )]);
+        unpack_layer(&l1[..], &dir, "test").unwrap();
+
+        let l2 = make_tar(&[(
+            "etc/out/evil".to_string(),
+            tar::EntryType::Regular,
+            None,
+            b"boom".to_vec(),
+        )]);
+        assert!(unpack_layer(&l2[..], &dir, "test").is_err());
+        assert!(!dir.parent().unwrap().join("escape-me").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symlink_loop_is_rejected() {
+        let dir =
+            std::env::temp_dir().join(format!("zerun-unpack-symlink-loop-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let l1 = make_tar(&[
+            (
+                "a".to_string(),
+                tar::EntryType::Symlink,
+                Some("b".to_string()),
+                b"".to_vec(),
+            ),
+            (
+                "b".to_string(),
+                tar::EntryType::Symlink,
+                Some("a".to_string()),
+                b"".to_vec(),
+            ),
+        ]);
+        unpack_layer(&l1[..], &dir, "test").unwrap();
+
+        let l2 = make_tar(&[(
+            "a/x".to_string(),
+            tar::EntryType::Regular,
+            None,
+            b"x".to_vec(),
+        )]);
+        assert!(unpack_layer(&l2[..], &dir, "test").is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
