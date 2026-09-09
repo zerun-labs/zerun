@@ -4,7 +4,9 @@
 //! A systemd-scope driver and a cgroups v1 fallback belong to later milestones.
 use crate::error::{last_err, ZResult};
 use crate::trace;
+use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Clone)]
@@ -15,6 +17,19 @@ pub struct ResourceLimits {
     pub cpus: Option<f64>,
     /// Process count limit pids.max (default suggestion for low-end hosts: 256).
     pub pids: Option<i64>,
+    /// Block I/O limits for cgroups v2 `io.max`, grouped by device on write.
+    pub io: Vec<IoLimit>,
+}
+
+/// One device's I/O ceilings. `None` means "leave the kernel default".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IoLimit {
+    /// Canonical `MAJOR:MINOR` form accepted by `io.max`.
+    pub device: String,
+    pub read_bps: Option<u64>,
+    pub write_bps: Option<u64>,
+    pub read_iops: Option<u64>,
+    pub write_iops: Option<u64>,
 }
 
 pub struct CgroupV2 {
@@ -37,7 +52,7 @@ impl CgroupV2 {
                 path.display()
             )
         })?;
-        enable_controllers(&parent, &["memory", "cpu", "pids"])?;
+        enable_controllers(&parent, &["memory", "cpu", "pids", "io"])?;
         let cg = CgroupV2 { path };
 
         if let Some(mem) = &limits.memory {
@@ -54,6 +69,10 @@ impl CgroupV2 {
         }
         if let Some(pids) = limits.pids {
             cg.write("pids.max", pids.to_string())?;
+        }
+        if !limits.io.is_empty() {
+            require_controller(&parent, "io")?;
+            cg.write("io.max", io_max_value(&limits.io))?;
         }
         trace::mark("parent:cgroup:configured");
         Ok(cg)
@@ -94,6 +113,132 @@ impl CgroupV2 {
         let _ = fs::remove_dir(&self.path);
         let _ = fs::remove_dir(self.path.parent().unwrap_or(Path::new("/sys/fs/cgroup")));
     }
+}
+
+/// Turn Docker-style device limits into one compact `io.max` value.
+fn io_max_value(limits: &[IoLimit]) -> String {
+    let mut by_device: BTreeMap<String, IoLimit> = BTreeMap::new();
+    for limit in limits {
+        let entry = by_device.entry(limit.device.clone()).or_default();
+        entry.read_bps = limit.read_bps.or(entry.read_bps);
+        entry.write_bps = limit.write_bps.or(entry.write_bps);
+        entry.read_iops = limit.read_iops.or(entry.read_iops);
+        entry.write_iops = limit.write_iops.or(entry.write_iops);
+    }
+    by_device
+        .into_iter()
+        .map(|(device, limit)| {
+            format!(
+                "{device} rbps={} wbps={} riops={} wiops={}",
+                value_or_max(limit.read_bps),
+                value_or_max(limit.write_bps),
+                value_or_max(limit.read_iops),
+                value_or_max(limit.write_iops)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn value_or_max(value: Option<u64>) -> String {
+    value.map_or_else(|| "max".to_string(), |v| v.to_string())
+}
+
+/// Resolve a device path or `MAJOR:MINOR` to cgroups v2 device syntax.
+pub fn parse_device(spec: &str) -> ZResult<String> {
+    let spec = spec.trim();
+    if let Some((major, minor)) = spec.split_once(':') {
+        let parsed = if !major.is_empty()
+            && !minor.is_empty()
+            && !major.contains('/')
+            && !minor.contains('/')
+        {
+            major
+                .parse::<u64>()
+                .ok()
+                .zip(minor.parse::<u64>().ok())
+                .filter(|(major, minor)| {
+                    *major <= u64::from(u32::MAX) && *minor <= u64::from(u32::MAX)
+                })
+        } else {
+            None
+        };
+        if let Some((major, minor)) = parsed {
+            return Ok(format!("{major}:{minor}"));
+        }
+        return Err(crate::zerr!(
+            "invalid device '{spec}' (use /dev/PATH or MAJOR:MINOR)"
+        ));
+    }
+
+    let meta = fs::metadata(spec).map_err(|e| crate::zerr!("stat I/O device '{spec}': {e}"))?;
+    if !meta.file_type().is_block_device() {
+        return Err(crate::zerr!("I/O device '{spec}' is not a block device"));
+    }
+    let dev = meta.rdev();
+    let major = (((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)) as u64;
+    let minor = ((dev & 0xff) | ((dev >> 12) & !0xff00)) as u64;
+    Ok(format!("{major}:{minor}"))
+}
+
+/// Parse one `--device-read-bps`-style value (`DEVICE:LIMIT`).
+pub fn parse_io_limit(flag: &str, value: &str) -> ZResult<IoLimit> {
+    // Device identifiers may themselves contain a colon (MAJOR:MINOR), so the
+    // final separator always belongs to the limit.
+    let (device, limit) = value
+        .rsplit_once(':')
+        .ok_or_else(|| crate::zerr!("{flag}: expected DEVICE:LIMIT, got '{value}'"))?;
+    let device = parse_device(device)?;
+    let mut out = IoLimit {
+        device,
+        ..IoLimit::default()
+    };
+    match flag {
+        "device-read-bps" => out.read_bps = Some(parse_positive_byte_size(limit)?),
+        "device-write-bps" => out.write_bps = Some(parse_positive_byte_size(limit)?),
+        "device-read-iops" => out.read_iops = Some(parse_positive_number(limit, flag)?),
+        "device-write-iops" => out.write_iops = Some(parse_positive_number(limit, flag)?),
+        other => return Err(crate::zerr!("unknown I/O limit flag '{other}'")),
+    }
+    Ok(out)
+}
+
+fn parse_positive_number(value: &str, what: &str) -> ZResult<u64> {
+    let n = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| crate::zerr!("cannot parse {what}: '{value}'"))?;
+    if n == 0 {
+        return Err(crate::zerr!("{what} must be greater than zero"));
+    }
+    Ok(n)
+}
+
+/// Parse a positive byte size. Supports decimal-ish human units used by Docker
+/// (`10m`, `10mb`, `1G`) as well as raw byte counts.
+fn parse_positive_byte_size(value: &str) -> ZResult<u64> {
+    let value = value.trim();
+    let without_b = value
+        .strip_suffix(['b', 'B'])
+        .filter(|v| !v.is_empty())
+        .unwrap_or(value);
+    let bytes =
+        parse_size(without_b).map_err(|_| crate::zerr!("cannot parse byte size: '{value}'"))?;
+    if bytes == 0 {
+        return Err(crate::zerr!("byte size must be greater than zero"));
+    }
+    Ok(bytes)
+}
+
+fn require_controller(parent: &Path, controller: &str) -> ZResult<()> {
+    let available = fs::read_to_string(parent.join("cgroup.controllers"))
+        .map_err(|e| crate::zerr!("read {}: {e}", parent.join("cgroup.controllers").display()))?;
+    if !available.split_whitespace().any(|c| c == controller) {
+        return Err(crate::zerr!(
+            "cgroups v2 '{controller}' controller is unavailable on this host"
+        ));
+    }
+    Ok(())
 }
 
 /// Locate the cgroup2 mount from /proc/self/mountinfo, falling back to
@@ -172,6 +317,45 @@ fn parse_size(s: &str) -> ZResult<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_device_io_limits() {
+        let limit = parse_io_limit("device-read-bps", "8:48:1m").unwrap();
+        assert_eq!(limit.device, "8:48");
+        assert_eq!(limit.read_bps, Some(1024 * 1024));
+        assert_eq!(limit.write_bps, None);
+
+        let limit = parse_io_limit("device-write-iops", "/dev/null:20");
+        assert!(limit.is_err()); // /dev/null is a character device
+        assert!(parse_io_limit("device-read-iops", "bad:10").is_err());
+        assert!(parse_io_limit("device-write-iops", "8:48:0").is_err());
+    }
+
+    #[test]
+    fn groups_device_limits_into_io_max() {
+        let value = io_max_value(&[
+            IoLimit {
+                device: "8:48".into(),
+                read_bps: Some(1024),
+                ..IoLimit::default()
+            },
+            IoLimit {
+                device: "8:48".into(),
+                write_iops: Some(20),
+                ..IoLimit::default()
+            },
+            IoLimit {
+                device: "8:16".into(),
+                read_iops: Some(3),
+                ..IoLimit::default()
+            },
+        ]);
+        assert_eq!(
+            value,
+            "8:16 rbps=max wbps=max riops=3 wiops=max\n\
+             8:48 rbps=1024 wbps=max riops=max wiops=20"
+        );
+    }
 
     #[test]
     fn parses_memory_sizes() {

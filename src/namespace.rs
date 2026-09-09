@@ -114,8 +114,10 @@ where
 
     // Create the cgroup on the parent side first (attach right after clone).
     // Skipped when no limits are set (typical rootless without delegation).
-    let has_limits =
-        spec.limits.memory.is_some() || spec.limits.cpus.is_some() || spec.limits.pids.is_some();
+    let has_limits = spec.limits.memory.is_some()
+        || spec.limits.cpus.is_some()
+        || spec.limits.pids.is_some()
+        || !spec.limits.io.is_empty();
     let cg = if has_limits {
         Some(CgroupV2::create(&spec.id, &spec.limits)?)
     } else {

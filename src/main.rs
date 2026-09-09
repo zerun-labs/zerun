@@ -95,6 +95,10 @@ struct RunArgs {
     memory: Option<String>,
     cpus: Option<f64>,
     pids: Option<i64>,
+    device_read_bps: Vec<cgroup::IoLimit>,
+    device_write_bps: Vec<cgroup::IoLimit>,
+    device_read_iops: Vec<cgroup::IoLimit>,
+    device_write_iops: Vec<cgroup::IoLimit>,
     hostname: Option<String>,
     net: NetMode,
     /// True after the operator explicitly selected `--net`.
@@ -212,6 +216,30 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             "--publish" | "-p" => {
                 let v = next_value(args, &mut i, s)?;
                 a.ports.push(parse_publish(&v)?);
+            }
+            "--device-read-bps" => {
+                let v = next_value(args, &mut i, s)?;
+                a.device_read_bps.push(
+                    cgroup::parse_io_limit("device-read-bps", &v).map_err(|e| e.to_string())?,
+                );
+            }
+            "--device-write-bps" => {
+                let v = next_value(args, &mut i, s)?;
+                a.device_write_bps.push(
+                    cgroup::parse_io_limit("device-write-bps", &v).map_err(|e| e.to_string())?,
+                );
+            }
+            "--device-read-iops" => {
+                let v = next_value(args, &mut i, s)?;
+                a.device_read_iops.push(
+                    cgroup::parse_io_limit("device-read-iops", &v).map_err(|e| e.to_string())?,
+                );
+            }
+            "--device-write-iops" => {
+                let v = next_value(args, &mut i, s)?;
+                a.device_write_iops.push(
+                    cgroup::parse_io_limit("device-write-iops", &v).map_err(|e| e.to_string())?,
+                );
             }
             "--dns" => {
                 let v = next_value(args, &mut i, "--dns")?;
@@ -494,6 +522,13 @@ fn cmd_run(args: &[String]) -> i32 {
             memory: a.memory,
             cpus: a.cpus,
             pids: a.pids,
+            io: [
+                a.device_read_bps,
+                a.device_write_bps,
+                a.device_read_iops,
+                a.device_write_iops,
+            ]
+            .concat(),
         },
         seccomp: a.seccomp,
         tty: a.tty,
@@ -728,6 +763,38 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     }
     if let Some(v) = a.pids {
         args.extend(["--pids".to_string(), v.to_string()]);
+    }
+    for v in &a.device_read_bps {
+        if let Some(limit) = v.read_bps {
+            args.extend([
+                "--device-read-bps".to_string(),
+                format!("{}:{}", v.device, limit),
+            ]);
+        }
+    }
+    for v in &a.device_write_bps {
+        if let Some(limit) = v.write_bps {
+            args.extend([
+                "--device-write-bps".to_string(),
+                format!("{}:{}", v.device, limit),
+            ]);
+        }
+    }
+    for v in &a.device_read_iops {
+        if let Some(limit) = v.read_iops {
+            args.extend([
+                "--device-read-iops".to_string(),
+                format!("{}:{}", v.device, limit),
+            ]);
+        }
+    }
+    for v in &a.device_write_iops {
+        if let Some(limit) = v.write_iops {
+            args.extend([
+                "--device-write-iops".to_string(),
+                format!("{}:{}", v.device, limit),
+            ]);
+        }
     }
     if let Some(v) = &a.hostname {
         args.extend(["--hostname".to_string(), v.clone()]);
@@ -2431,6 +2498,10 @@ RUN OPTIONS:\n  \
   -m, --memory 64M    cgroup v2 memory.max (K/M/G suffixes)\n  \
   --cpus 0.5          cgroup v2 cpu.max (cores)\n  \
   --pids 256          cgroup v2 pids.max\n  \
+  --device-read-bps DEV:BYTES    cgroup v2 io.max read rate (repeatable)\n  \
+  --device-write-bps DEV:BYTES   cgroup v2 io.max write rate (repeatable)\n  \
+  --device-read-iops DEV:COUNT   cgroup v2 io.max read IOPS (repeatable)\n  \
+  --device-write-iops DEV:COUNT  cgroup v2 io.max write IOPS (repeatable)\n  \
   -h, --hostname H    container hostname (new UTS namespace)\n  \
   --net none|host|bridge\n  \
                       none = fresh netns + loopback; host = share host net;\n  \
@@ -2529,6 +2600,38 @@ mod tests {
             ports_label(&ports, None),
             "0.0.0.0:53->53/tcp, 0.0.0.0:8080->80/tcp"
         );
+    }
+
+    #[test]
+    fn parses_canonical_device_io_limits() {
+        let args: Vec<_> = [
+            "--device-read-bps",
+            "8:48:1m",
+            "--device-write-bps",
+            "8:48:10mb",
+            "--device-read-iops",
+            "8:48:100",
+            "--device-write-iops",
+            "8:48:200",
+            "alpine",
+            "true",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_run_args(&args).expect("device I/O flags");
+        let launch_args = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+        assert!(launch_args.contains(&"--device-read-bps".to_string()));
+        assert!(launch_args.contains(&"8:48:1048576".to_string()));
+        assert!(launch_args.contains(&"--device-write-bps".to_string()));
+        assert!(launch_args.contains(&"8:48:10485760".to_string()));
+        assert!(launch_args.contains(&"--device-read-iops".to_string()));
+        assert!(launch_args.contains(&"8:48:100".to_string()));
+        assert!(launch_args.contains(&"--device-write-iops".to_string()));
+        assert!(launch_args.contains(&"8:48:200".to_string()));
+
+        assert!(cgroup::parse_io_limit("device-read-bps", "8:48:0").is_err());
+        assert!(cgroup::parse_io_limit("device-read-iops", "bad:1").is_err());
     }
 
     #[test]

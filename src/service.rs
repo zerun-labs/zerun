@@ -63,6 +63,30 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--pids".into());
         run_args.push(v.to_string());
     }
+    for v in &a.device_read_bps {
+        if let Some(limit) = v.read_bps {
+            run_args.push("--device-read-bps".into());
+            run_args.push(format!("{}:{}", v.device, limit));
+        }
+    }
+    for v in &a.device_write_bps {
+        if let Some(limit) = v.write_bps {
+            run_args.push("--device-write-bps".into());
+            run_args.push(format!("{}:{}", v.device, limit));
+        }
+    }
+    for v in &a.device_read_iops {
+        if let Some(limit) = v.read_iops {
+            run_args.push("--device-read-iops".into());
+            run_args.push(format!("{}:{}", v.device, limit));
+        }
+    }
+    for v in &a.device_write_iops {
+        if let Some(limit) = v.write_iops {
+            run_args.push("--device-write-iops".into());
+            run_args.push(format!("{}:{}", v.device, limit));
+        }
+    }
     if let Some(v) = &a.hostname {
         run_args.push("--hostname".into());
         run_args.push(v.clone());
@@ -357,6 +381,23 @@ mod tests {
 
         let invalid = args(&["--no-overlay", "--tmpfs-upper", "alpine"]);
         assert!(render(Path::new("/bin/zerun"), &invalid, true).is_err());
+    }
+
+    #[test]
+    fn renders_device_io_limits() {
+        let a = args(&[
+            "--device-read-bps",
+            "8:48:1m",
+            "--device-write-iops",
+            "8:48:100",
+            "--name",
+            "web",
+            "alpine",
+            "true",
+        ]);
+        let unit = render(Path::new("/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains(" --device-read-bps 8:48:1048576 "));
+        assert!(unit.contains(" --device-write-iops 8:48:100 "));
     }
 
     #[test]

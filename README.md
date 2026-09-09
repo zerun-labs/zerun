@@ -17,7 +17,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
 
 - **M1 — isolation executor (done)**: namespace isolation (PID/MNT/UTS/IPC/NET/USER),
   corrected `pivot_root(".", ".")` sequence, container pseudo-filesystems, minimal `/dev`,
-  masked/readonly paths, capability dropping, cgroups v2 (memory/cpu/pids), optional
+  masked/readonly paths, capability dropping, cgroups v2 (memory/cpu/pids/io), optional
   built-in mini-init, and a reproducible benchmark harness.
 - **M2 — storage & security (done)**: deny-by-default seccomp allowlist; per-run OverlayFS
   with disk upper and automatic cleanup; OCI whiteout materialization; safe host bind-mount
@@ -132,6 +132,10 @@ Run options (current subset):
 -m, --memory 64M     cgroup v2 memory.max (K/M/G suffixes)
 --cpus 0.5           cgroup v2 cpu.max (cores)
 --pids 256           cgroup v2 pids.max
+--device-read-bps DEV:RATE    cgroup v2 io.max (e.g. /dev/sda:10mb)
+--device-write-bps DEV:RATE   cgroup v2 io.max (e.g. 8:0:10mb)
+--device-read-iops DEV:COUNT  cgroup v2 io.max
+--device-write-iops DEV:COUNT cgroup v2 io.max
 -h, --hostname H     container hostname (new UTS namespace)
 --net bridge|none|host
                      bridge = rootful bridge networking on zerun0 (veth + eth0 in container;
