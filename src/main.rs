@@ -54,6 +54,7 @@ fn main() {
         Some("pull") => cmd_pull(&args[2..]),
         Some("images") => cmd_images(&args[2..]),
         Some("rmi") => cmd_rmi(&args[2..]),
+        Some("commit") => cmd_commit(&args[2..]),
         Some("generate-service") => cmd_generate_service(&args[2..]),
         Some("doctor") => cmd_doctor(),
         Some("__init") => {
@@ -812,6 +813,167 @@ fn cmd_restart(args: &[String]) -> i32 {
     } else {
         0
     }
+}
+
+fn cmd_commit(args: &[String]) -> i32 {
+    let mut message: Option<String> = None;
+    let mut author: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "-m" | "--message" => match next_value(args, &mut i, arg) {
+                Ok(v) => message = Some(v),
+                Err(e) => {
+                    eprintln!("zerun commit: {e}");
+                    return 2;
+                }
+            },
+            "--author" => match next_value(args, &mut i, arg) {
+                Ok(v) => author = Some(v),
+                Err(e) => {
+                    eprintln!("zerun commit: {e}");
+                    return 2;
+                }
+            },
+            "-h" | "--help" => {
+                println!(
+                    "usage: zerun commit [-m MESSAGE] [--author AUTHOR] CONTAINER IMAGE[:TAG]"
+                );
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun commit: unknown option {other}");
+                return 2;
+            }
+            _ => {
+                positional.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    let [container, target] = positional.as_slice() else {
+        eprintln!("zerun commit: CONTAINER and IMAGE[:TAG] are required");
+        return 2;
+    };
+
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let st = match state::resolve(&store, container) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun commit: {e}");
+            return 1;
+        }
+    };
+    let imgstore = match image::store::ImageStore::open(&store) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+
+    if st.status == state::Status::Running {
+        eprintln!("zerun: warning: committing a running container; filesystem changes in progress may be inconsistent");
+    }
+
+    // A live container can archive its mounted merged rootfs directly. After
+    // exit that mount is gone, so reconstruct the rootfs from the image lower
+    // layer plus the persisted overlay upper layer.
+    let mut rebuilt: Option<std::path::PathBuf> = None;
+    let rootfs = match (
+        st.overlay.as_deref(),
+        matches!(st.status, state::Status::Running),
+    ) {
+        (Some(overlay), false) => {
+            let upper = std::path::Path::new(overlay).join("upper");
+            let staging = imgstore.blob_tmp("commit-source");
+            match committable_lower_rootfs(&imgstore, &st) {
+                Ok(lower) => {
+                    let root = match image::commit::rebuild_rootfs(&lower, &upper, &staging) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            fsutil::remove_dir_all_quiet(&staging);
+                            eprintln!("zerun commit: rebuild exited container rootfs: {e}");
+                            return 1;
+                        }
+                    };
+                    rebuilt = Some(root.clone());
+                    root
+                }
+                Err(e) => {
+                    fsutil::remove_dir_all_quiet(&staging);
+                    eprintln!("zerun commit: {e}");
+                    return 1;
+                }
+            }
+        }
+        _ => std::path::PathBuf::from(&st.rootfs),
+    };
+    if !rootfs.is_dir() {
+        if let Some(path) = &rebuilt {
+            fsutil::remove_dir_all_quiet(path);
+        }
+        eprintln!(
+            "zerun commit: container filesystem is gone (removed or created by an older zerun): {}",
+            rootfs.display()
+        );
+        return 1;
+    }
+    let options = image::commit::CommitOptions {
+        env: st.env.clone(),
+        cmd: st.cmd.clone(),
+        working_dir: st.cwd.clone().unwrap_or_else(|| "/".to_string()),
+        comment: message,
+        author,
+    };
+    let result = image::commit::commit_image(&imgstore, &rootfs, target, options);
+    if let Some(path) = &rebuilt {
+        fsutil::remove_dir_all_quiet(path);
+    }
+    match result {
+        Ok(record) => {
+            println!(
+                "sha256:{}",
+                record
+                    .manifest
+                    .strip_prefix("sha256:")
+                    .unwrap_or(&record.manifest)
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("zerun commit: {e}");
+            1
+        }
+    }
+}
+
+/// Resolve the lower rootfs backing a detached container's overlay.
+fn committable_lower_rootfs(
+    imgstore: &image::store::ImageStore,
+    st: &state::ContainerState,
+) -> Result<std::path::PathBuf, String> {
+    if let Some(path) = st.image.strip_prefix("rootfs:") {
+        return Ok(std::path::PathBuf::from(path));
+    }
+    let reference = Reference::parse(&st.image).map_err(|e| e.to_string())?;
+    image::local_image(imgstore, &reference)
+        .map_err(|e| e.to_string())?
+        .map(|(rootfs, _)| rootfs)
+        .ok_or_else(|| {
+            format!(
+                "base image '{}' is missing; it is needed to commit this exited container",
+                st.image
+            )
+        })
 }
 
 fn net_label(net: NetMode) -> String {
@@ -1962,6 +2124,7 @@ USAGE:\n  \
   zerun pull [--platform ...] IMAGE...   pull OCI images (Docker Hub, mirrors)\n  \
   zerun images                           list local images\n  \
   zerun rmi IMAGE...                     remove local images\n  \
+  zerun commit [-m MSG] CONTAINER IMAGE[:TAG]  save a container as an image\n  \
   zerun generate-service [opts] IMAGE    write a systemd unit to stdout\n  \
   zerun doctor                           environment diagnostics\n\
 \n\

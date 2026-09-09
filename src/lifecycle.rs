@@ -104,8 +104,13 @@ pub fn run_detached(
         st.finished = Some(state::now_rfc3339());
         let _ = st.save();
     }
+    // Keep the writable layer for an addressable exited container so it can be
+    // committed or inspected later. `--rm` retains Docker's remove-on-exit
+    // behavior; `rm` cleans up any other stopped container's layer.
     if let Some(fs) = container_fs {
-        store.cleanup_container_fs(&fs);
+        if remove_state {
+            store.cleanup_container_fs(&fs);
+        }
     }
     if remove_state {
         let dir = state::ContainerState::dir(&store, &id);
@@ -207,11 +212,8 @@ pub fn reconcile_stale(store: &Store, st: &mut ContainerState) -> bool {
     st.table = None;
     st.veth = None;
     st.cgroup = None;
-    // The per-run overlay would normally have been removed by the reaper right
-    // after the container exited; reclaim it here when the reaper never got to.
-    if let Some(ov) = st.overlay.take() {
-        fsutil::remove_dir_all_quiet(Path::new(&ov));
-    }
+    // The per-run overlay may survive when the reaper died so the record can
+    // still be committed/inspected; `rm` is the authoritative cleanup path.
     true
 }
 

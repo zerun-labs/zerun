@@ -45,7 +45,9 @@ impl ImageStore {
         Self::at(store.data_root())
     }
 
-    fn at(data_root: &Path) -> ZResult<Self> {
+    /// Build a store at an explicit root (useful for tests and callers that
+    /// already own a data-root path).
+    pub fn at(data_root: &Path) -> ZResult<Self> {
         let s = Self {
             data_root: data_root.to_path_buf(),
         };
@@ -147,6 +149,29 @@ impl ImageStore {
         }
         fs::rename(&tmp, &path).map_err(|e| crate::zerr!("install blob {digest}: {e}"))?;
         Ok(())
+    }
+
+    /// A temporary file next to blob storage; renaming it into place is
+    /// atomic on the same filesystem.
+    pub fn blob_tmp(&self, what: &str) -> PathBuf {
+        self.tmp_path(what)
+    }
+
+    /// Hash a completed temporary file, install it as a content-addressed
+    /// blob, and return its digest and size. The source must be on the image
+    /// store filesystem so installation is a rename.
+    pub fn install_blob_file(&self, source: &Path) -> ZResult<(String, u64)> {
+        let digest = format!("sha256:{}", sha256_file(source)?);
+        let path = self.blob_path(&digest)?;
+        let size = fs::metadata(source)
+            .map(|m| m.len())
+            .map_err(|e| crate::zerr!("stat blob {}: {e}", source.display()))?;
+        if path.is_file() {
+            let _ = fs::remove_file(source);
+            return Ok((digest, size));
+        }
+        fs::rename(source, &path).map_err(|e| crate::zerr!("install blob {digest}: {e}"))?;
+        Ok((digest, size))
     }
 
     // --- materialized rootfs ------------------------------------------------
@@ -338,6 +363,23 @@ pub fn digest_hex(digest: &str) -> ZResult<String> {
         return Err(crate::zerr!("malformed sha256 digest '{digest}'"));
     }
     Ok(hex.to_string())
+}
+
+pub fn sha256_file(path: &Path) -> ZResult<String> {
+    let mut file =
+        fs::File::open(path).map_err(|e| crate::zerr!("open blob {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| crate::zerr!("read blob {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex(&hasher.finalize()))
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {

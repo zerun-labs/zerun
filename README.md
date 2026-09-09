@@ -33,8 +33,8 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   (Docker's docker-proxy in-binary), and `--dns` / host resolv.conf inheritance.
 - **M5 — detached lifecycle (done)**: `run -d` forks a tiny per-container reaper that
   redirects stdio to `console.log` and persists state to disk; `ps [-a]`, `stop`, `restart`,
-  `rm`, `logs [-f]`, and `exec` address containers by id/name with crash reconcile of stale
-  records; file-based IPAM; `--rm` for auto-removal (see AGENTS.md).
+  `rm`, `logs [-f]`, `exec`, and `commit` address containers by id/name with crash reconcile
+  of stale records; file-based IPAM; `--rm` for auto-removal (see AGENTS.md).
 
 ## Highlights
 
@@ -48,7 +48,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   `/proc`/`/sys` paths, and a deny-by-default seccomp allowlist (opt out with
   `--seccomp unconfined`).
 - **Docker-compatible top 20% CLI**: `run / ps / stop / restart / rm / logs / exec / pull /
-  images / rmi / generate-service / doctor`.
+  images / rmi / commit / generate-service / doctor`.
 
 ## Install
 
@@ -101,6 +101,17 @@ target/release/zerun images
 target/release/zerun rmi alpine
 ```
 
+Commit a detached container's current filesystem into a local OCI image
+(`commit` works while running, but a running filesystem may be inconsistent):
+
+```bash
+target/release/zerun run -d --name builder alpine sleep 5
+# ... make changes with zerun exec builder ...
+target/release/zerun commit -m "add tooling" --author "You <you@example.com>" builder myapp:v1
+target/release/zerun run myapp:v1 /bin/busybox echo committed
+target/release/zerun rm builder
+```
+
 `run IMAGE` pulls the image automatically when it is not present locally; `-e NAME=V`
 sets environment variables, `--init` adds the built-in mini-init, and
 `--platform os/arch[/variant]` selects a specific architecture (default: host).
@@ -146,8 +157,11 @@ sudo target/release/zerun logs -t web                 # include capture timestam
 sudo target/release/zerun exec web /bin/sh            # join the container
 sudo target/release/zerun stop --time 3 web           # SIGTERM, then SIGKILL
 sudo target/release/zerun restart --time 3 web        # stop, then recreate from saved options
+sudo target/release/zerun commit -m snapshot web web:snapshot
 sudo target/release/zerun rm web                      # remove the stopped container
 ```
+
+Detached containers keep no daemon: the per-container reaper is a tiny process that
 
 Detached containers keep no daemon: the per-container reaper is a tiny process that
 disappears when the container exits. If the host crashes (or the reaper is killed), the
@@ -155,6 +169,8 @@ next `ps`/`rm` reconciles the stale record and reclaims host-side resources.
 `logs` hides capture-time timestamps by default; `-t/--timestamps` shows them.
 `restart` recreates a detached container from the canonical launch options saved in
 `state.json`; containers created before this metadata was added are not restartable.
+`commit` produces a single-layer OCI image from the container rootfs. Exited detached
+containers retain their writable layer until `rm`; `--rm` still removes it on exit.
 
 ### systemd integration (M6)
 
