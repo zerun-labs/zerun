@@ -50,6 +50,21 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
 - **Docker-compatible top 20% CLI**: `run / ps / stop / rm / logs / exec / pull / images /
   rmi / generate-service / doctor`.
 
+## Install
+
+On Linux, install a tagged release with the checksum-verified helper script:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zerun-labs/zerun/main/install.sh | sh
+# Or pin a release and prefix:
+ZERUN_INSTALL_VERSION=v0.2.0 ./install.sh --prefix ~/.local
+```
+
+The script detects x86_64, ARM64, ARMv7, and RISC-V64, downloads the static
+musl build, verifies SHA-256, and creates `zerun` plus the shorter `ze`
+command. It uses `/usr/local` when it has root access and falls back to
+`~/.local` for rootless hosts.
+
 ## Build
 
 ```bash

@@ -1,0 +1,74 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+          - riscv64gc-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild
+
+      - name: Build static binary
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo zigbuild --locked --release --target ${{ matrix.target }}
+
+      - name: Package release
+        run: |
+          mkdir -p dist/zerun-${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/zerun dist/zerun-${{ matrix.target }}/zerun
+          tar -czf dist/zerun-${{ matrix.target }}.tar.gz -C dist/zerun-${{ matrix.target }} zerun
+          (cd dist && sha256sum zerun-${{ matrix.target }}.tar.gz > zerun-${{ matrix.target }}.tar.gz.sha256)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zerun-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Upload release artifacts
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.tar.gz.sha256
