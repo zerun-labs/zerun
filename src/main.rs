@@ -60,6 +60,7 @@ fn main() {
         Some("pull") => cmd_pull(&args[2..]),
         Some("images") => cmd_images(&args[2..]),
         Some("rmi") => cmd_rmi(&args[2..]),
+        Some("push") => cmd_push(&args[2..]),
         Some("commit") => cmd_commit(&args[2..]),
         Some("generate-service") => cmd_generate_service(&args[2..]),
         Some("doctor") => cmd_doctor(),
@@ -1616,6 +1617,51 @@ fn cmd_rmi(args: &[String]) -> i32 {
     }
 }
 
+fn cmd_push(args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("usage: zerun push IMAGE[:TAG]");
+        return 0;
+    }
+    if args.len() != 1 {
+        eprintln!("zerun push: exactly one IMAGE[:TAG] is required");
+        return 2;
+    }
+    let raw = &args[0];
+    let reference = match Reference::parse(raw) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("zerun push: invalid reference '{raw}': {e}");
+            return 2;
+        }
+    };
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let imgstore = match image::store::ImageStore::open(&store) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let mut client = RegistryClient::new();
+    println!("{}: pushing...", reference.canonical());
+    match image::push::push_image(&imgstore, &mut client, &reference) {
+        Ok(image) => {
+            println!("{}: digest: {}", reference.canonical(), image.digest);
+            0
+        }
+        Err(e) => {
+            eprintln!("zerun push: {}: {e}", reference.canonical());
+            1
+        }
+    }
+}
+
 fn cmd_generate_service(args: &[String]) -> i32 {
     if args.iter().any(|a| a == "--help") {
         service::print_usage();
@@ -2486,6 +2532,7 @@ USAGE:\n  \
   zerun logout [REGISTRY]               remove stored registry credentials\n  \
   zerun images                           list local images\n  \
   zerun rmi IMAGE...                     remove local images\n  \
+  zerun push IMAGE[:TAG]                 push a local image to a registry\n  \
   zerun commit [-m MSG] CONTAINER IMAGE[:TAG]  save a container as an image\n  \
   zerun generate-service [opts] IMAGE    write a systemd unit to stdout\n  \
   zerun doctor                           environment diagnostics\n\

@@ -16,6 +16,7 @@ pub mod commit;
 pub mod config;
 pub mod manifest;
 pub mod name;
+pub mod push;
 pub mod registry;
 pub mod store;
 pub mod unpack;

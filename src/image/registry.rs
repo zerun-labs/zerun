@@ -11,6 +11,8 @@
 use crate::error::ZResult;
 use crate::image::auth::{normalize_registry, Credential, CredentialStore};
 use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -59,12 +61,15 @@ impl RegistryClient {
 
     /// API endpoints for a registry, in priority order: configured mirrors for
     /// Docker Hub (a mirror is a caching proxy for the same repository paths),
-    /// then the official endpoint.
+    /// then the official endpoint. Explicit localhost dev registries try plain
+    /// HTTP first; remote registries are HTTPS-only.
     pub fn endpoints(&self, registry: &str) -> Vec<String> {
         if registry == "docker.io" {
             let mut v = self.mirrors.clone();
             v.push(DOCKER_HUB_API.to_string());
             v
+        } else if registry == "localhost" || registry.starts_with("localhost:") {
+            vec![format!("http://{registry}"), format!("https://{registry}")]
         } else {
             vec![format!("https://{registry}")]
         }
@@ -81,28 +86,203 @@ impl RegistryClient {
         registry: &str,
         repo: &str,
     ) -> ZResult<ureq::Response> {
-        let scope = format!("repository:{repo}:pull");
-        for _ in 0..2 {
+        let headers: Vec<(&str, &str)> = accept.map(|a| vec![("Accept", a)]).unwrap_or_default();
+        self.request(
+            Method::Get,
+            url,
+            RequestOptions {
+                registry,
+                repo,
+                scope: &format!("repository:{repo}:pull"),
+                headers: &headers,
+                body: RequestBody::None,
+            },
+        )
+    }
+
+    /// Perform an authenticated HEAD request. `404` is not an error because
+    /// callers use HEAD for content-addressed blob existence checks.
+    pub(crate) fn head(
+        &mut self,
+        url: &str,
+        registry: &str,
+        repo: &str,
+    ) -> ZResult<Option<ureq::Response>> {
+        match self.request(
+            Method::Head,
+            url,
+            RequestOptions {
+                registry,
+                repo,
+                scope: &format!("repository:{repo}:pull,push"),
+                headers: &[],
+                body: RequestBody::None,
+            },
+        ) {
+            Ok(resp) => Ok(Some(resp)),
+            Err(e) if e.0.contains("HTTP 404:") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Start a distribution blob-upload session. The registry may accept the
+    /// whole blob on this request (HTTP 201), or return an upload location for
+    /// a monolithic PUT.
+    pub(crate) fn start_blob_upload(
+        &mut self,
+        base: &str,
+        repo: &str,
+        digest: &str,
+    ) -> ZResult<Option<String>> {
+        let url = format!("{base}/v2/{repo}/blobs/uploads/?digest={digest}");
+        let resp = self.request(
+            Method::Post,
+            &url,
+            RequestOptions {
+                registry: registry_from_base(base)?,
+                repo,
+                scope: &format!("repository:{repo}:pull,push"),
+                headers: &[],
+                body: RequestBody::None,
+            },
+        )?;
+        let status = resp.status();
+        if status == 201 {
+            return Ok(None);
+        }
+        if status != 202 {
+            let body = response_snippet(resp);
+            return Err(crate::zerr!(
+                "start blob upload {digest}: HTTP {status}: {body}"
+            ));
+        }
+        let location = resp.header("location").map(str::to_string);
+        if location.is_none() {
+            return Err(crate::zerr!(
+                "registry accepted blob upload {digest} but returned no upload location"
+            ));
+        }
+        Ok(location.map(|loc| absolute_url(base, &loc)))
+    }
+
+    /// Upload a small blob (config or manifest descriptor) as one request.
+    pub(crate) fn put_blob_bytes(
+        &mut self,
+        url: &str,
+        registry: &str,
+        repo: &str,
+        bytes: &[u8],
+    ) -> ZResult<ureq::Response> {
+        self.request(
+            Method::Put,
+            url,
+            RequestOptions {
+                registry,
+                repo,
+                scope: &format!("repository:{repo}:pull,push"),
+                headers: &[],
+                body: RequestBody::Bytes(bytes),
+            },
+        )
+    }
+
+    /// Upload a layer file as a streaming request (never materialized in RAM).
+    pub(crate) fn put_blob_file(
+        &mut self,
+        url: &str,
+        registry: &str,
+        repo: &str,
+        path: &Path,
+    ) -> ZResult<ureq::Response> {
+        let size = std::fs::metadata(path)
+            .map_err(|e| crate::zerr!("stat blob {}: {e}", path.display()))?
+            .len();
+        self.request(
+            Method::Put,
+            url,
+            RequestOptions {
+                registry,
+                repo,
+                scope: &format!("repository:{repo}:pull,push"),
+                headers: &[],
+                body: RequestBody::File(path, size),
+            },
+        )
+    }
+
+    /// Put a signed manifest descriptor. `media_type` must be the exact
+    /// manifest mediaType; registries reject a generic JSON content type.
+    pub(crate) fn put_manifest(
+        &mut self,
+        url: &str,
+        registry: &str,
+        repo: &str,
+        media_type: &str,
+        bytes: &[u8],
+    ) -> ZResult<ureq::Response> {
+        let headers = [("Content-Type", media_type)];
+        self.request(
+            Method::Put,
+            url,
+            RequestOptions {
+                registry,
+                repo,
+                scope: &format!("repository:{repo}:pull,push"),
+                headers: &headers,
+                body: RequestBody::Bytes(bytes),
+            },
+        )
+    }
+
+    /// Shared authenticated request path used by pull and push. A 401 starts
+    /// (or refreshes) a Bearer token and retries once; transport failures and
+    /// transient HTTP statuses are retried twice. Bodies supplied as files are
+    /// reopened on every attempt, so streaming uploads remain retryable.
+    fn request(
+        &mut self,
+        method: Method,
+        url: &str,
+        opts: RequestOptions<'_>,
+    ) -> ZResult<ureq::Response> {
+        let scope = opts.scope.to_string();
+        for auth_round in 0..2 {
             let cached = self.tokens.get(&scope).cloned();
             for attempt in 0..3 {
-                let mut req = self.agent.get(url).set("User-Agent", USER_AGENT);
-                if let Some(a) = accept {
-                    req = req.set("Accept", a);
-                }
-                if let Some(tok) = cached.as_ref() {
-                    if now() < tok.expires_at {
-                        req = req.set("Authorization", &tok.authorization);
+                let mut req = self
+                    .agent
+                    .request(method.as_str(), url)
+                    .set("User-Agent", USER_AGENT);
+                if let Some(token) = cached.as_ref() {
+                    if now() < token.expires_at {
+                        req = req.set("Authorization", &token.authorization);
                     }
                 }
-                match req.call() {
+                for (name, value) in opts.headers {
+                    req = req.set(name, value);
+                }
+                if let RequestBody::File(_, size) = opts.body {
+                    req = req.set("Content-Length", &size.to_string());
+                }
+                let result = match opts.body {
+                    RequestBody::None => req.call(),
+                    RequestBody::Bytes(bytes) => req.send_bytes(bytes),
+                    RequestBody::File(path, _) => match File::open(path) {
+                        Ok(file) => req.send(file),
+                        Err(e) => {
+                            return Err(crate::zerr!("open blob {}: {e}", path.display()));
+                        }
+                    },
+                };
+                match result {
                     Ok(resp) => return Ok(resp),
                     Err(ureq::Error::Status(401, resp)) => {
                         let challenge = resp.header("www-authenticate").unwrap_or("").to_string();
                         self.tokens.remove(&scope);
-                        let credential = self.credential_for(registry, url).cloned();
+                        let credential = self.credential_for(opts.registry, url).cloned();
                         let authorization = self.authorization_for_challenge(
                             &challenge,
-                            repo,
+                            opts.repo,
+                            opts.scope,
                             credential.as_ref(),
                         )?;
                         self.tokens.insert(
@@ -112,14 +292,20 @@ impl RegistryClient {
                                 expires_at: now() + 55,
                             },
                         );
-                        break;
+                        if auth_round == 0 {
+                            break;
+                        }
+                        return Err(crate::zerr!(
+                            "registry request failed: {url}: authentication failed; check \
+                             'zerun login {}'",
+                            opts.registry
+                        ));
                     }
                     Err(ureq::Error::Status(code, resp)) => {
                         let retry_after = retry_after(&resp);
-                        let body = resp.into_string().unwrap_or_default();
-                        let snippet: String = body.chars().take(300).collect();
+                        let body = response_snippet(resp);
                         let err =
-                            crate::zerr!("registry request failed: {url}: HTTP {code}: {snippet}");
+                            crate::zerr!("registry request failed: {url}: HTTP {code}: {body}");
                         if is_retryable_status(code) && attempt < 2 {
                             thread::sleep(retry_delay(attempt, retry_after));
                             continue;
@@ -138,7 +324,8 @@ impl RegistryClient {
             }
         }
         Err(crate::zerr!(
-            "registry request failed: {url}: authentication failed; check 'zerun login {registry}'"
+            "registry request failed: {url}: authentication failed; check 'zerun login {}'",
+            opts.registry
         ))
     }
 
@@ -150,14 +337,19 @@ impl RegistryClient {
             Self::with_credentials(BTreeMap::from([(registry.clone(), credential.clone())]));
         // The credential is keyed by docker.io, but its API endpoint is the
         // registry-1 hostname; the bare domain is not the API host.
-        let host = if registry == "docker.io" {
-            DOCKER_HUB_API.to_string()
-        } else {
-            format!("https://{registry}")
-        };
-        probe
-            .get(&format!("{host}/v2/"), None, &registry, "")
-            .map(|_| ())
+        // Localhost registries may be plain HTTP, so try endpoint fallbacks.
+        let hosts = probe.endpoints(&registry);
+        let mut last_error = None;
+        for host in hosts {
+            match probe.get(&format!("{host}/v2/"), None, &registry, "") {
+                Ok(_) => return Ok(()),
+                Err(e) => last_error = Some(e),
+            }
+        }
+        match last_error {
+            Some(e) => Err(e),
+            None => Err(crate::zerr!("no registry endpoint available")),
+        }
     }
 
     fn credential_for(&self, registry: &str, url: &str) -> Option<&Credential> {
@@ -169,7 +361,9 @@ impl RegistryClient {
             }
             return None;
         }
-        if url.starts_with(&format!("https://{registry}/")) {
+        if url.starts_with(&format!("https://{registry}/"))
+            || url.starts_with(&format!("http://{registry}/"))
+        {
             self.credentials.get(registry)
         } else {
             None
@@ -180,6 +374,7 @@ impl RegistryClient {
         &self,
         challenge: &str,
         repo: &str,
+        default_scope: &str,
         credential: Option<&Credential>,
     ) -> ZResult<String> {
         if challenge.trim().eq_ignore_ascii_case("basic")
@@ -192,7 +387,7 @@ impl RegistryClient {
             };
             return Ok(credential.authorization());
         }
-        let token = self.obtain_token(challenge, repo, credential)?;
+        let token = self.obtain_token(challenge, repo, default_scope, credential)?;
         Ok(format!("Bearer {token}"))
     }
 
@@ -200,7 +395,8 @@ impl RegistryClient {
     fn obtain_token(
         &self,
         challenge: &str,
-        repo: &str,
+        _repo: &str,
+        default_scope: &str,
         credential: Option<&Credential>,
     ) -> ZResult<String> {
         let ch = parse_bearer_challenge(challenge).ok_or_else(|| {
@@ -217,9 +413,9 @@ impl RegistryClient {
         if !scope.is_empty() {
             url.push_str("&scope=");
             url.push_str(&encode_query(&scope));
-        } else if !repo.is_empty() {
+        } else if !default_scope.is_empty() {
             url.push_str("&scope=");
-            url.push_str(&encode_query(&format!("repository:{repo}:pull")));
+            url.push_str(&encode_query(default_scope));
         }
 
         let resp = (0..3)
@@ -264,6 +460,85 @@ impl RegistryClient {
             .map(str::to_string)
             .ok_or_else(|| crate::zerr!("token endpoint returned no token"))
     }
+}
+
+/// HTTP methods supported by the registry request helper.
+#[derive(Clone, Copy)]
+enum Method {
+    Get,
+    Head,
+    Post,
+    Put,
+}
+
+impl Method {
+    fn as_str(self) -> &'static str {
+        match self {
+            Method::Get => "GET",
+            Method::Head => "HEAD",
+            Method::Post => "POST",
+            Method::Put => "PUT",
+        }
+    }
+}
+
+/// Description of one registry request, excluding authentication.
+struct RequestOptions<'a> {
+    registry: &'a str,
+    repo: &'a str,
+    /// Requested token scope. Registries commonly advertise a broader scope in
+    /// their challenge; the cache is still keyed by what the caller asked for.
+    scope: &'a str,
+    headers: &'a [(&'a str, &'a str)],
+    body: RequestBody<'a>,
+}
+
+/// Request bodies. Layer files stream directly from the content-addressed
+/// store instead of being read into memory.
+enum RequestBody<'a> {
+    None,
+    Bytes(&'a [u8]),
+    File(&'a Path, u64),
+}
+
+/// Read a bounded response-body snippet for diagnostics. HEAD/204 responses
+/// and unreadable bodies simply produce an empty string.
+fn response_snippet(resp: ureq::Response) -> String {
+    resp.into_string()
+        .unwrap_or_default()
+        .chars()
+        .take(300)
+        .collect()
+}
+
+/// Resolve a distribution `Location` header. OCI permits an absolute URL or a
+/// path relative to the API base.
+fn absolute_url(base: &str, location: &str) -> String {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        location.to_string()
+    } else if location.starts_with('/') {
+        format!("{base}{location}")
+    } else {
+        format!("{base}/{location}")
+    }
+}
+
+/// Derive the registry key used by the credential cache from an API base URL.
+fn registry_from_base(base: &str) -> ZResult<&str> {
+    let rest = base
+        .strip_prefix("https://")
+        .or_else(|| base.strip_prefix("http://"))
+        .ok_or_else(|| crate::zerr!("registry API base must be HTTP(S): {base}"))?;
+    let host = rest.split('/').next().unwrap_or_default();
+    if host.is_empty() {
+        return Err(crate::zerr!("registry API base has no host: {base}"));
+    }
+    let normalized = if host == "registry-1.docker.io" {
+        "docker.io"
+    } else {
+        host
+    };
+    Ok(normalized)
 }
 
 impl Default for RegistryClient {
