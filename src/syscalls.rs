@@ -442,15 +442,23 @@ where
 
 // ---------- bring loopback up inside a fresh netns ----------
 
-/// libc's ioctl request type differs between Linux libc ABIs.
-#[cfg(target_env = "musl")]
+/// libc's ioctl request type differs between Linux libc ABIs. Constants are
+/// passed through this target-specific adapter so both GNU and musl builds use
+/// the type expected by `libc::ioctl`.
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64"
+))]
+#[allow(clippy::unnecessary_cast)]
 fn ioctl_request(request: u64) -> libc::Ioctl {
     request as libc::Ioctl
 }
 
-#[cfg(not(target_env = "musl"))]
-fn ioctl_request(request: u64) -> libc::Ioctl {
-    request
+#[cfg(target_arch = "arm")]
+#[allow(clippy::unnecessary_cast)]
+fn ioctl_request(request: u32) -> libc::Ioctl {
+    request as libc::Ioctl
 }
 
 pub fn bring_loopback_up() -> ZResult<()> {

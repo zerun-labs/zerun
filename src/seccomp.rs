@@ -36,6 +36,15 @@ const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
 #[cfg(target_arch = "x86_64")]
 const AUDIT_ARCH_NATIVE: u32 = 0xc000_003e;
 
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH_NATIVE: u32 = 0xc000_00b7;
+
+#[cfg(all(target_arch = "arm", target_endian = "little"))]
+const AUDIT_ARCH_NATIVE: u32 = 0x4000_0028;
+
+#[cfg(target_arch = "riscv64")]
+const AUDIT_ARCH_NATIVE: u32 = 0xc000_00f3;
+
 #[repr(C)]
 struct SockFprog {
     len: u16,
