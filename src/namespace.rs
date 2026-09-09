@@ -324,6 +324,13 @@ fn child_stage(
     };
     setup_rootfs(&cfg)?;
 
+    // 1b. /etc/hosts: a container should resolve its own hostname and id.
+    //     Written from inside the child because the bridge IP is only known
+    //     once the parent's IPAM picked it, and the writable layer only exists
+    //     after the overlay mount. Requires the per-run overlay: without one
+    //     (--no-overlay) we would mutate the caller's rootfs, so we skip.
+    write_etc_hosts(spec);
+
     // 2. Network inside the container netns (before capability drop, which
     //    would remove the CAP_NET_ADMIN needed to configure eth0).
     match spec.net {
@@ -393,6 +400,40 @@ fn child_stage(
     );
     let err = cmd.exec(); // only returns on failure
     Err(crate::zerr!("execve failed: {err}"))
+}
+
+/// Generate `/etc/hosts` for the container (Docker-style entries) and write it
+/// into the container root. Best effort: failures are warned about and never
+/// abort the run — a missing/odd image layout must not kill the container.
+/// Host networking shares the host's /etc/hosts, so nothing is written there.
+fn write_etc_hosts(spec: &RunSpec) {
+    if matches!(spec.net, NetMode::Host) {
+        return;
+    }
+    if spec.overlay.is_none() {
+        eprintln!("zerun: warning: --no-overlay has no writable layer; /etc/hosts is not injected");
+        return;
+    }
+    let host = spec.hostname.as_deref().unwrap_or(&spec.id);
+    let self_entry = match spec.bridge_ip {
+        Some(ip) => format!("{ip}\t{host}\t{}", spec.id),
+        None => format!("127.0.0.1\t{host}"),
+    };
+    let content = format!(
+        "127.0.0.1\tlocalhost\n\
+         ::1\tlocalhost ip6-localhost ip6-loopback\n\
+         fe00::0\tip6-localnet\n\
+         ff00::0\tip6-mcastprefix\n\
+         ff02::1\tip6-allnodes\n\
+         ff02::2\tip6-allrouters\n\
+         \n{self_entry}\n"
+    );
+    let etc = std::path::Path::new("/etc");
+    if let Err(e) =
+        std::fs::create_dir_all(etc).and_then(|_| std::fs::write(etc.join("hosts"), content))
+    {
+        eprintln!("zerun: warning: /etc/hosts injection: {e}");
+    }
 }
 
 /// Unprivileged rootless: map uid/gid 0 inside the new user namespace to the host
