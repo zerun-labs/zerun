@@ -116,8 +116,9 @@ Run options (current subset):
 --pids 256           cgroup v2 pids.max
 -h, --hostname H     container hostname (new UTS namespace)
 --net bridge|none|host
-                     bridge = rootful bridge networking on zerun0 (veth + eth0 in container);
-                     none = fresh netns with loopback only (default); host = share host net
+                     bridge = rootful bridge networking on zerun0 (veth + eth0 in container;
+                     rootful default); none = fresh netns with loopback only (rootless default);
+                     host = share host net
 --init               run built-in mini-init (reap orphans, forward signals)
 --seccomp default|unconfined   seccomp policy (default: deny-by-default allowlist)
 --platform os/arch[/variant]   pull/run a specific platform

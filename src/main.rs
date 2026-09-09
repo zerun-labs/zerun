@@ -88,6 +88,8 @@ struct RunArgs {
     pids: Option<i64>,
     hostname: Option<String>,
     net: NetMode,
+    /// True after the operator explicitly selected `--net`.
+    net_specified: bool,
     use_init: bool,
     seccomp: SeccompMode,
     no_overlay: bool,
@@ -138,6 +140,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--net" => {
                 let v = next_value(args, &mut i, "--net")?;
+                a.net_specified = true;
                 a.net = match v.as_str() {
                     "bridge" => NetMode::Bridge,
                     "host" => NetMode::Host,
@@ -279,18 +282,31 @@ fn next_value(args: &[String], i: &mut usize, opt: &str) -> Result<String, Strin
     Ok(v.clone())
 }
 
+/// Docker-style networking defaults: rootful runs use the managed bridge;
+/// rootless stays on an isolated loopback namespace until user-mode NAT lands.
+fn default_net(euid: u32) -> NetMode {
+    if euid == 0 {
+        NetMode::Bridge
+    } else {
+        NetMode::None
+    }
+}
+
 fn cmd_run(args: &[String]) -> i32 {
     if args.iter().any(|a| a == "--help") {
         print_run_usage();
         return 0;
     }
-    let a = match parse_run_args(args) {
+    let mut a = match parse_run_args(args) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("zerun run: {e}");
             return 2;
         }
     };
+    if !a.net_specified {
+        a.net = default_net(unsafe { libc::geteuid() });
+    }
     if !a.ports.is_empty() && a.net != NetMode::Bridge {
         eprintln!("zerun run: -p/--publish requires --net bridge");
         return 2;
@@ -977,13 +993,18 @@ fn cmd_generate_service(args: &[String]) -> i32 {
         service::print_usage();
         return 0;
     }
-    let a = match parse_run_args(args) {
+    let mut a = match parse_run_args(args) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("zerun generate-service: {e}");
             return 2;
         }
     };
+    // Keep the generated command explicit so behavior does not depend on the
+    // effective UID of the systemd service versus the generating user.
+    if !a.net_specified {
+        a.net = default_net(unsafe { libc::geteuid() });
+    }
     match service::generate(&a, &mut std::io::stdout().lock()) {
         Ok(()) => 0,
         Err(e) => {
@@ -1760,8 +1781,9 @@ RUN OPTIONS:\n  \
   --pids 256          cgroup v2 pids.max\n  \
   -h, --hostname H    container hostname (new UTS namespace)\n  \
   --net none|host|bridge\n  \
-                      none = fresh netns + loopback (default); host = share host net;\n  \
-                      bridge = zerun0 bridge + NAT (rootful, needs CAP_NET_ADMIN)\n  \
+                      none = fresh netns + loopback; host = share host net;\n  \
+                      bridge = zerun0 bridge + NAT (needs CAP_NET_ADMIN;\n  \
+                      rootful default; rootless default is none)\n  \
   -p, --publish HOST:CONTAINER  publish a TCP port on the host (requires --net bridge)\n  \
   --dns IP            container DNS server (repeatable; bridge mode; defaults to the host's)\n  \
   --init              run the built-in mini-init (reap orphans + forward signals)\n  \
@@ -1779,6 +1801,12 @@ ENV:\n  \
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rootful_defaults_to_bridge_and_rootless_to_none() {
+        assert_eq!(default_net(0), NetMode::Bridge);
+        assert_eq!(default_net(1000), NetMode::None);
+    }
 
     #[test]
     fn log_timestamps_are_hidden_by_default_and_shown_on_request() {
