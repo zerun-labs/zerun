@@ -183,6 +183,21 @@ pub fn restore_terminal(fd: RawFd, saved: &libc::termios) {
     }
 }
 
+/// Disable terminal echo while preserving the rest of the line discipline.
+/// Returns the caller-owned saved termios for a precise restore.
+pub fn disable_terminal_echo(fd: RawFd) -> ZResult<libc::termios> {
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
+        return Err(last_err("tcgetattr"));
+    }
+    let mut hidden = saved;
+    hidden.c_lflag &= !libc::ECHO;
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &hidden) } != 0 {
+        return Err(last_err("tcsetattr(disable ECHO)"));
+    }
+    Ok(saved)
+}
+
 pub fn terminal_window_size(fd: RawFd) -> ZResult<libc::winsize> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } != 0 {

@@ -21,8 +21,8 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   built-in mini-init, and a reproducible benchmark harness.
 - **M2 — storage & security (done)**: deny-by-default seccomp allowlist; per-run OverlayFS
   with disk upper and automatic cleanup; OCI whiteout materialization.
-- **M3 — OCI image engine (core done)**: `zerun pull / images / rmi`; Docker v2 pull with
-  Bearer token auth, multi-arch platform selection (`--platform`), compressed-blob and
+- **M3 — OCI image engine (done)**: `zerun login / logout / pull / images / rmi`; Docker v2
+  pull with Bearer token auth, private-registry credentials, multi-arch platform selection (`--platform`), compressed-blob and
   diff_id double verification, zstd layer decode + magic sniffing, mirror inheritance
   (env, zerun `config.toml`, `/etc/docker/daemon.json`), and per-layer pull progress;
   `zerun run IMAGE` auto-pulls and applies image env/entrypoint/cmd/working-dir.
@@ -48,7 +48,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   `/proc`/`/sys` paths, and a deny-by-default seccomp allowlist (opt out with
   `--seccomp unconfined`).
 - **Docker-compatible top 20% CLI**: `run / ps / stop / restart / rm / logs / exec / pull /
-  images / rmi / commit / generate-service / doctor`.
+  login / logout / images / rmi / commit / generate-service / doctor`.
 
 ## Install
 
@@ -143,6 +143,22 @@ Run options (current subset):
 (`/etc/zerun/config.toml` with `[registry] mirrors = [...]`, overridable via
 `ZERUN_CONFIG` or `~/.config/zerun/config.toml`), and the `/etc/docker/daemon.json`
 `registry-mirrors` list are honored for `docker.io` pulls (in that priority order).
+
+### Private registries
+
+Log in once before pulling from a private registry:
+
+```bash
+zerun login ghcr.io
+zerun login registry.example:5000 -u alice --password-stdin
+zerun logout ghcr.io
+```
+
+Credentials live in `~/.config/zerun/credentials.json` (or `$XDG_CONFIG_HOME/zerun/...`).
+Set `ZERUN_CREDENTIALS` to use another file. The file is written atomically with `0600`
+permissions and its parent with `0700`; passwords are validated against `/v2/` before they
+are stored. For `docker.io`, credentials are used only for the official registry endpoint
+and are never sent to configured mirrors.
 
 ### Detached lifecycle (M5)
 

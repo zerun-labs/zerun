@@ -11,6 +11,7 @@
 //!   instead of mounting each OCI layer as its own overlay lower. Whiteouts are
 //!   then plain file deletions during unpack (works rootful *and* rootless, no
 //!   mknod needed), and tags sharing the same config digest share one rootfs.
+pub mod auth;
 pub mod commit;
 pub mod config;
 pub mod manifest;

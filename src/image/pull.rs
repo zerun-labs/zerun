@@ -82,15 +82,29 @@ pub fn pull_image(
 
     // 1. Resolve the tag/digest to a single-architecture manifest on the first
     //    endpoint that answers (mirrors first, official last).
-    let (manifest_digest, manifest_bytes) =
-        resolve_single_manifest(store, client, &endpoints, repo, &req_ref, &want)?;
+    let (manifest_digest, manifest_bytes) = resolve_single_manifest(
+        store,
+        client,
+        &endpoints,
+        &reference.registry,
+        repo,
+        &req_ref,
+        &want,
+    )?;
     let manifest = match manifest::classify(&manifest_bytes)? {
         ImageDoc::Manifest(m) => m,
         ImageDoc::Index(_) => unreachable!("resolve_single_manifest returns single manifests"),
     };
 
     // 2. Config blob: download if missing, parse it.
-    ensure_blob(store, client, &endpoints, repo, &manifest.config.digest)?;
+    ensure_blob(
+        store,
+        client,
+        &endpoints,
+        &reference.registry,
+        repo,
+        &manifest.config.digest,
+    )?;
     let cfg_bytes = store
         .read_blob(&manifest.config.digest)?
         .ok_or_else(|| crate::zerr!("config blob disappeared after download"))?;
@@ -113,7 +127,15 @@ pub fn pull_image(
 
     // 4. Materialize the rootfs (keyed by config digest, shared across tags).
     let size_bytes: u64 = manifest.layers.iter().map(|l| l.size).sum();
-    let rootfs = materialize_rootfs(store, client, &endpoints, repo, &manifest, &config)?;
+    let rootfs = materialize_rootfs(
+        store,
+        client,
+        &endpoints,
+        &reference.registry,
+        repo,
+        &manifest,
+        &config,
+    )?;
 
     // 5. Index under name[:tag] (a digest-pinned pull records no tag).
     let name = format!("{}/{}", reference.registry, reference.repository);
@@ -149,6 +171,7 @@ fn resolve_single_manifest(
     store: &ImageStore,
     client: &mut RegistryClient,
     endpoints: &[String],
+    registry: &str,
     repo: &str,
     req_ref: &str,
     want: &Platform,
@@ -157,7 +180,7 @@ fn resolve_single_manifest(
     for base in endpoints {
         let top_url = format!("{base}/v2/{repo}/manifests/{req_ref}");
         let res = (|| -> ZResult<(String, Vec<u8>)> {
-            let resp = client.get(&top_url, Some(manifest::ACCEPT_MANIFEST), repo)?;
+            let resp = client.get(&top_url, Some(manifest::ACCEPT_MANIFEST), registry, repo)?;
             let digest_hdr = resp.header("docker-content-digest").map(str::to_string);
             let bytes = resp
                 .into_string()
@@ -176,7 +199,7 @@ fn resolve_single_manifest(
                     let child_digest = child.digest.clone();
                     let child_url = format!("{base}/v2/{repo}/manifests/{child_digest}");
                     let child_resp =
-                        client.get(&child_url, Some(manifest::ACCEPT_MANIFEST), repo)?;
+                        client.get(&child_url, Some(manifest::ACCEPT_MANIFEST), registry, repo)?;
                     let child_bytes = child_resp
                         .into_string()
                         .map_err(|e| crate::zerr!("read child manifest body: {e}"))?
@@ -219,6 +242,7 @@ fn ensure_blob(
     store: &ImageStore,
     client: &mut RegistryClient,
     endpoints: &[String],
+    registry: &str,
     repo: &str,
     digest: &str,
 ) -> ZResult<()> {
@@ -228,7 +252,7 @@ fn ensure_blob(
     let mut last_err: Option<ZError> = None;
     for base in endpoints {
         let url = format!("{base}/v2/{repo}/blobs/{digest}");
-        match client.get(&url, None, repo) {
+        match client.get(&url, None, registry, repo) {
             Ok(resp) => {
                 let reader = resp.into_reader();
                 match store.store_blob_stream(digest, reader) {
@@ -249,6 +273,7 @@ fn materialize_rootfs(
     store: &ImageStore,
     client: &mut RegistryClient,
     endpoints: &[String],
+    registry: &str,
     repo: &str,
     manifest: &manifest::Manifest,
     config: &ImageConfig,
@@ -277,7 +302,7 @@ fn materialize_rootfs(
             short_digest(&layer.digest),
             crate::fsutil::human_size(layer.size)
         );
-        ensure_blob(store, client, endpoints, repo, &layer.digest)?;
+        ensure_blob(store, client, endpoints, registry, repo, &layer.digest)?;
         let blob_path = store.blob_path(&layer.digest)?;
         let expected_diff = config.rootfs.diff_ids[i].clone();
         let hint = format!("layer {} ({})", i + 1, layer.digest);

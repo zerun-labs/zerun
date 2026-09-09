@@ -5,7 +5,7 @@
 //!   zerun run --rootfs DIR [opts] -- CMD  legacy: run from an unpacked rootfs
 //!   zerun run -d [--name N] [opts] IMAGE  run detached (state under /run/zerun)
 //!   zerun ps [-a] / stop / rm / logs / exec   detached-container lifecycle (M5)
-//!   zerun pull / images / rmi             OCI image lifecycle (M3)
+//!   zerun login / logout / pull / images / rmi   image lifecycle (M3)
 //!   zerun doctor                          environment diagnostics
 mod cgroup;
 mod error;
@@ -19,6 +19,7 @@ mod namespace;
 mod netlink;
 mod network;
 mod nfnetlink;
+mod prompt;
 mod pty;
 mod seccomp;
 mod security;
@@ -30,7 +31,9 @@ mod trace;
 mod workload;
 
 use cgroup::ResourceLimits;
+use image::auth::{normalize_registry, Credential, CredentialStore};
 use image::name::Reference;
+use image::registry::RegistryClient;
 use image::PullOptions;
 use mounts::OverlayPaths;
 use namespace::{NetMode, RunSpec};
@@ -51,6 +54,8 @@ fn main() {
         Some("rm") => cmd_rm(&args[2..]),
         Some("logs") => cmd_logs(&args[2..]),
         Some("exec") => cmd_exec(&args[2..]),
+        Some("login") => cmd_login(&args[2..]),
+        Some("logout") => cmd_logout(&args[2..]),
         Some("pull") => cmd_pull(&args[2..]),
         Some("images") => cmd_images(&args[2..]),
         Some("rmi") => cmd_rmi(&args[2..]),
@@ -1158,6 +1163,153 @@ fn resolve_image_argv(cfg: &image::config::ImageConfig, cli: &[String]) -> Vec<S
     argv
 }
 
+fn cmd_login(args: &[String]) -> i32 {
+    let mut registry = "docker.io".to_string();
+    let mut username: Option<String> = None;
+    let mut password_stdin = false;
+    let mut positional = 0;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-u" | "--username" => match next_value(args, &mut i, "--username") {
+                Ok(v) => username = Some(v),
+                Err(e) => {
+                    eprintln!("zerun login: {e}");
+                    return 2;
+                }
+            },
+            "--username=" => {
+                username = Some(args[i]["--username=".len()..].to_string());
+                i += 1;
+            }
+            other if other.starts_with("--username=") => {
+                username = Some(other["--username=".len()..].to_string());
+                i += 1;
+            }
+            "--password-stdin" => {
+                password_stdin = true;
+                i += 1;
+            }
+            "-h" | "--help" => {
+                println!("usage: zerun login [REGISTRY] [-u USERNAME] [--password-stdin]");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun login: unknown option {other}");
+                return 2;
+            }
+            _ => {
+                positional += 1;
+                if positional > 1 {
+                    eprintln!("zerun login: only one REGISTRY may be given");
+                    return 2;
+                }
+                registry = args[i].clone();
+                i += 1;
+            }
+        }
+    }
+
+    let registry = match normalize_registry(&registry) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("zerun login: {e}");
+            return 2;
+        }
+    };
+    let username = match prompt::username(username) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("zerun login: {e}");
+            return 1;
+        }
+    };
+    let password = if password_stdin {
+        prompt::password_from_stdin()
+    } else {
+        prompt::password_interactive()
+    };
+    let password = match password {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("zerun login: {e}");
+            return 1;
+        }
+    };
+    let credential = Credential { username, password };
+    let mut client = RegistryClient::new();
+    if let Err(e) = client.verify_login(&registry, &credential) {
+        eprintln!("zerun login: {e}");
+        return 1;
+    }
+    let store = match CredentialStore::open() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun login: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = store.set(&registry, &credential) {
+        eprintln!("zerun login: {e}");
+        return 1;
+    }
+    println!("Login Succeeded for {registry}");
+    0
+}
+
+fn cmd_logout(args: &[String]) -> i32 {
+    let mut registry = "docker.io".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                println!("usage: zerun logout [REGISTRY]");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun logout: unknown option {other}");
+                return 2;
+            }
+            _ => {
+                if i > 0 {
+                    eprintln!("zerun logout: only one REGISTRY may be given");
+                    return 2;
+                }
+                registry = args[i].clone();
+                i += 1;
+            }
+        }
+    }
+    let registry = match normalize_registry(&registry) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("zerun logout: {e}");
+            return 2;
+        }
+    };
+    let store = match CredentialStore::open() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun logout: {e}");
+            return 1;
+        }
+    };
+    match store.remove(&registry) {
+        Ok(true) => {
+            println!("Removing login for {registry}");
+            0
+        }
+        Ok(false) => {
+            eprintln!("zerun logout: not logged in to {registry}");
+            1
+        }
+        Err(e) => {
+            eprintln!("zerun logout: {e}");
+            1
+        }
+    }
+}
+
 fn cmd_pull(args: &[String]) -> i32 {
     let mut platform: Option<String> = None;
     let mut refs: Vec<String> = Vec::new();
@@ -2122,6 +2274,9 @@ USAGE:\n  \
   zerun exec [-e K=V] [-w DIR] CONTAINER CMD [ARG...]\n  \
                                         run a command in a running container\n  \
   zerun pull [--platform ...] IMAGE...   pull OCI images (Docker Hub, mirrors)\n  \
+  zerun login [REGISTRY] [-u USER] [--password-stdin]\n  \
+                                        log in to a private registry\n  \
+  zerun logout [REGISTRY]               remove stored registry credentials\n  \
   zerun images                           list local images\n  \
   zerun rmi IMAGE...                     remove local images\n  \
   zerun commit [-m MSG] CONTAINER IMAGE[:TAG]  save a container as an image\n  \

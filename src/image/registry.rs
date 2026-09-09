@@ -1,15 +1,16 @@
 //! OCI distribution (registry) client.
 //!
-//! Scope: anonymous `pull` only, which is all a daemonless run-only runtime
-//! needs. It implements the Docker v2 token flow (WWW-Authenticate challenge ->
-//! Bearer token), multi-arch manifest resolution, and Docker Hub mirror
+//! Scope: authenticated OCI `pull`, `login`, and `logout`. It implements the
+//! Docker v2 token flow (WWW-Authenticate challenge -> Bearer token), Basic
+//! challenges, multi-arch manifest resolution, and Docker Hub mirror
 //! inheritance. Mirror priority: env `ZERUN_REGISTRY_MIRRORS`, then the zerun
 //! config file (`/etc/zerun/config.toml`, or `ZERUN_CONFIG` / user config;
 //! `[registry] mirrors = [...]`), then `/etc/docker/daemon.json`'s
-//! `registry-mirrors`. Registry credentials (private registries) are out of
-//! scope for now and produce a clear error.
+//! `registry-mirrors`. Credentials are read from the owner-only zerun store;
+//! they are deliberately not sent to Docker Hub mirrors.
 use crate::error::ZResult;
-use std::collections::HashMap;
+use crate::image::auth::{normalize_registry, Credential, CredentialStore};
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const USER_AGENT: &str = concat!("zerun/", env!("CARGO_PKG_VERSION"));
@@ -20,12 +21,14 @@ pub struct RegistryClient {
     /// Docker Hub mirror base URLs (with scheme, no trailing slash), in
     /// priority order. Only consulted for `docker.io` references.
     pub mirrors: Vec<String>,
+    credentials: BTreeMap<String, Credential>,
     tokens: HashMap<String, CachedToken>,
 }
 
 #[derive(Clone)]
 struct CachedToken {
-    token: String,
+    /// Complete Authorization header value ("Basic ..." or "Bearer ...").
+    authorization: String,
     expires_at: u64,
 }
 
@@ -38,12 +41,17 @@ struct BearerChallenge {
 
 impl RegistryClient {
     pub fn new() -> Self {
+        Self::with_credentials(load_credentials())
+    }
+
+    pub(crate) fn with_credentials(credentials: BTreeMap<String, Credential>) -> Self {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(30))
             .build();
         RegistryClient {
             agent,
             mirrors: discover_mirrors(),
+            credentials,
             tokens: HashMap::new(),
         }
     }
@@ -69,6 +77,7 @@ impl RegistryClient {
         &mut self,
         url: &str,
         accept: Option<&str>,
+        registry: &str,
         repo: &str,
     ) -> ZResult<ureq::Response> {
         let scope = format!("repository:{repo}:pull");
@@ -80,7 +89,7 @@ impl RegistryClient {
             }
             if let Some(tok) = cached.as_ref() {
                 if now() < tok.expires_at {
-                    req = req.set("Authorization", &format!("Bearer {}", tok.token));
+                    req = req.set("Authorization", &tok.authorization);
                 }
             }
             match req.call() {
@@ -88,11 +97,13 @@ impl RegistryClient {
                 Err(ureq::Error::Status(401, resp)) => {
                     let challenge = resp.header("www-authenticate").unwrap_or("").to_string();
                     self.tokens.remove(&scope);
-                    let token = self.obtain_token(&challenge, repo)?;
+                    let credential = self.credential_for(registry, url).cloned();
+                    let authorization =
+                        self.authorization_for_challenge(&challenge, repo, credential.as_ref())?;
                     self.tokens.insert(
                         scope.clone(),
                         CachedToken {
-                            token,
+                            authorization,
                             expires_at: now() + 55,
                         },
                     );
@@ -110,40 +121,101 @@ impl RegistryClient {
             }
         }
         Err(crate::zerr!(
-            "registry request failed: {url}: authentication failed"
+            "registry request failed: {url}: authentication failed; check 'zerun login {registry}'"
         ))
     }
 
+    /// Validate credentials against the registry's `/v2/` endpoint before they
+    /// are written to disk. `get` handles both Basic and Bearer challenges.
+    pub fn verify_login(&mut self, registry: &str, credential: &Credential) -> ZResult<()> {
+        let registry = normalize_registry(registry)?;
+        let mut probe =
+            Self::with_credentials(BTreeMap::from([(registry.clone(), credential.clone())]));
+        // The credential is keyed by docker.io, but its API endpoint is the
+        // registry-1 hostname; the bare domain is not the API host.
+        let host = if registry == "docker.io" {
+            DOCKER_HUB_API.to_string()
+        } else {
+            format!("https://{registry}")
+        };
+        probe
+            .get(&format!("{host}/v2/"), None, &registry, "")
+            .map(|_| ())
+    }
+
+    fn credential_for(&self, registry: &str, url: &str) -> Option<&Credential> {
+        if registry == "docker.io" {
+            // Mirrors are often shared caching services; never leak Hub login
+            // credentials to them.
+            if url.starts_with(DOCKER_HUB_API) {
+                return self.credentials.get(registry);
+            }
+            return None;
+        }
+        if url.starts_with(&format!("https://{registry}/")) {
+            self.credentials.get(registry)
+        } else {
+            None
+        }
+    }
+
+    fn authorization_for_challenge(
+        &self,
+        challenge: &str,
+        repo: &str,
+        credential: Option<&Credential>,
+    ) -> ZResult<String> {
+        if challenge.trim().eq_ignore_ascii_case("basic")
+            || challenge.trim_start().to_lowercase().starts_with("basic ")
+        {
+            let Some(credential) = credential else {
+                return Err(crate::zerr!(
+                    "registry requires Basic authentication; run 'zerun login <REGISTRY>'"
+                ));
+            };
+            return Ok(credential.authorization());
+        }
+        let token = self.obtain_token(challenge, repo, credential)?;
+        Ok(format!("Bearer {token}"))
+    }
+
     /// Bearer token dance against the realm from a `WWW-Authenticate` header.
-    fn obtain_token(&self, challenge: &str, repo: &str) -> ZResult<String> {
+    fn obtain_token(
+        &self,
+        challenge: &str,
+        repo: &str,
+        credential: Option<&Credential>,
+    ) -> ZResult<String> {
         let ch = parse_bearer_challenge(challenge).ok_or_else(|| {
             crate::zerr!(
                 "registry requires unsupported authentication: '{challenge}' \
-                 (anonymous pull supports the standard Bearer token flow)"
+                 (standard Basic and Bearer token flows are supported)"
             )
         })?;
-        let scope = ch
-            .scope
-            .unwrap_or_else(|| format!("repository:{repo}:pull"));
         let mut url = ch.realm;
         url.push(if url.contains('?') { '&' } else { '?' });
         url.push_str("service=");
         url.push_str(&encode_query(&ch.service));
-        url.push_str("&scope=");
-        url.push_str(&encode_query(&scope));
+        let scope = ch.scope.unwrap_or_default();
+        if !scope.is_empty() {
+            url.push_str("&scope=");
+            url.push_str(&encode_query(&scope));
+        } else if !repo.is_empty() {
+            url.push_str("&scope=");
+            url.push_str(&encode_query(&format!("repository:{repo}:pull")));
+        }
 
-        let resp = self
-            .agent
-            .get(&url)
-            .set("User-Agent", USER_AGENT)
-            .call()
-            .map_err(|e| match e {
-                ureq::Error::Status(code, r) => {
-                    let body = r.into_string().unwrap_or_default();
-                    crate::zerr!("token endpoint {url}: HTTP {code}: {body}")
-                }
-                other => crate::zerr!("token endpoint {url}: {other}"),
-            })?;
+        let mut request = self.agent.get(&url).set("User-Agent", USER_AGENT);
+        if let Some(credential) = credential {
+            request = request.set("Authorization", &credential.authorization());
+        }
+        let resp = request.call().map_err(|e| match e {
+            ureq::Error::Status(code, r) => {
+                let body = r.into_string().unwrap_or_default();
+                crate::zerr!("token endpoint {url}: HTTP {code}: {body}")
+            }
+            other => crate::zerr!("token endpoint {url}: {other}"),
+        })?;
         let body = resp
             .into_string()
             .map_err(|e| crate::zerr!("read token response: {e}"))?;
@@ -160,6 +232,16 @@ impl RegistryClient {
 impl Default for RegistryClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn load_credentials() -> BTreeMap<String, Credential> {
+    match CredentialStore::open().and_then(|store| store.all()) {
+        Ok(credentials) => credentials,
+        Err(e) => {
+            eprintln!("zerun: warning: ignoring registry credentials: {e}");
+            BTreeMap::new()
+        }
     }
 }
 
