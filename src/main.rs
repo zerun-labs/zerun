@@ -15,6 +15,7 @@ mod execc;
 mod fsutil;
 mod image;
 mod lifecycle;
+mod logs;
 mod mini_init;
 mod mounts;
 mod namespace;
@@ -38,6 +39,7 @@ use image::auth::{normalize_registry, Credential, CredentialStore};
 use image::name::Reference;
 use image::registry::RegistryClient;
 use image::PullOptions;
+use logs::LogTimeFilter;
 use mounts::OverlayPaths;
 use namespace::{NetMode, RunSpec};
 use seccomp::SeccompMode;
@@ -2568,6 +2570,8 @@ fn cmd_logs(args: &[String]) -> i32 {
     let mut tail: Option<usize> = None;
     let mut follow = false;
     let mut timestamps = false;
+    let mut since = None;
+    let mut until = None;
     let mut targets: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -2594,8 +2598,26 @@ fn cmd_logs(args: &[String]) -> i32 {
                 timestamps = true;
                 i += 1;
             }
+            "--since" | "--until" => {
+                let is_since = a == "--since";
+                match next_value(args, &mut i, a) {
+                    Ok(v) => {
+                        if is_since {
+                            since = Some(v);
+                        } else {
+                            until = Some(v);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("zerun logs: {e}");
+                        return 2;
+                    }
+                }
+            }
             "-h" | "--help" => {
-                println!("usage: zerun logs [--tail N] [-f] [-t|--timestamps] CONTAINER");
+                println!(
+                    "usage: zerun logs [--tail N] [--since TIME] [--until TIME] [-f] [-t] CONTAINER"
+                );
                 return 0;
             }
             other if other.starts_with('-') && other.len() > 1 => {
@@ -2638,24 +2660,45 @@ fn cmd_logs(args: &[String]) -> i32 {
             return 1;
         }
     };
+    let filter = match LogTimeFilter::parse(since.as_deref(), until.as_deref()) {
+        Ok(filter) => filter,
+        Err(e) => {
+            eprintln!("zerun logs: {e}");
+            return 2;
+        }
+    };
+    // Tail selects raw log lines first, then time bounds narrow that window.
+    // This keeps `--tail 0` cheap and makes both options independently useful.
     let shown = tail_bytes(&bytes, tail.unwrap_or(usize::MAX));
-    write_log_output(shown, timestamps);
-    if follow {
-        follow_log(&store, &st, &path, shown.len() as u64, timestamps);
+    // Follow resumes at the raw byte consumed by this snapshot. Filtered
+    // output can be shorter than that tail when old lines are omitted.
+    let followed_from = shown.len() as u64;
+    let shown = logs::filter_log_lines(shown, Some(&filter));
+    write_log_output(&shown, timestamps);
+    // A fixed --until is an end boundary; only unbounded logs can follow.
+    if follow && !filter.has_until() {
+        follow_log(&store, &st, &path, followed_from, timestamps, Some(&filter));
     }
     0
 }
 
 /// Print data appended to `console.log` until the container exits.
-fn follow_log(store: &Store, st: &ContainerState, path: &Path, mut pos: u64, timestamps: bool) {
+fn follow_log(
+    store: &Store,
+    st: &ContainerState,
+    path: &Path,
+    mut pos: u64,
+    timestamps: bool,
+    filter: Option<&LogTimeFilter>,
+) {
     while container_observable(store, st) {
         std::thread::sleep(Duration::from_millis(200));
-        pos = drain_log(path, pos, timestamps);
+        pos = drain_log(path, pos, timestamps, filter);
     }
-    drain_log(path, pos, timestamps);
+    drain_log(path, pos, timestamps, filter);
 }
 
-fn drain_log(path: &Path, pos: u64, timestamps: bool) -> u64 {
+fn drain_log(path: &Path, pos: u64, timestamps: bool, filter: Option<&LogTimeFilter>) -> u64 {
     use std::io::{Read, Seek};
     let Ok(mut f) = std::fs::File::open(path) else {
         return pos;
@@ -2671,7 +2714,8 @@ fn drain_log(path: &Path, pos: u64, timestamps: bool) -> u64 {
     }
     let mut buf = Vec::new();
     if f.read_to_end(&mut buf).is_ok() {
-        write_log_output(&buf, timestamps);
+        let shown = logs::filter_log_lines(&buf, filter);
+        write_log_output(&shown, timestamps);
     }
     len
 }
@@ -4050,46 +4094,8 @@ fn write_log_output(data: &[u8], timestamps: bool) {
     if timestamps {
         write_stdout(data);
     } else {
-        write_stdout(&strip_log_timestamps(data));
+        write_stdout(&logs::strip_log_timestamps(data));
     }
-}
-
-fn strip_log_timestamps(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len());
-    let mut start = 0;
-    while start < data.len() {
-        let end = data[start..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map(|p| start + p + 1)
-            .unwrap_or(data.len());
-        let line = &data[start..end];
-        if let Some(content) = timestamp_prefix(line) {
-            out.extend_from_slice(content);
-        } else {
-            out.extend_from_slice(line);
-        }
-        start = end;
-    }
-    out
-}
-
-/// Return the line content after an RFC3339 nanosecond timestamp + TAB.
-fn timestamp_prefix(line: &[u8]) -> Option<&[u8]> {
-    const TS_LEN: usize = 30; // 2026-01-01T00:00:00.000000000Z
-    if line.len() <= TS_LEN + 1 || line[TS_LEN] != b'\t' || !is_utc_rfc3339(&line[..TS_LEN]) {
-        return None;
-    }
-    Some(&line[TS_LEN + 1..])
-}
-
-fn is_utc_rfc3339(b: &[u8]) -> bool {
-    const SEPARATORS: [u8; 30] = *b"YYYY-MM-DDTHH:MM:SS.NNNNNNNNNZ";
-    b.len() == 30
-        && b.iter().zip(SEPARATORS).all(|(got, want)| match want {
-            b'Y' | b'M' | b'D' | b'H' | b'S' | b'N' => got.is_ascii_digit(),
-            _ => *got == want,
-        })
 }
 
 /// Keep only the last `n` lines of `data` (newline-terminated lines; a
@@ -4214,7 +4220,7 @@ USAGE:\n  \
   zerun kill [--signal SIG] CONTAINER... signal detached containers (default KILL)\n  \
   zerun restart [--time S] CONTAINER... restart detached containers\n  \
   zerun rm [-f] CONTAINER...            remove stopped containers (-f: kill first)\n  \
-  zerun logs [--tail N] [-f] [-t] CONTAINER  show a container's console.log\n  \
+  zerun logs [--tail N] [--since TIME] [--until TIME] [-f] [-t] CONTAINER\n  \
   zerun stats [-a] [CONTAINER...]        one-shot resource metrics\n  \
   zerun update [opts] CONTAINER          change live resource limits\n  \
   zerun inspect CONTAINER...             dump container state as JSON\n  \
@@ -4582,18 +4588,6 @@ mod tests {
     fn rootful_defaults_to_bridge_and_rootless_to_none() {
         assert_eq!(default_net(0), NetMode::Bridge);
         assert_eq!(default_net(1000), NetMode::None);
-    }
-
-    #[test]
-    fn log_timestamps_are_hidden_by_default_and_shown_on_request() {
-        const RAW: &[u8] = b"2026-01-01T00:00:00.123456789Z\thello\nlegacy\npartial";
-        assert_eq!(strip_log_timestamps(RAW), b"hello\nlegacy\npartial");
-        assert_eq!(timestamp_prefix(RAW), Some(&b"hello\nlegacy\npartial"[..]));
-        let first_line_end = RAW.iter().position(|&b| b == b'\n').unwrap() + 1;
-        assert_eq!(
-            timestamp_prefix(&RAW[..first_line_end]),
-            Some(&b"hello\n"[..])
-        );
     }
 
     #[test]

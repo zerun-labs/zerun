@@ -35,7 +35,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   proxy (Docker's docker-proxy in-binary), and `--dns` / host resolv.conf inheritance.
 - **M5 — detached lifecycle (done)**: `run -d` forks a tiny per-container reaper that
   redirects stdio to `console.log` and persists state to disk; `ps [-a]`, `stop`, `restart`,
-  `rm`, `logs [-f]`, `stats`, `exec`, `attach`, and `commit` address containers by id/name with crash reconcile
+  `rm`, `logs [--since/--until/-f]`, `stats`, `exec`, `attach`, and `commit` address containers by id/name with crash reconcile
   of stale records; file-based IPAM; `--rm` for auto-removal (see AGENTS.md).
 
 ## Highlights
@@ -229,6 +229,8 @@ sudo target/release/zerun run -d --name web -p 18080:80 --net bridge --init \
 sudo target/release/zerun ps                          # running containers
 sudo target/release/zerun wait web                    # block until exit; prints the exit code
 sudo target/release/zerun logs --tail 20 web          # container console.log
+sudo target/release/zerun logs --since 10m web        # last ten minutes
+sudo target/release/zerun logs --until 2026-01-01T12:00:00Z web
 sudo target/release/zerun logs -t web                 # include capture timestamps
 sudo target/release/zerun attach web                  # stream live container output
 sudo target/release/zerun stats web                   # one-shot resource metrics
@@ -247,6 +249,11 @@ Detached containers keep no daemon: the per-container reaper is a tiny process t
 disappears when the container exits. If the host crashes (or the reaper is killed), the
 next `ps`/`rm` reconciles the stale record and reclaims host-side resources.
 `logs` hides capture-time timestamps by default; `-t/--timestamps` shows them.
+`--since`/`--until` accept RFC3339 times, UNIX seconds, or Go-style durations such as
+`10m` (relative to now) and select inclusive capture-time bounds. `--tail N` narrows the
+raw lines before applying the time window. Untimestamped legacy logs are displayed
+normally but cannot be selected by time. `--until` ends follow mode at that boundary;
+`--since` remains fixed while following.
 `stats` is a one-shot snapshot of cgroup v2 memory, CPU, PID, and block-I/O data.
 It reads live control files while a container runs and persists a final snapshot
 when it exits. Metrics are `n/a` when the cgroup was unavailable or the command
