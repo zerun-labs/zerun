@@ -71,17 +71,18 @@ pub fn save_images(
                 .find_record(&name, reference.tag.as_deref(), reference.digest.as_deref())?
                 .ok_or_else(|| crate::zerr!("No such image: {raw}"))?;
 
-            copy_manifest_tree(store, &layout, &record.manifest, &mut copied)?;
+            let root_digest = record.index.as_deref().unwrap_or(&record.manifest);
+            copy_manifest_tree(store, &layout, root_digest, &mut copied)?;
             let bytes = store
-                .read_blob(&record.manifest)?
-                .ok_or_else(|| crate::zerr!("manifest blob {} is missing", record.manifest))?;
+                .read_blob(root_digest)?
+                .ok_or_else(|| crate::zerr!("manifest blob {root_digest} is missing"))?;
             let mut annotations = HashMap::new();
             if let Some(tag) = &record.tag {
                 annotations.insert(REF_NAME_ANNOTATION.to_string(), format!("{name}:{tag}"));
             }
             descriptors.push(ArchiveDescriptor {
                 media_type: manifest_media_type(&bytes)?,
-                digest: record.manifest.clone(),
+                digest: root_digest.to_string(),
                 size: bytes.len() as u64,
                 annotations,
             });
@@ -270,7 +271,12 @@ pub fn load_archive(store: &ImageStore, input: &Path) -> ZResult<Vec<ImageRecord
             .annotations
             .get(REF_NAME_ANNOTATION)
             .map(String::as_str);
-        imported.extend(import_descriptor(store, &descriptor.digest, ref_name)?);
+        imported.extend(import_descriptor(
+            store,
+            &descriptor.digest,
+            ref_name,
+            None,
+        )?);
     }
     Ok(imported)
 }
@@ -282,10 +288,18 @@ fn import_descriptor(
     store: &ImageStore,
     digest: &str,
     ref_name: Option<&str>,
+    source_index: Option<&str>,
 ) -> ZResult<Vec<ImageRecord>> {
     let bytes = store_blob(store, digest)?;
     match manifest::classify(&bytes)? {
-        ImageDoc::Manifest(m) => Ok(vec![import_manifest(store, digest, &bytes, &m, ref_name)?]),
+        ImageDoc::Manifest(m) => Ok(vec![import_manifest(
+            store,
+            digest,
+            &bytes,
+            &m,
+            ref_name,
+            source_index,
+        )?]),
         ImageDoc::Index(index) => {
             let doc = ImageDoc::Index(index);
             let child = doc.select(&manifest::host_platform())?.ok_or_else(|| {
@@ -297,8 +311,10 @@ fn import_descriptor(
             })?;
             // A ref name written on the outer index applies to its platform
             // child; digest-only index children without a name are imported as
-            // digest-pinned records so they do not shadow each other.
-            import_descriptor(store, &child.digest, ref_name)
+            // digest-pinned records so they do not shadow each other. Keep the
+            // outer index digest so the complete multi-arch image can be
+            // exported and pushed unchanged.
+            import_descriptor(store, &child.digest, ref_name, Some(digest))
         }
     }
 }
@@ -309,6 +325,7 @@ fn import_manifest(
     bytes: &[u8],
     manifest: &manifest::Manifest,
     ref_name: Option<&str>,
+    source_index: Option<&str>,
 ) -> ZResult<ImageRecord> {
     for layer in &manifest.layers {
         if !store.has_blob(&layer.digest) {
@@ -345,12 +362,13 @@ fn import_manifest(
             )
         }
     };
-    store.add_image(
+    store.add_index_image(
         &name,
         tag.as_deref(),
         digest,
         &manifest.config.digest,
         size_bytes,
+        source_index,
     )?;
     store
         .find_record(&name, tag.as_deref(), Some(digest))?
@@ -453,6 +471,104 @@ mod tests {
 
         let _ = fs::remove_dir_all(&data_dir);
         let _ = fs::remove_dir_all(&source);
+    }
+
+    #[test]
+    fn multi_arch_archive_roundtrips_full_index() {
+        let data_dir = scratch("archive-multi-store");
+        let store = ImageStore::at(&data_dir).unwrap();
+        let amd_root = scratch("archive-multi-amd64");
+        let arm_root = scratch("archive-multi-arm64");
+        fs::create_dir_all(amd_root.join("bin")).unwrap();
+        fs::create_dir_all(arm_root.join("bin")).unwrap();
+        fs::write(amd_root.join("bin/marker"), b"amd64").unwrap();
+        fs::write(arm_root.join("bin/marker"), b"arm64").unwrap();
+        let amd = commit_image(
+            &store,
+            &amd_root,
+            "example/multi-amd:v1",
+            Default::default(),
+        )
+        .unwrap();
+        let arm = commit_image(
+            &store,
+            &arm_root,
+            "example/multi-arm:v1",
+            Default::default(),
+        )
+        .unwrap();
+
+        let child = |record: &ImageRecord, architecture: &str| {
+            let bytes = store.read_blob(&record.manifest).unwrap().unwrap();
+            serde_json::json!({
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "digest": record.manifest,
+                "size": bytes.len(),
+                "platform": {"os": "linux", "architecture": architecture},
+            })
+        };
+        let index_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+            "manifests": [
+                child(&amd, "amd64"),
+                child(&arm, "arm64"),
+            ],
+        }))
+        .unwrap();
+        let index_digest = format!("sha256:{}", crate::image::store::sha256_hex(&index_bytes));
+        store.write_blob(&index_digest, &index_bytes).unwrap();
+        store
+            .add_index_image(
+                "docker.io/example/multi",
+                Some("v1"),
+                &arm.manifest,
+                &arm.config,
+                arm.size_bytes,
+                Some(&index_digest),
+            )
+            .unwrap();
+
+        let archive_path = data_dir.join("multi.tar");
+        let exported = save_images(
+            &store,
+            &["docker.io/example/multi:v1".to_string()],
+            &archive_path,
+        )
+        .unwrap();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].index.as_deref(), Some(index_digest.as_str()));
+
+        // Remove both tag records, then all unreferenced blobs, so the load
+        // has to restore the selected rootfs and full index from the archive.
+        store
+            .remove_record("docker.io/example/multi", Some("v1"), None)
+            .unwrap();
+        store
+            .remove_record("docker.io/example/multi-amd", Some("v1"), None)
+            .unwrap();
+        store
+            .remove_record("docker.io/example/multi-arm", Some("v1"), None)
+            .unwrap();
+        store.gc().unwrap();
+        assert!(!store.has_blob(&index_digest));
+
+        let imported = load_archive(&store, &archive_path).unwrap();
+        assert_eq!(imported.len(), 1);
+        // Loading selects the host platform child while preserving the full
+        // multi-architecture index for push/save.
+        assert_eq!(imported[0].manifest, amd.manifest);
+        assert_eq!(imported[0].index.as_deref(), Some(index_digest.as_str()));
+        assert!(store.has_blob(&amd.manifest));
+        assert!(store.has_blob(&arm.manifest));
+        assert_eq!(
+            fs::read(store.rootfs_path(&amd.config).unwrap().join("bin/marker")).unwrap(),
+            b"amd64"
+        );
+
+        let _ = fs::remove_dir_all(&data_dir);
+        let _ = fs::remove_dir_all(&amd_root);
+        let _ = fs::remove_dir_all(&arm_root);
     }
 
     #[test]

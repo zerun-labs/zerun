@@ -26,8 +26,13 @@ pub struct ImageRecord {
     pub name: String,
     /// Tag; `None` for digest-only pulls (`docker.io/library/alpine@sha256:...`).
     pub tag: Option<String>,
-    /// Single-architecture manifest digest (`sha256:<hex>`).
+    /// Selected host-platform manifest digest (`sha256:<hex>`). For records
+    /// imported from a multi-architecture archive this is the child used to
+    /// run the image locally; `index` preserves the full multi-arch root.
     pub manifest: String,
+    /// Optional multi-architecture index digest (`sha256:<hex>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
     /// Image config digest (`sha256:<hex>`); also keys the materialized rootfs.
     pub config: String,
     /// Sum of the compressed layer sizes (for `ze images`).
@@ -230,6 +235,21 @@ impl ImageStore {
         config_digest: &str,
         size_bytes: u64,
     ) -> ZResult<()> {
+        self.add_index_image(name, tag, manifest_digest, config_digest, size_bytes, None)
+    }
+
+    /// Record an image and optionally preserve the multi-architecture index it
+    /// was selected from. This keeps `run` semantics unchanged (the selected
+    /// manifest remains in `manifest`) while making the complete index pushable.
+    pub fn add_index_image(
+        &self,
+        name: &str,
+        tag: Option<&str>,
+        manifest_digest: &str,
+        config_digest: &str,
+        size_bytes: u64,
+        index_digest: Option<&str>,
+    ) -> ZResult<()> {
         let mut records = self.records()?;
         // Replace a previous entry for the same name+tag (re-pull updates it).
         records.retain(|r| !(r.name == name && r.tag.as_deref() == tag));
@@ -237,6 +257,7 @@ impl ImageStore {
             name: name.to_string(),
             tag: tag.map(str::to_string),
             manifest: manifest_digest.to_string(),
+            index: index_digest.map(str::to_string),
             config: config_digest.to_string(),
             size_bytes,
             created_at: SystemTime::now()
@@ -257,7 +278,10 @@ impl ImageStore {
     ) -> ZResult<Option<ImageRecord>> {
         let records = self.records()?;
         if let Some(d) = digest {
-            if let Some(r) = records.iter().find(|r| r.manifest == d) {
+            if let Some(r) = records
+                .iter()
+                .find(|r| r.manifest == d || r.index.as_deref() == Some(d))
+            {
                 return Ok(Some(r.clone()));
             }
             return Ok(None);
@@ -293,12 +317,13 @@ impl ImageStore {
                 "tag target must be REPOSITORY[:TAG], not a digest reference"
             ));
         };
-        self.add_image(
+        self.add_index_image(
             target_name,
             Some(tag),
             &source.manifest,
             &source.config,
             source.size_bytes,
+            source.index.as_deref(),
         )?;
         // `add_image` creates a new timestamped record; re-read it so callers
         // observe exactly what is in the index after replacement.
@@ -315,7 +340,9 @@ impl ImageStore {
     ) -> ZResult<Option<ImageRecord>> {
         let mut records = self.records()?;
         let idx = if let Some(d) = digest {
-            records.iter().position(|r| r.manifest == d)
+            records
+                .iter()
+                .position(|r| r.manifest == d || r.index.as_deref() == Some(d))
         } else {
             let tag = tag.unwrap_or("latest");
             records
@@ -338,18 +365,20 @@ impl ImageStore {
         let mut keep_rootfs: BTreeSet<String> = BTreeSet::new(); // "<hex>"
         for rec in &records {
             keep_blobs.insert(rec.manifest.clone());
+            if let Some(index) = &rec.index {
+                keep_blobs.insert(index.clone());
+            }
             keep_blobs.insert(rec.config.clone());
             if let Ok(hex) = digest_hex(&rec.config) {
                 keep_rootfs.insert(hex);
             }
-            // Layers are reachable through the manifest.
-            if let Ok(Some(bytes)) = self.read_blob(&rec.manifest) {
-                if let Ok(manifest::ImageDoc::Manifest(m)) = manifest::classify(&bytes) {
-                    for layer in &m.layers {
-                        keep_blobs.insert(layer.digest.clone());
-                    }
-                }
+            // Manifests, configs, and layers are reachable through the record.
+            // An index is traversed recursively so every platform child and its
+            // blobs survive garbage collection.
+            if let Some(index) = &rec.index {
+                self.keep_manifest_tree(index, &mut keep_blobs);
             }
+            self.keep_manifest_tree(&rec.manifest, &mut keep_blobs);
         }
 
         // Blob sweep.
@@ -382,6 +411,33 @@ impl ImageStore {
             }
         }
         Ok(())
+    }
+
+    /// Mark all blobs reachable from a manifest/index as retained. Invalid or
+    /// missing subtrees are ignored here so `gc` remains best-effort for broken
+    /// records and can still clean everything else.
+    fn keep_manifest_tree(&self, digest: &str, keep_blobs: &mut BTreeSet<String>) {
+        if !keep_blobs.insert(digest.to_string()) {
+            return;
+        }
+        let bytes = self.read_blob(digest).ok().flatten();
+        let Some(bytes) = bytes else {
+            return;
+        };
+        match manifest::classify(&bytes) {
+            Ok(manifest::ImageDoc::Manifest(m)) => {
+                keep_blobs.insert(m.config.digest.clone());
+                for layer in &m.layers {
+                    keep_blobs.insert(layer.digest.clone());
+                }
+            }
+            Ok(manifest::ImageDoc::Index(index)) => {
+                for child in &index.manifests {
+                    self.keep_manifest_tree(&child.digest, keep_blobs);
+                }
+            }
+            Err(_) => {}
+        }
     }
 
     fn tmp_path(&self, what: &str) -> PathBuf {
