@@ -251,7 +251,21 @@ fn worker(
         *first = workload::resolve_argv0(first, &pairs);
     }
 
-    if let Err(e) = crate::security::harden(crate::seccomp::SeccompMode::Default) {
+    // Older records predate per-container capability state and safely fall
+    // back to the default set. Exact recorded sets include the empty set, so
+    // `exec` cannot silently regain capabilities that `run --cap-drop ALL`
+    // removed.
+    let capabilities = match state.capabilities.as_deref() {
+        Some(names) => match crate::security::CapabilitySet::from_names(names) {
+            Ok(capabilities) => capabilities,
+            Err(e) => {
+                eprintln!("zerun exec: {e}");
+                return 1;
+            }
+        },
+        None => crate::security::CapabilitySet::default(),
+    };
+    if let Err(e) = crate::security::harden(crate::seccomp::SeccompMode::Default, &capabilities) {
         eprintln!("zerun exec: {e}");
         return 1;
     }

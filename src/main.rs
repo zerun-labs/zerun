@@ -46,7 +46,7 @@ use namespace::{NetMode, RunSpec};
 use psfilter::PsFilter;
 use seccomp::SeccompMode;
 use state::ContainerState;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -141,6 +141,10 @@ struct RunArgs {
     net_specified: bool,
     use_init: bool,
     seccomp: SeccompMode,
+    /// Canonical capability names added to the secure default set.
+    cap_add: BTreeSet<String>,
+    /// Canonical capability names removed from the secure default set.
+    cap_drop: BTreeSet<String>,
     no_overlay: bool,
     tmpfs_upper: bool,
     /// `--read-only`: remount the container root read-only before exec.
@@ -301,6 +305,14 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                     other => return Err(format!("invalid --seccomp value '{other}'")),
                 };
             }
+            "--cap-add" => {
+                let v = next_value(args, &mut i, "--cap-add")?;
+                a.cap_add.extend(security::parse_capability_list(&v)?);
+            }
+            "--cap-drop" => {
+                let v = next_value(args, &mut i, "--cap-drop")?;
+                a.cap_drop.extend(security::parse_capability_list(&v)?);
+            }
             "--no-overlay" => {
                 a.no_overlay = true;
                 i += 1;
@@ -419,6 +431,18 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             other if other.starts_with("--pull=") => {
                 a.pull = PullPolicy::parse(&other["--pull=".len()..])?;
+                i += 1;
+            }
+            other if other.starts_with("--cap-add=") => {
+                a.cap_add.extend(security::parse_capability_list(
+                    &other["--cap-add=".len()..],
+                )?);
+                i += 1;
+            }
+            other if other.starts_with("--cap-drop=") => {
+                a.cap_drop.extend(security::parse_capability_list(
+                    &other["--cap-drop=".len()..],
+                )?);
                 i += 1;
             }
             other if other.starts_with("--") && other.len() > 2 => {
@@ -623,6 +647,13 @@ fn cmd_run(args: &[String]) -> i32 {
             "zerun: warning: log rotation options only apply to detached containers; ignoring"
         );
     }
+    let capabilities = match security::CapabilitySet::resolve(&a.cap_add, &a.cap_drop) {
+        Ok(capabilities) => capabilities,
+        Err(e) => {
+            eprintln!("zerun run: {e}");
+            return 2;
+        }
+    };
 
     let store = match Store::detect() {
         Ok(s) => s,
@@ -778,6 +809,7 @@ fn cmd_run(args: &[String]) -> i32 {
             .concat(),
         },
         seccomp: a.seccomp,
+        capabilities,
         tty: a.tty,
         interactive: a.interactive,
         overlay,
@@ -917,6 +949,7 @@ fn run_detached(
         env,
         cwd: spec.cwd.clone(),
         user: spec.user.clone(),
+        capabilities: Some(spec.capabilities.names()),
         labels: info.labels,
         log: log_path.display().to_string(),
         log_max_size: Some(info.log.max_size),
@@ -1095,6 +1128,12 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     }
     if matches!(a.seccomp, SeccompMode::Unconfined) {
         args.extend(["--seccomp".to_string(), "unconfined".to_string()]);
+    }
+    for cap in &a.cap_add {
+        args.extend(["--cap-add".to_string(), cap.clone()]);
+    }
+    for cap in &a.cap_drop {
+        args.extend(["--cap-drop".to_string(), cap.clone()]);
     }
     if a.no_overlay {
         args.push("--no-overlay".to_string());
@@ -5113,6 +5152,8 @@ RUN OPTIONS:\n  \
   --dns IP            container DNS server (repeatable; bridge mode; defaults to the host's)\n  \
   --init              run the built-in mini-init (reap orphans + forward signals)\n  \
   --seccomp default|unconfined\n  \
+  --cap-add CAP|ALL    add capability to the default set (repeatable/comma-separated)\n  \
+  --cap-drop CAP|ALL   remove capability from the default set (repeatable; before adds)\n  \
   --platform os/arch[/variant]  pull/run a specific platform\n  \
   --entrypoint CMD    override the image ENTRYPOINT (empty resets it)\n  \
   -w, --workdir DIR   override the image WorkingDir\n  \
@@ -5357,6 +5398,47 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert!(parse_run_args(&args).is_err());
+    }
+
+    #[test]
+    fn parses_and_captures_capability_controls() {
+        let args: Vec<_> = [
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "cap_net_raw,SYS_ADMIN",
+            "--cap-add=NET_BIND_SERVICE",
+            "alpine",
+            "true",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_run_args(&args).expect("valid capability controls");
+        assert_eq!(
+            a.cap_add.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["CAP_NET_BIND_SERVICE", "CAP_NET_RAW", "CAP_SYS_ADMIN"]
+        );
+        assert_eq!(
+            a.cap_drop.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["ALL"]
+        );
+
+        let launch = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+        for cap in ["CAP_NET_RAW", "CAP_SYS_ADMIN", "CAP_NET_BIND_SERVICE"] {
+            assert!(launch.windows(2).any(|pair| pair == ["--cap-add", cap]));
+        }
+        assert!(launch.windows(2).any(|pair| pair == ["--cap-drop", "ALL"]));
+
+        let args: Vec<_> = ["--cap-add", "CAP_NOT_REAL", "alpine"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(parse_run_args(&args)
+            .err()
+            .expect("invalid capability")
+            .contains("unknown capability"));
+        assert!(parse_run_args(&["--cap-add=".to_string(), "alpine".to_string()]).is_err());
     }
 
     #[test]

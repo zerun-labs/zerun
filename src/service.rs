@@ -129,6 +129,14 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--seccomp".into());
         run_args.push("unconfined".into());
     }
+    for cap in &a.cap_add {
+        run_args.push("--cap-add".into());
+        run_args.push(cap.clone());
+    }
+    for cap in &a.cap_drop {
+        run_args.push("--cap-drop".into());
+        run_args.push(cap.clone());
+    }
     if a.no_overlay {
         run_args.push("--no-overlay".into());
     }
@@ -449,6 +457,22 @@ mod tests {
         let unit = render(&PathBuf::from("/usr/local/bin/zerun"), &a, true).unwrap();
         assert!(unit.contains("--cpuset-cpus 0-1"));
         assert!(unit.contains("--cpuset-mems 0"));
+    }
+
+    #[test]
+    fn renders_capability_controls() {
+        let a = args(&[
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "NET_RAW,SYS_ADMIN",
+            "alpine",
+            "true",
+        ]);
+        let unit = render(Path::new("/usr/local/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains("--cap-drop ALL"));
+        assert!(unit.contains("--cap-add CAP_NET_RAW"));
+        assert!(unit.contains("--cap-add CAP_SYS_ADMIN"));
     }
 
     #[test]

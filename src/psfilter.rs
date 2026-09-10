@@ -129,6 +129,7 @@ mod tests {
             env: vec![],
             cwd: None,
             user: None,
+            capabilities: None,
             labels: BTreeMap::new(),
             log: String::new(),
             log_max_size: None,

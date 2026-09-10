@@ -51,6 +51,8 @@ pub struct RunSpec {
     pub use_init: bool,
     pub limits: ResourceLimits,
     pub seccomp: SeccompMode,
+    /// Exact capability set left for the workload after security hardening.
+    pub capabilities: security::CapabilitySet,
     /// Allocate a PTY for foreground container stdio (`run -t`).
     pub tty: bool,
     /// Forward host stdin to the container (`run -i`).
@@ -482,7 +484,7 @@ fn child_stage(
     }
 
     // 3. Security hardening: no_new_privs -> capability drop -> seccomp profile.
-    security::harden(spec.seccomp)?;
+    security::harden(spec.seccomp, &spec.capabilities)?;
 
     // 3a. Drop to the requested container user while CAP_SETUID/SETGID are still
     // effective (the capability set was trimmed but these two are retained).

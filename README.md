@@ -49,9 +49,10 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   release profile optimized for size (`opt-level=z`, LTO, strip, panic=abort).
 - **No external command dependencies**: namespaces, mounts, cgroups, and netlink are driven
   directly (rtnetlink) — no shelling out to `ip`, `nft`, or a daemon.
-- **Secure defaults**: `PR_SET_NO_NEW_PRIVS`, capability bounding-set cleared, masked
-  `/proc`/`/sys` paths, and a deny-by-default seccomp allowlist (opt out with
-  `--seccomp unconfined`).
+- **Secure defaults**: `PR_SET_NO_NEW_PRIVS`, a Docker-compatible capability set with
+  `CAP_NET_RAW`/`CAP_SYS_ADMIN` removed, masked `/proc`/`/sys` paths, and a
+  deny-by-default seccomp allowlist (capabilities can be tuned with
+  `--cap-add`/`--cap-drop`; seccomp can be opted out with `--seccomp unconfined`).
 - **Docker-compatible top 20% CLI**: `run / ps / wait / stop / restart / rm / prune / logs / exec / inspect /
   port / rename / top / diff / cp / export / import / events / update / attach / kill / pull / push / tag / save / load /
   login / logout / images / rmi / commit / generate-service / system df / doctor`.
@@ -169,6 +170,8 @@ Run options (current subset):
                      bracketed IPv6 bind addresses (for example 127.0.0.1 or [::1])
 --init               run built-in mini-init (reap orphans, forward signals)
 --seccomp default|unconfined   seccomp policy (default: deny-by-default allowlist)
+--cap-add CAP|ALL              add capabilities to the default set (repeatable/comma-separated)
+--cap-drop CAP|ALL             remove capabilities from the default set (applied before adds)
 --platform os/arch[/variant]   pull/run a specific platform
 --entrypoint CMD               override the image ENTRYPOINT (empty string resets it)
 -w, --workdir DIR              override the image WorkingDir

@@ -179,6 +179,10 @@ pub struct ContainerState {
     /// exec; `zerun exec` re-applies it. None = root.
     #[serde(default)]
     pub user: Option<String>,
+    /// Exact capability set left for the workload. None = legacy record using
+    /// the secure default set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
     /// Absolute path to this container's console.log.
     pub log: String,
     /// Rotation threshold for the console log. None = legacy/unbounded record.
@@ -488,6 +492,7 @@ mod tests {
             env: vec![],
             cwd: None,
             user: None,
+            capabilities: Some(vec!["CAP_NET_RAW".to_string()]),
             log: format!("{}/x/console.log", std::env::temp_dir().display()),
             log_max_size: None,
             log_max_file: None,
@@ -515,6 +520,10 @@ mod tests {
         assert_eq!(loaded.id, a.id);
         assert_eq!(loaded.name.as_deref(), Some("web"));
         assert_eq!(loaded.status, Status::Exited);
+        assert_eq!(
+            loaded.capabilities.as_deref(),
+            Some(&["CAP_NET_RAW".to_string()][..])
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
