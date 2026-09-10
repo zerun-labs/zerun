@@ -31,7 +31,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
 - **M4 — kernel networking (done)**: `--net bridge` (rootful) creates the `zerun0` bridge
   (10.88.0.1/24) and a per-container veth pair with container-side `eth0` and a default
   route (verified: host ↔ container reachable). Per-container egress NAT via nf_tables
-  (pure netlink), `-p HOST:CONTAINER[/tcp|/udp]` publishing through a built-in userland
+  (pure netlink), `-p [ADDR:]HOST[:CONTAINER][/tcp|/udp]` publishing through a built-in userland
   proxy (Docker's docker-proxy in-binary), and `--dns` / host resolv.conf inheritance.
 - **M5 — detached lifecycle (done)**: `run -d` forks a tiny per-container reaper that
   redirects stdio to `console.log` and persists state to disk; `ps [-a]`, `stop`, `restart`,
@@ -151,8 +151,9 @@ Run options (current subset):
                      host = share host net
 -i, --interactive   keep stdin attached (foreground runs; without it stdin is /dev/null)
 -t, --tty           allocate a PTY (foreground runs; often combined as -it)
--p, --publish HOST:CONTAINER[/udp]
-                     publish a TCP (default) or UDP port on the host
+-p, --publish [ADDR:]HOST[:CONTAINER][/proto]
+                     publish a TCP (default) or UDP port; ADDR supports IPv4 and
+                     bracketed IPv6 bind addresses (for example 127.0.0.1 or [::1])
 --init               run built-in mini-init (reap orphans, forward signals)
 --seccomp default|unconfined   seccomp policy (default: deny-by-default allowlist)
 --platform os/arch[/variant]   pull/run a specific platform
@@ -248,6 +249,8 @@ Detached containers keep no daemon: the per-container reaper is a tiny process t
 Detached containers keep no daemon: the per-container reaper is a tiny process that
 disappears when the container exits. If the host crashes (or the reaper is killed), the
 next `ps`/`rm` reconciles the stale record and reclaims host-side resources.
+`-p` can bind a specific host address (`127.0.0.1:18080:80` or `[::1]:18080:80`);
+`zerun port` and `ps` display the selected bind address.
 `logs` hides capture-time timestamps by default; `-t/--timestamps` shows them.
 `--since`/`--until` accept RFC3339 times, UNIX seconds, or Go-style durations such as
 `10m` (relative to now) and select inclusive capture-time bounds. `--tail N` narrows the

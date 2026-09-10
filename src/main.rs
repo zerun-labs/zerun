@@ -356,10 +356,12 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
 }
 
 /// Parse `-p`/`--publish` values. Supported forms:
-///   HOST:CONTAINER[/tcp|/udp]
-///   CONTAINER[/tcp|/udp]
-/// Bind addresses (`127.0.0.1:8080:80`) are rejected with a clear error.
+///   HOST[:CONTAINER][/tcp|/udp]
+///   ADDRESS:HOST[:CONTAINER][/tcp|/udp]
+/// IPv6 addresses are bracketed (`[::1]:8080:80`).
 fn parse_publish(v: &str) -> Result<network::PublishedPort, String> {
+    use std::net::IpAddr;
+
     fn parse_port(s: &str) -> Result<u16, String> {
         s.parse::<u16>()
             .map_err(|_| format!("invalid port '{s}' (expected 1-65535)"))
@@ -371,6 +373,7 @@ fn parse_publish(v: &str) -> Result<network::PublishedPort, String> {
                 }
             })
     }
+
     let (v, protocol) = if let Some(v) = v.strip_suffix("/udp") {
         (v, network::PortProtocol::Udp)
     } else if let Some(v) = v.strip_suffix("/tcp") {
@@ -381,25 +384,57 @@ fn parse_publish(v: &str) -> Result<network::PublishedPort, String> {
     if v.is_empty() {
         return Err(format!("-p: invalid port publish '{v}'"));
     }
-    if let Some((host, container)) = v.split_once(':') {
-        if container.contains(':') {
-            return Err(format!(
-                "-p: binding to a host address ('{v}') is not supported yet; use HOST:CONTAINER"
-            ));
-        }
-        Ok(network::PublishedPort {
-            host: parse_port(host)?,
-            container: parse_port(container)?,
-            protocol,
-        })
+
+    let (host_ip, rest) = if let Some(rest) = v.strip_prefix('[') {
+        let close = rest
+            .find(']')
+            .ok_or_else(|| format!("-p: missing ']' in IPv6 publish '{v}'"))?;
+        let ip: IpAddr = rest[..close]
+            .parse()
+            .map_err(|_| format!("-p: invalid host address in '{v}'"))?;
+        let rest = rest[close + 1..]
+            .strip_prefix(':')
+            .ok_or_else(|| format!("-p: invalid port publish '{v}'"))?;
+        (ip, rest)
     } else {
-        let p = parse_port(v)?;
-        Ok(network::PublishedPort {
-            host: p,
-            container: p,
-            protocol,
-        })
-    }
+        match v.matches(':').count() {
+            0 => (std::net::Ipv4Addr::UNSPECIFIED.into(), v),
+            1 => {
+                let (first, second) = v.split_once(':').expect("one colon was counted");
+                match first.parse::<IpAddr>() {
+                    Ok(ip) => (ip, second),
+                    Err(_) => (std::net::Ipv4Addr::UNSPECIFIED.into(), v),
+                }
+            }
+            2 => {
+                let ip: IpAddr = v
+                    .split(':')
+                    .next()
+                    .expect("two colons were counted")
+                    .parse()
+                    .map_err(|_| format!("-p: invalid host address in '{v}'"))?;
+                (ip, &v[v.find(':').expect("two colons were counted") + 1..])
+            }
+            _ => return Err(
+                "-p: bracket IPv6 addresses ('[::1]:HOST:CONTAINER'); use ADDRESS:HOST:CONTAINER"
+                    .to_string(),
+            ),
+        }
+    };
+
+    let (host, container) = match rest.split_once(':') {
+        Some((host, container)) => (parse_port(host)?, parse_port(container)?),
+        None => {
+            let host = parse_port(rest)?;
+            (host, host)
+        }
+    };
+    Ok(network::PublishedPort {
+        host_ip,
+        host,
+        container,
+        protocol,
+    })
 }
 
 fn next_value(args: &[String], i: &mut usize, opt: &str) -> Result<String, String> {
@@ -724,6 +759,11 @@ fn run_detached(
                     .collect(),
             )
         },
+        port_ips: if spec.ports.is_empty() {
+            None
+        } else {
+            Some(spec.ports.iter().map(|p| p.host_ip.to_string()).collect())
+        },
         ip: None,
         cmd: spec.argv.clone(),
         env,
@@ -907,9 +947,15 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
         args.extend(["--env".to_string(), v.clone()]);
     }
     for p in &a.ports {
+        let base = format!(
+            "{}:{}:{}",
+            network::host_ip_label(p.host_ip),
+            p.host,
+            p.container
+        );
         let publish = match p.protocol {
-            network::PortProtocol::Tcp => format!("{}:{}", p.host, p.container),
-            network::PortProtocol::Udp => format!("{}:{}/udp", p.host, p.container),
+            network::PortProtocol::Tcp => base,
+            network::PortProtocol::Udp => format!("{base}/udp"),
         };
         args.extend(["--publish".to_string(), publish]);
     }
@@ -2127,7 +2173,11 @@ fn ps_row(st: &ContainerState) -> Vec<String> {
         truncate(&one_line(&st.cmd), 30),
         format!("{} ago", elapsed_str(&st.created)),
         ps_status(st),
-        ports_label(&st.ports, st.port_protocols.as_deref()),
+        ports_label(
+            &st.ports,
+            st.port_ips.as_deref(),
+            st.port_protocols.as_deref(),
+        ),
         st.name.clone().unwrap_or_default(),
     ]
 }
@@ -2149,15 +2199,23 @@ fn ps_status(st: &ContainerState) -> String {
     }
 }
 
-fn ports_label(ports: &[(u16, u16)], protocols: Option<&[String]>) -> String {
+fn ports_label(
+    ports: &[(u16, u16)],
+    ips: Option<&[String]>,
+    protocols: Option<&[String]>,
+) -> String {
     ports
         .iter()
         .enumerate()
         .map(|(i, (h, c))| {
+            let ip = ips
+                .and_then(|values| values.get(i))
+                .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+                .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into());
             let protocol = protocols
                 .and_then(|values| values.get(i).map(String::as_str))
                 .unwrap_or("tcp");
-            format!("0.0.0.0:{h}->{c}/{protocol}")
+            format!("{}:{h}->{c}/{protocol}", network::host_ip_label(ip))
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -3103,7 +3161,16 @@ fn cmd_port(args: &[String]) -> i32 {
             .as_deref()
             .and_then(|v| v.get(i).map(String::as_str))
             .unwrap_or("tcp");
-        println!("{container}/{protocol} -> 0.0.0.0:{host}");
+        let ip = st
+            .port_ips
+            .as_deref()
+            .and_then(|values| values.get(i))
+            .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+            .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into());
+        println!(
+            "{container}/{protocol} -> {}:{host}",
+            network::host_ip_label(ip)
+        );
     }
     0
 }
@@ -4272,7 +4339,8 @@ RUN OPTIONS:\n  \
                       rootful default; rootless default is none)\n  \
   -i, --interactive      keep stdin attached (foreground runs)\n  \
   -t, --tty              allocate a PTY (foreground runs; combine with -i)\n  \
-  -p, --publish HOST:CONTAINER[/udp]  publish a TCP/UDP port (requires --net bridge)\n  \
+  -p, --publish [ADDR:]HOST[:CONTAINER][/proto]\n  \
+                                      publish a TCP/UDP port (requires --net bridge)\n  \
   -v, --volume HOST:CONTAINER[:ro]  bind-mount a host file or directory\n  \
   --dns IP            container DNS server (repeatable; bridge mode; defaults to the host's)\n  \
   --init              run the built-in mini-init (reap orphans + forward signals)\n  \
@@ -4379,6 +4447,7 @@ mod tests {
         a.net = NetMode::Bridge;
         a.memory = Some("64M".to_string());
         a.ports.push(network::PublishedPort {
+            host_ip: std::net::Ipv4Addr::UNSPECIFIED.into(),
             host: 8080,
             container: 80,
             protocol: network::PortProtocol::Tcp,
@@ -4395,7 +4464,7 @@ mod tests {
                 "--net",
                 "bridge",
                 "--publish",
-                "8080:80",
+                "0.0.0.0:8080:80",
                 "alpine",
                 "--",
                 "sleep",
@@ -4499,11 +4568,13 @@ mod tests {
             a.ports,
             vec![
                 network::PublishedPort {
+                    host_ip: std::net::Ipv4Addr::UNSPECIFIED.into(),
                     host: 53,
                     container: 53,
                     protocol: network::PortProtocol::Udp,
                 },
                 network::PublishedPort {
+                    host_ip: std::net::Ipv4Addr::UNSPECIFIED.into(),
                     host: 8080,
                     container: 80,
                     protocol: network::PortProtocol::Tcp,
@@ -4511,18 +4582,49 @@ mod tests {
             ]
         );
         assert!(parse_publish("/udp").is_err());
-        assert!(parse_publish("127.0.0.1:8080:80").is_err());
     }
 
     #[test]
-    fn port_labels_include_transport_and_default_to_tcp() {
-        let ports = [(53, 53), (8080, 80)];
+    fn parses_bound_publish_addresses() {
+        let tcp = parse_publish("127.0.0.1:8080:80").unwrap();
+        assert_eq!(tcp.host_ip, std::net::IpAddr::from([127, 0, 0, 1]));
+        assert_eq!(tcp.host, 8080);
+        assert_eq!(tcp.container, 80);
+
+        let short_tcp = parse_publish("127.0.0.1:8080").unwrap();
+        assert_eq!(short_tcp.host, 8080);
+        assert_eq!(short_tcp.container, 8080);
+
+        let udp = parse_publish("[::1]:5353:53/udp").unwrap();
         assert_eq!(
-            ports_label(&ports, Some(&["udp".to_string(), "tcp".to_string()])),
-            "0.0.0.0:53->53/udp, 0.0.0.0:8080->80/tcp"
+            udp.host_ip,
+            std::net::IpAddr::from([0u16, 0, 0, 0, 0, 0, 0, 1])
+        );
+        assert_eq!(udp.host, 5353);
+        assert_eq!(udp.container, 53);
+        assert_eq!(udp.protocol, network::PortProtocol::Udp);
+
+        assert!(parse_publish("not-an-address:8080:80").is_err());
+        assert!(parse_publish("::1:8080:80").is_err());
+    }
+
+    #[test]
+    fn port_labels_include_address_transport_and_default_to_tcp() {
+        let ports = [(53, 53), (8080, 80)];
+        let ips = Some(vec![
+            "127.0.0.1".to_string(),
+            std::net::Ipv6Addr::LOCALHOST.to_string(),
+        ]);
+        assert_eq!(
+            ports_label(
+                &ports,
+                ips.as_deref(),
+                Some(&["udp".to_string(), "tcp".to_string()])
+            ),
+            "127.0.0.1:53->53/udp, [::1]:8080->80/tcp"
         );
         assert_eq!(
-            ports_label(&ports, None),
+            ports_label(&ports, None, None),
             "0.0.0.0:53->53/tcp, 0.0.0.0:8080->80/tcp"
         );
     }

@@ -37,7 +37,7 @@ use crate::error::ZResult;
 use crate::netlink::Netlink;
 use crate::nfnetlink::{NatConfig, Nftables};
 use std::collections::{BTreeMap, HashMap};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::thread;
@@ -62,6 +62,8 @@ impl PortProtocol {
 /// One port publish: host port -> container port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublishedPort {
+    /// Address to bind on the host; unspecified means every IPv4 interface.
+    pub host_ip: IpAddr,
     pub host: u16,
     pub container: u16,
     pub protocol: PortProtocol,
@@ -107,35 +109,37 @@ enum ProxyListener {
 impl PortProxy {
     /// Bind one listener/socket and spawn its receive loop.
     fn bind(
+        host_ip: IpAddr,
         host: u16,
         container_ip: Ipv4Addr,
         container: u16,
         protocol: PortProtocol,
     ) -> ZResult<Self> {
+        let host_label = host_ip_label(host_ip);
         match protocol {
             PortProtocol::Tcp => {
-                let listener = TcpListener::bind(("0.0.0.0", host)).map_err(|e| {
+                let listener = TcpListener::bind((host_ip, host)).map_err(|e| {
                     crate::zerr!(
-                        "cannot publish 0.0.0.0:{host} -> {container_ip}:{container}/tcp: {e}"
+                        "cannot publish {host_label}:{host} -> {container_ip}:{container}/tcp: {e}"
                     )
                 })?;
                 let thread_listener = listener
                     .try_clone()
-                    .map_err(|e| crate::zerr!("clone listener for 0.0.0.0:{host}: {e}"))?;
+                    .map_err(|e| crate::zerr!("clone listener for {host_label}:{host}: {e}"))?;
                 thread::spawn(move || accept_loop(thread_listener, container_ip, container));
                 Ok(PortProxy {
                     _listener: ProxyListener::Tcp(listener),
                 })
             }
             PortProtocol::Udp => {
-                let listener = UdpSocket::bind(("0.0.0.0", host)).map_err(|e| {
+                let listener = UdpSocket::bind((host_ip, host)).map_err(|e| {
                     crate::zerr!(
-                        "cannot publish 0.0.0.0:{host} -> {container_ip}:{container}/udp: {e}"
+                        "cannot publish {host_label}:{host} -> {container_ip}:{container}/udp: {e}"
                     )
                 })?;
                 let thread_listener = listener
                     .try_clone()
-                    .map_err(|e| crate::zerr!("clone UDP socket for 0.0.0.0:{host}: {e}"))?;
+                    .map_err(|e| crate::zerr!("clone UDP socket for {host_label}:{host}: {e}"))?;
                 thread::spawn(move || udp_loop(thread_listener, container_ip, container));
                 Ok(PortProxy {
                     _listener: ProxyListener::Udp(listener),
@@ -153,8 +157,16 @@ pub fn bind_port_proxies(
 ) -> ZResult<Vec<PortProxy>> {
     published
         .iter()
-        .map(|p| PortProxy::bind(p.host, container_ip, p.container, p.protocol))
+        .map(|p| PortProxy::bind(p.host_ip, p.host, container_ip, p.container, p.protocol))
         .collect()
+}
+
+/// Render a host address for CLI/error output (IPv6 needs brackets).
+pub fn host_ip_label(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V6(ip) => format!("[{ip}]"),
+        IpAddr::V4(ip) => ip.to_string(),
+    }
 }
 
 /// Accept connections until the listener is dropped, then forward each one.

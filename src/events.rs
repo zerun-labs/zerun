@@ -259,6 +259,7 @@ mod tests {
             net: "none".to_string(),
             ports: vec![],
             port_protocols: None,
+            port_ips: None,
             ip: None,
             cmd: vec![],
             env: vec![],
