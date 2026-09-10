@@ -59,6 +59,10 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--memory-reservation".into());
         run_args.push(v.clone());
     }
+    if let Some(v) = a.memory_swap {
+        run_args.push("--memory-swap".into());
+        run_args.push(if v < 0 { "-1".into() } else { v.to_string() });
+    }
     if let Some(v) = a.cpus {
         run_args.push("--cpus".into());
         run_args.push(v.to_string());
@@ -451,6 +455,8 @@ mod tests {
             "64M",
             "--memory-reservation",
             "48M",
+            "--memory-swap",
+            "268435456",
             "--oom-group",
             "--name",
             "web",
@@ -460,6 +466,7 @@ mod tests {
         let unit = render(Path::new("/bin/zerun"), &a, true).unwrap();
         assert!(unit.contains(" --memory 64M "));
         assert!(unit.contains(" --memory-reservation 48M "));
+        assert!(unit.contains(" --memory-swap 268435456 "));
         assert!(unit.contains(" --oom-group "));
     }
 

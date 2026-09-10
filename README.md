@@ -135,6 +135,7 @@ Run options (current subset):
 -m, --memory 64M     cgroup v2 memory.max (K/M/G suffixes)
 --memory-reservation 64M
                      cgroup v2 memory.high soft limit
+--memory-swap 128M   total memory+swap ceiling; -1/unlimited
 --cpus 0.5           cgroup v2 cpu.max (cores)
 --cpuset-cpus 0-3    pin CPUs (cgroups v2 cpuset.cpus)
 --cpuset-mems 0      pin memory nodes (cgroups v2 cpuset.mems)

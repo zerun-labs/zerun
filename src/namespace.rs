@@ -136,6 +136,7 @@ where
     // Skipped when no limits are set (typical rootless without delegation).
     let has_limits = spec.limits.memory.is_some()
         || spec.limits.memory_reservation.is_some()
+        || spec.limits.memory_swap.is_some()
         || spec.limits.cpus.is_some()
         || spec.limits.cpuset_cpus.is_some()
         || spec.limits.cpuset_mems.is_some()

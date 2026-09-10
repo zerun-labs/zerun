@@ -17,6 +17,10 @@ pub struct ResourceLimits {
     pub memory: Option<String>,
     /// Soft memory reservation written to cgroups v2 `memory.high`.
     pub memory_reservation: Option<String>,
+    /// Total memory+swap ceiling for cgroups v2 `memory.swap.max`; `-1` is
+    /// unlimited. When `memory.max` is set without this field, swap is capped
+    /// at the same value so a memory limit cannot be bypassed.
+    pub memory_swap: Option<i64>,
     /// CPU cores (fractional), e.g. 0.5 -> cpu.max "50000 100000".
     pub cpus: Option<f64>,
     /// CPU list bound to `cpuset.cpus`, e.g. "0-3" or "0,2".
@@ -85,8 +89,32 @@ impl CgroupV2 {
         if let Some(mem) = &limits.memory {
             let bytes = parse_size(mem)?;
             self.write("memory.max", bytes.to_string())?;
-            // Lock swap to the same ceiling so memory limits cannot be bypassed.
-            let _ = self.write("memory.swap.max", bytes.to_string());
+            // Docker's --memory-swap is a total memory+swap ceiling. Without
+            // it, lock swap to the memory ceiling so a memory limit cannot be
+            // bypassed by swapping.
+            match limits.memory_swap {
+                Some(swap) if swap < 0 => {
+                    self.write("memory.swap.max", "max".to_string())?;
+                }
+                Some(swap) => {
+                    if (swap as u64) < bytes {
+                        return Err(crate::zerr!(
+                            "memory-swap {swap} must be >= memory {}",
+                            bytes
+                        ));
+                    }
+                    self.write("memory.swap.max", swap.to_string())?;
+                }
+                None => {
+                    self.write("memory.swap.max", bytes.to_string())?;
+                }
+            }
+        } else if let Some(swap) = limits.memory_swap {
+            if swap < 0 {
+                self.write("memory.swap.max", "max".to_string())?;
+            } else {
+                self.write("memory.swap.max", swap.to_string())?;
+            }
         }
         if let Some(high) = &limits.memory_reservation {
             let bytes = parse_size(high)?;
@@ -373,6 +401,23 @@ fn enable_controllers(parent: &Path, want: &[&str]) -> ZResult<()> {
 }
 
 /// Parse K/M/G size suffixes into bytes.
+/// Parse Docker-style memory+swap ceilings. `-1`/`unlimited` means no swap
+/// ceiling; otherwise values use the same size suffixes as memory.
+pub fn parse_memory_swap(value: &str) -> ZResult<i64> {
+    let value = value.trim();
+    if value == "-1" || value.eq_ignore_ascii_case("unlimited") {
+        return Ok(-1);
+    }
+    let bytes =
+        parse_size(value).map_err(|_| crate::zerr!("cannot parse memory-swap size: '{value}'"))?;
+    if bytes == 0 {
+        return Err(crate::zerr!(
+            "memory-swap must be greater than zero or unlimited"
+        ));
+    }
+    i64::try_from(bytes).map_err(|_| crate::zerr!("memory-swap size is too large"))
+}
+
 fn parse_size(s: &str) -> ZResult<u64> {
     let s = s.trim();
     let (num, mult) = match s.chars().last() {
@@ -397,6 +442,15 @@ mod tests {
             std::env::temp_dir().join(format!("zerun-cgroup-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&missing);
         assert!(CgroupV2::open(&missing).is_err());
+    }
+
+    #[test]
+    fn parses_memory_swap_ceilings() {
+        assert_eq!(parse_memory_swap("64M").unwrap(), 64 * 1024 * 1024);
+        assert_eq!(parse_memory_swap("-1").unwrap(), -1);
+        assert_eq!(parse_memory_swap("unlimited").unwrap(), -1);
+        assert!(parse_memory_swap("0").is_err());
+        assert!(parse_memory_swap("bad").is_err());
     }
 
     #[test]

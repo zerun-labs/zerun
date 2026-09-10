@@ -120,6 +120,8 @@ struct RunArgs {
     image: Option<String>,
     memory: Option<String>,
     memory_reservation: Option<String>,
+    /// Docker-style total memory+swap; -1/unlimited.
+    memory_swap: Option<i64>,
     cpus: Option<f64>,
     cpuset_cpus: Option<String>,
     cpuset_mems: Option<String>,
@@ -180,6 +182,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--memory-reservation" => {
                 a.memory_reservation = Some(next_value(args, &mut i, s)?);
+            }
+            "--memory-swap" => {
+                let v = next_value(args, &mut i, "--memory-swap")?;
+                a.memory_swap = Some(cgroup::parse_memory_swap(&v).map_err(|e| e.to_string())?);
             }
             "--oom-group" => {
                 a.oom_group = true;
@@ -645,6 +651,7 @@ fn cmd_run(args: &[String]) -> i32 {
         limits: ResourceLimits {
             memory: a.memory,
             memory_reservation: a.memory_reservation,
+            memory_swap: a.memory_swap,
             cpus: a.cpus,
             cpuset_cpus: a.cpuset_cpus,
             cpuset_mems: a.cpuset_mems,
@@ -901,6 +908,14 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     }
     if let Some(v) = &a.memory_reservation {
         args.extend(["--memory-reservation".to_string(), v.clone()]);
+    }
+    if let Some(v) = a.memory_swap {
+        let value = if v < 0 {
+            "-1".to_string()
+        } else {
+            v.to_string()
+        };
+        args.extend(["--memory-swap".to_string(), value]);
     }
     if let Some(v) = a.cpus {
         args.extend(["--cpus".to_string(), v.to_string()]);
@@ -3139,7 +3154,8 @@ fn cmd_update(args: &[String]) -> i32 {
             "-h" | "--help" => {
                 println!(
                     "usage: zerun update [--memory SIZE] [--memory-reservation SIZE] \
-                     [--cpuset-cpus LIST] [--cpuset-mems LIST] [--pids N] \
+                     [--memory-swap SIZE] [--cpuset-cpus LIST] [--cpuset-mems LIST] \
+                     [--pids N] \
                      [--oom-group] CONTAINER"
                 );
                 return 0;
@@ -3159,6 +3175,22 @@ fn cmd_update(args: &[String]) -> i32 {
                     limits.memory_reservation = Some(v);
                     continue;
                 }
+                Err(e) => {
+                    eprintln!("zerun update: {e}");
+                    return 2;
+                }
+            },
+            "--memory-swap" => match next_value(args, &mut i, a) {
+                Ok(v) => match cgroup::parse_memory_swap(&v) {
+                    Ok(swap) => {
+                        limits.memory_swap = Some(swap);
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("zerun update: invalid --memory-swap '{v}': {e}");
+                        return 2;
+                    }
+                },
                 Err(e) => {
                     eprintln!("zerun update: {e}");
                     return 2;
@@ -3248,6 +3280,7 @@ fn cmd_update(args: &[String]) -> i32 {
     }
     if limits.memory.is_none()
         && limits.memory_reservation.is_none()
+        && limits.memory_swap.is_none()
         && limits.cpus.is_none()
         && limits.cpuset_cpus.is_none()
         && limits.cpuset_mems.is_none()
@@ -4571,6 +4604,7 @@ RUN OPTIONS:\n  \
   --rm            remove state and the writable layer when the container exits\n  \
   -m, --memory 64M    cgroup v2 memory.max (K/M/G suffixes)\n  \
   --memory-reservation 64M    cgroup v2 memory.high soft limit\n  \
+  --memory-swap 128M  total memory+swap ceiling (-1 = unlimited)\n  \
   --cpus 0.5          cgroup v2 cpu.max (cores)\n  \
   --cpuset-cpus 0-3   pin CPUs (cgroups v2 cpuset.cpus)\n  \
   --cpuset-mems 0     pin memory nodes (cgroups v2 cpuset.mems)\n  \
@@ -4723,6 +4757,26 @@ mod tests {
                 "1"
             ]
         );
+    }
+
+    #[test]
+    fn captures_memory_swap() {
+        for (raw, parsed) in [("268435456", 256 * 1024 * 1024), ("-1", -1)] {
+            let args: Vec<_> = ["--memory-swap", raw, "alpine", "true"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let a = parse_run_args(&args).expect("valid memory swap");
+            assert_eq!(a.memory_swap, Some(parsed));
+            let launch = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+            assert!(launch.contains(&"--memory-swap".to_string()));
+            assert!(launch.contains(&raw.to_string()));
+        }
+        let args: Vec<_> = ["--memory-swap", "bad", "alpine"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(parse_run_args(&args).is_err());
     }
 
     #[test]
