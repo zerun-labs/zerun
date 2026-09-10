@@ -60,6 +60,7 @@ fn main() {
         Some("port") => cmd_port(&args[2..]),
         Some("rename") => cmd_rename(&args[2..]),
         Some("top") => cmd_top(&args[2..]),
+        Some("cp") => cmd_cp(&args[2..]),
         Some("exec") => cmd_exec(&args[2..]),
         Some("login") => cmd_login(&args[2..]),
         Some("logout") => cmd_logout(&args[2..]),
@@ -2906,6 +2907,173 @@ fn cmd_top(args: &[String]) -> i32 {
     0
 }
 
+/// One endpoint of `zerun cp`: a host path or `CONTAINER:PATH`.
+#[derive(Debug)]
+enum CpEndpoint {
+    Host(PathBuf),
+    Container { target: String, path: String },
+}
+
+/// Parse one `cp` endpoint. Container paths are joined under the live
+/// container's `/proc/<pid>/root`, so `..` components are rejected up front
+/// (path-walking `..` on that root dentry lands in the *host* overlay dir).
+fn parse_cp_endpoint(arg: &str) -> Result<CpEndpoint, String> {
+    let Some((target, path)) = arg.split_once(':') else {
+        return Ok(CpEndpoint::Host(PathBuf::from(arg)));
+    };
+    if target.is_empty() || path.is_empty() {
+        return Err(format!(
+            "invalid endpoint '{arg}' (expected CONTAINER:PATH or a host path)"
+        ));
+    }
+    if path.split('/').any(|c| c == "..") {
+        return Err(format!("'..' is not allowed in container path '{arg}'"));
+    }
+    Ok(CpEndpoint::Container {
+        target: target.to_string(),
+        path: path.trim_start_matches('/').to_string(),
+    })
+}
+
+/// `zerun cp SRC DST` — copy between the host and a running container.
+///
+/// The container side is addressed through `/proc/<pid>/root`, which VFS
+/// resolves with the container as the root (absolute symlinks inside the
+/// container stay inside it). Exited containers have no live root mount,
+/// so they are rejected instead of copying from an empty merged dir.
+fn cmd_cp(args: &[String]) -> i32 {
+    let mut positional: Vec<&str> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "-h" | "--help" => {
+                println!("usage: zerun cp SRC DST   (one side: CONTAINER:PATH)");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun cp: unknown option {other}");
+                return 2;
+            }
+            other => positional.push(other),
+        }
+    }
+    if positional.len() != 2 {
+        eprintln!("usage: zerun cp SRC DST   (one side: CONTAINER:PATH)");
+        return 2;
+    }
+    let (src, dst) = match (
+        parse_cp_endpoint(positional[0]),
+        parse_cp_endpoint(positional[1]),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("zerun cp: {e}");
+            return 2;
+        }
+    };
+    // Direction: true = host -> container.
+    let host_to_container = match (&src, &dst) {
+        (CpEndpoint::Host(_), CpEndpoint::Container { .. }) => true,
+        (CpEndpoint::Container { .. }, CpEndpoint::Host(_)) => false,
+        _ => {
+            eprintln!("zerun cp: exactly one of SRC/DST must be CONTAINER:PATH");
+            return 2;
+        }
+    };
+    let (host_endpoint, container_endpoint) = if host_to_container {
+        (src, dst)
+    } else {
+        (dst, src)
+    };
+    let CpEndpoint::Container { target, path } = container_endpoint else {
+        unreachable!("checked direction above")
+    };
+    let CpEndpoint::Host(host_path) = host_endpoint else {
+        unreachable!("checked direction above")
+    };
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let mut st = match state::resolve(&store, &target) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun cp: {e}");
+            return 1;
+        }
+    };
+    if lifecycle::reconcile_stale(&store, &mut st) {
+        let _ = st.save();
+    }
+    if st.status != state::Status::Running || !st.pid_alive() {
+        eprintln!(
+            "zerun cp: container {} is not running (cp needs a live container root)",
+            display_name(&st)
+        );
+        return 1;
+    }
+    let pid = st.pid.unwrap_or(0);
+    let container_root = PathBuf::from(format!("/proc/{pid}/root"));
+    let result = if host_to_container {
+        // Host -> container.
+        let base = container_root.join(path);
+        let dst_is_dir = base.is_dir();
+        let Some(name) = host_path.file_name() else {
+            eprintln!("zerun cp: invalid source path '{}'", host_path.display());
+            return 2;
+        };
+        let to = if dst_is_dir { base.join(name) } else { base };
+        copy_between(&host_path, &to)
+    } else {
+        // Container -> host.
+        let from = container_root.join(&path);
+        let dst_is_dir = host_path.ends_with("/") || host_path.is_dir();
+        let Some(name) = from.file_name() else {
+            eprintln!("zerun cp: invalid container path '{path}'");
+            return 2;
+        };
+        let to = if dst_is_dir {
+            host_path.join(name)
+        } else {
+            host_path.clone()
+        };
+        copy_between(&from, &to)
+    };
+    if let Err(e) = result {
+        eprintln!("zerun cp: {e}");
+        return 1;
+    }
+    0
+}
+
+/// Copy a file, directory, or symlink, preserving modes (reuses the
+/// overlay-robust `copy_dir_all` for trees).
+fn copy_between(src: &Path, dst: &Path) -> crate::error::ZResult<()> {
+    if let Some(parent) = dst.parent() {
+        fsutil::mkdir_p(parent)?;
+    }
+    let meta =
+        std::fs::symlink_metadata(src).map_err(|e| crate::zerr!("stat {}: {e}", src.display()))?;
+    if meta.file_type().is_symlink() {
+        let target = std::fs::read_link(src)?;
+        std::os::unix::fs::symlink(&target, dst)
+            .map_err(|e| crate::zerr!("symlink {} -> {}: {e}", dst.display(), target.display()))
+    } else if meta.is_dir() {
+        fsutil::copy_dir_all(src, dst)
+    } else {
+        std::fs::copy(src, dst)
+            .map_err(|e| crate::zerr!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            dst,
+            std::fs::Permissions::from_mode(meta.permissions().mode() & 0o7777),
+        )
+        .map_err(|e| crate::zerr!("chmod {}: {e}", dst.display()))
+    }
+}
+
 fn cmd_exec(args: &[String]) -> i32 {
     let mut env_extra: Vec<String> = Vec::new();
     let mut workdir: Option<String> = None;
@@ -3217,6 +3385,7 @@ USAGE:\n  \
   zerun port CONTAINER                   list published port mappings\n  \
   zerun rename OLD NEW                   rename a container\n  \
   zerun top CONTAINER                    list a container's processes\n  \
+  zerun cp SRC DST                       copy files to/from a running container\n  \
   zerun exec [-e K=V] [-w DIR] CONTAINER CMD [ARG...]\n  \
                                         run a command in a running container\n  \
   zerun pull [--platform ...] IMAGE...   pull OCI images (Docker Hub, mirrors)\n  \
@@ -3276,6 +3445,26 @@ ENV:\n  \
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cp_endpoint_parsing_and_safety() {
+        let host = parse_cp_endpoint("/tmp/data").unwrap();
+        assert!(matches!(host, CpEndpoint::Host(_)));
+        let c = parse_cp_endpoint("web:/etc/hosts").unwrap();
+        match c {
+            CpEndpoint::Container { target, path } => {
+                assert_eq!(target, "web");
+                assert_eq!(path, "etc/hosts");
+            }
+            _ => panic!("expected container endpoint"),
+        }
+        // Leading slashes are container-relative; ".." never reaches the
+        // /proc root join.
+        let abs = parse_cp_endpoint("web:///tmp/x/../y").unwrap_err();
+        assert!(abs.contains(".."));
+        assert!(parse_cp_endpoint("web:").is_err());
+        assert!(parse_cp_endpoint(":/tmp").is_err());
+    }
 
     #[test]
     fn detached_launch_args_capture_resolved_options() {
