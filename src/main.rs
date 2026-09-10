@@ -79,6 +79,7 @@ fn main() {
         Some("images") => cmd_images(&args[2..]),
         Some("tag") => cmd_tag(&args[2..]),
         Some("rmi") => cmd_rmi(&args[2..]),
+        Some("prune") => cmd_prune(&args[2..]),
         Some("push") => cmd_push(&args[2..]),
         Some("save") => cmd_save(&args[2..]),
         Some("load") => cmd_load(&args[2..]),
@@ -2536,6 +2537,91 @@ fn stop_one(store: &Store, target: &str, timeout_secs: u64) -> Result<String, St
     Ok(name)
 }
 
+/// `zerun prune` — remove every retained exited container. Stale Running
+/// records are reconciled first, so this is also the bulk crash-recovery path.
+/// Live containers are deliberately never touched.
+fn cmd_prune(args: &[String]) -> i32 {
+    let mut force = false;
+    for a in args {
+        match a.as_str() {
+            "-f" | "--force" => force = true,
+            "-h" | "--help" => {
+                println!("usage: zerun prune [-f|--force]");
+                return 0;
+            }
+            other => {
+                eprintln!(
+                    "zerun prune: unknown option {other}; no positional arguments are accepted"
+                );
+                return 2;
+            }
+        }
+    }
+
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+
+    // Reconcile before selection so a dead reaper's Running record is treated
+    // like the Exited record it logically represents.
+    let states = state::list(&store);
+    let mut targets = Vec::new();
+    for mut st in states {
+        if st.status == state::Status::Running
+            && !st.pid_alive()
+            && lifecycle::reconcile_stale(&store, &mut st)
+        {
+            let _ = st.save();
+        }
+        if st.status == state::Status::Exited {
+            targets.push((st.id.clone(), display_name(&st)));
+        }
+    }
+    if targets.is_empty() {
+        println!("No exited containers to prune");
+        return 0;
+    }
+
+    let prompt = format!(
+        "Remove {} exited container(s)? This deletes their writable layers. [y/N] ",
+        targets.len()
+    );
+    match prompt::confirm(&prompt, force) {
+        Ok(true) => {}
+        Ok(false) => return 0,
+        Err(e) => {
+            eprintln!("zerun prune: {e}");
+            return 2;
+        }
+    }
+
+    println!("Deleted Containers:");
+    let mut removed = 0;
+    let mut failed = false;
+    for (id, label) in targets {
+        match rm_one(&store, &id, true) {
+            Ok(_) => {
+                println!("{label}");
+                removed += 1;
+            }
+            Err(e) => {
+                eprintln!("zerun prune: {e}");
+                failed = true;
+            }
+        }
+    }
+    println!("Total removed containers: {removed}");
+    if failed {
+        1
+    } else {
+        0
+    }
+}
+
 fn cmd_rm(args: &[String]) -> i32 {
     let mut force = false;
     let mut targets: Vec<String> = Vec::new();
@@ -4309,6 +4395,7 @@ USAGE:\n  \
   zerun logout [REGISTRY]               remove stored registry credentials\n  \
   zerun images                           list local images\n  \
   zerun rmi IMAGE...                     remove local images\n  \
+  zerun prune [-f]                       remove all exited containers\n  \
   zerun tag SOURCE TARGET[:TAG]          add a local tag to an image\n  \
   zerun push IMAGE[:TAG]                 push a local image to a registry\n  \
   zerun save -o FILE.tar IMAGE...        export images as an OCI archive\n  \

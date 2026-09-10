@@ -35,7 +35,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   proxy (Docker's docker-proxy in-binary), and `--dns` / host resolv.conf inheritance.
 - **M5 — detached lifecycle (done)**: `run -d` forks a tiny per-container reaper that
   redirects stdio to `console.log` and persists state to disk; `ps [-a]`, `stop`, `restart`,
-  `rm`, `logs [--since/--until/-f]`, `stats`, `exec`, `attach`, and `commit` address containers by id/name with crash reconcile
+  `rm`, `prune [-f]`, `logs [--since/--until/-f]`, `stats`, `exec`, `attach`, and `commit` address containers by id/name with crash reconcile
   of stale records; file-based IPAM; `--rm` for auto-removal (see AGENTS.md).
 
 ## Highlights
@@ -49,7 +49,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
 - **Secure defaults**: `PR_SET_NO_NEW_PRIVS`, capability bounding-set cleared, masked
   `/proc`/`/sys` paths, and a deny-by-default seccomp allowlist (opt out with
   `--seccomp unconfined`).
-- **Docker-compatible top 20% CLI**: `run / ps / wait / stop / restart / rm / logs / exec / inspect /
+- **Docker-compatible top 20% CLI**: `run / ps / wait / stop / restart / rm / prune / logs / exec / inspect /
   port / rename / top / diff / cp / export / import / events / update / attach / kill / pull / push / tag / save / load /
   login / logout / images / rmi / commit / generate-service / doctor`.
 
@@ -242,6 +242,7 @@ sudo target/release/zerun kill --signal TERM web      # send any Linux signal
 sudo target/release/zerun restart --time 3 web        # stop, then recreate from saved options
 sudo target/release/zerun commit -m snapshot web web:snapshot
 sudo target/release/zerun rm web                      # remove the stopped container
+sudo target/release/zerun prune -f                    # remove all exited containers
 ```
 
 Detached containers keep no daemon: the per-container reaper is a tiny process that
@@ -257,6 +258,9 @@ next `ps`/`rm` reconciles the stale record and reclaims host-side resources.
 raw lines before applying the time window. Untimestamped legacy logs are displayed
 normally but cannot be selected by time. `--until` ends follow mode at that boundary;
 `--since` remains fixed while following.
+`prune` removes every retained exited container and its writable layer. It reconciles stale
+Running records first, never touches live containers, and requires `--force` when stdin is
+not a terminal.
 `stats` is a one-shot snapshot of cgroup v2 memory, CPU, PID, and block-I/O data.
 It reads live control files while a container runs and persists a final snapshot
 when it exits. Metrics are `n/a` when the cgroup was unavailable or the command

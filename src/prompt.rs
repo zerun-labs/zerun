@@ -28,6 +28,33 @@ pub fn username(value: Option<String>) -> ZResult<String> {
     Ok(username.to_string())
 }
 
+/// Ask a destructive-operation confirmation question. `--force` bypasses both
+/// the question and the terminal check so automation can proceed explicitly.
+pub fn confirm(question: &str, force: bool) -> ZResult<bool> {
+    if force {
+        return Ok(true);
+    }
+    if !crate::syscalls::is_terminal(libc::STDIN_FILENO) {
+        return Err(crate::zerr!(
+            "confirmation requires a terminal; use --force for non-interactive use"
+        ));
+    }
+
+    print!("{question}");
+    std::io::stdout()
+        .flush()
+        .map_err(|e| crate::zerr!("write confirmation prompt: {e}"))?;
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| crate::zerr!("read confirmation: {e}"))?;
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
 /// Read a password from stdin (normally `--password-stdin`).
 pub fn password_from_stdin() -> ZResult<String> {
     let mut bytes = Vec::new();
@@ -91,5 +118,10 @@ mod tests {
     #[test]
     fn existing_username_wins_without_reading_stdin() {
         assert_eq!(username(Some("alice".into())).unwrap(), "alice");
+    }
+
+    #[test]
+    fn forced_confirmation_never_reads_stdin() {
+        assert!(confirm("Proceed?", true).unwrap());
     }
 }
