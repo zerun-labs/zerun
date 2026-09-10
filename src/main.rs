@@ -2740,6 +2740,7 @@ fn cmd_system_df(args: &[String]) -> i32 {
     };
     let image_bytes = fsutil::dir_size(&store.data_root().join("blobs"))
         + fsutil::dir_size(&store.data_root().join("rootfs"));
+    let image_reclaimable = imgstore.reclaimable_bytes();
     let volumes_root = store.data_root().join("volumes");
     let volume_count = std::fs::read_dir(&volumes_root)
         .map(|entries| {
@@ -2781,7 +2782,7 @@ fn cmd_system_df(args: &[String]) -> i32 {
         "Images",
         image_records.len(),
         fsutil::human_size(image_bytes),
-        "0 B"
+        fsutil::human_size(image_reclaimable),
     );
     println!(
         "{:<12} {:>7} {:>14} {:>14}",
@@ -2800,16 +2801,18 @@ fn cmd_system_df(args: &[String]) -> i32 {
     0
 }
 
-/// `zerun prune` — remove every retained exited container. Stale Running
-/// records are reconciled first, so this is also the bulk crash-recovery path.
-/// Live containers are deliberately never touched.
+/// `zerun prune` — remove retained exited containers, and optionally remove
+/// unreachable image storage. Stale Running records are reconciled first, so
+/// this is also the bulk crash-recovery path. Live containers are never touched.
 fn cmd_prune(args: &[String]) -> i32 {
     let mut force = false;
+    let mut images = false;
     for a in args {
         match a.as_str() {
             "-f" | "--force" => force = true,
+            "--images" => images = true,
             "-h" | "--help" => {
-                println!("usage: zerun prune [-f|--force]");
+                println!("usage: zerun prune [-f|--force] [--images]");
                 return 0;
             }
             other => {
@@ -2825,6 +2828,13 @@ fn cmd_prune(args: &[String]) -> i32 {
         Ok(s) => s,
         Err(e) => {
             eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let imgstore = match image::store::ImageStore::open(&store) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun prune: {e}");
             return 1;
         }
     };
@@ -2844,15 +2854,32 @@ fn cmd_prune(args: &[String]) -> i32 {
             targets.push((st.id.clone(), display_name(&st)));
         }
     }
-    if targets.is_empty() {
-        println!("No exited containers to prune");
+    let image_reclaimable = if images {
+        imgstore.reclaimable_bytes()
+    } else {
+        0
+    };
+    if targets.is_empty() && (!images || image_reclaimable == 0) {
+        println!("No exited containers or unreachable image storage to prune");
         return 0;
     }
 
-    let prompt = format!(
-        "Remove {} exited container(s)? This deletes their writable layers. [y/N] ",
-        targets.len()
-    );
+    let mut prompt = String::new();
+    if !targets.is_empty() {
+        prompt.push_str(&format!(
+            "Remove {} exited container(s)? This deletes their writable layers.",
+            targets.len()
+        ));
+    }
+    if images && image_reclaimable > 0 {
+        if !prompt.is_empty() {
+            prompt.push(' ');
+        }
+        prompt.push_str(&format!(
+            "Delete {image_reclaimable} bytes of unreachable image storage?"
+        ));
+    }
+    prompt.push_str(" [y/N] ");
     match prompt::confirm(&prompt, force) {
         Ok(true) => {}
         Ok(false) => return 0,
@@ -2862,22 +2889,38 @@ fn cmd_prune(args: &[String]) -> i32 {
         }
     }
 
-    println!("Deleted Containers:");
-    let mut removed = 0;
     let mut failed = false;
-    for (id, label) in targets {
-        match rm_one(&store, &id, true) {
-            Ok(_) => {
-                println!("{label}");
-                removed += 1;
+    if !targets.is_empty() {
+        println!("Deleted Containers:");
+        let mut removed = 0;
+        for (id, label) in targets {
+            match rm_one(&store, &id, true) {
+                Ok(_) => {
+                    println!("{label}");
+                    removed += 1;
+                }
+                Err(e) => {
+                    eprintln!("zerun prune: {e}");
+                    failed = true;
+                }
             }
+        }
+        println!("Total removed containers: {removed}");
+    }
+
+    if images {
+        match imgstore.gc() {
+            Ok(()) => println!(
+                "Reclaimed image storage: {}",
+                fsutil::human_size(image_reclaimable)
+            ),
             Err(e) => {
                 eprintln!("zerun prune: {e}");
                 failed = true;
             }
         }
     }
-    println!("Total removed containers: {removed}");
+
     if failed {
         1
     } else {
@@ -4718,6 +4761,7 @@ USAGE:\n  \
   zerun logout [REGISTRY]               remove stored registry credentials\n  \
   zerun images                           list local images\n  \
   zerun rmi IMAGE...                     remove local images\n  \
+  zerun prune [-f] [--images]            remove exited containers/image garbage\n  \
   zerun system df                        summarize image/container disk usage\n  \
   zerun tag SOURCE TARGET[:TAG]          add a local tag to an image\n  \
   zerun push IMAGE[:TAG]                 push a local image to a registry\n  \

@@ -357,6 +357,55 @@ impl ImageStore {
         Ok(Some(rec))
     }
 
+    /// Best-effort byte size that `gc()` would reclaim.
+    ///
+    /// This stays a read-only dry run so `system df` can report stale pull
+    /// artifacts without mutating the store or requiring a privileged caller.
+    pub fn reclaimable_bytes(&self) -> u64 {
+        let Ok(records) = self.records() else {
+            return 0;
+        };
+        let mut keep_blobs = BTreeSet::new();
+        let mut keep_rootfs = BTreeSet::new();
+        for rec in &records {
+            keep_blobs.insert(rec.manifest.clone());
+            if let Some(index) = &rec.index {
+                keep_blobs.insert(index.clone());
+            }
+            keep_blobs.insert(rec.config.clone());
+            if let Ok(hex) = digest_hex(&rec.config) {
+                keep_rootfs.insert(hex);
+            }
+            if let Some(index) = &rec.index {
+                self.keep_manifest_tree(index, &mut keep_blobs);
+            }
+            self.keep_manifest_tree(&rec.manifest, &mut keep_blobs);
+        }
+
+        let mut total = 0;
+        let blobs_dir = self.data_root.join("blobs").join("sha256");
+        if let Ok(rd) = fs::read_dir(&blobs_dir) {
+            for entry in rd.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if name.starts_with(".tmp-") || !keep_blobs.contains(name) {
+                    total += fsutil::dir_size(&entry.path());
+                }
+            }
+        }
+        let rootfs_dir = self.data_root.join("rootfs");
+        if let Ok(rd) = fs::read_dir(&rootfs_dir) {
+            for entry in rd.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if name.starts_with(".tmp-") || !keep_rootfs.contains(name) {
+                    total += fsutil::dir_size(&entry.path());
+                }
+            }
+        }
+        total
+    }
+
     /// Delete blobs and rootfs dirs no longer reachable from the tag index.
     /// Best-effort per entry: a broken record must not wedge `rmi`.
     pub fn gc(&self) -> ZResult<()> {
@@ -522,6 +571,24 @@ mod tests {
         let bad_d = format!("sha256:{}", sha256_hex(b"other"));
         assert!(s.write_blob(&bad_d, b"different").is_err());
         let _ = fs::remove_dir_all(&s.data_root);
+    }
+
+    #[test]
+    fn reclaimable_dry_run_matches_gc_scope() {
+        let s = test_store();
+        let orphan = b"orphan blob";
+        let orphan_digest = format!("sha256:{}", sha256_hex(orphan));
+        s.write_blob(&orphan_digest, orphan).unwrap();
+        let orphan_rootfs = s.rootfs_dir().join("orphanroot");
+        std::fs::create_dir_all(&orphan_rootfs).unwrap();
+        std::fs::write(orphan_rootfs.join("marker"), b"orphan rootfs").unwrap();
+        let expected = orphan.len() as u64 + b"orphan rootfs".len() as u64;
+        assert_eq!(s.reclaimable_bytes(), expected);
+
+        s.gc().unwrap();
+        assert!(!s.has_blob(&orphan_digest));
+        assert!(!orphan_rootfs.exists());
+        assert_eq!(s.reclaimable_bytes(), 0);
     }
 
     #[test]

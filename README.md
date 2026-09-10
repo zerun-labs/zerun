@@ -37,7 +37,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
 - **M5 — detached lifecycle (done)**: `run -d` forks a tiny per-container reaper that
   redirects stdio to `console.log` and persists state to disk;
   `ps [-a] [-q] [--format table|json] [--filter KEY=VALUE]`, `stop`, `restart`,
-  `rm`, `prune [-f]`, `logs [--since/--until/-f]`, `stats`, `exec`, `attach`, and `commit` address containers by id/name with crash reconcile
+  `rm`, `prune [-f] [--images]`, `logs [--since/--until/-f]`, `stats`, `exec`, `attach`, and `commit` address containers by id/name with crash reconcile
   of stale records; file-based IPAM; `--rm` for auto-removal (see AGENTS.md).
 
 ## Highlights
@@ -268,6 +268,7 @@ sudo target/release/zerun restart --time 3 web        # stop, then recreate from
 sudo target/release/zerun commit -m snapshot web web:snapshot
 sudo target/release/zerun rm web                      # remove the stopped container
 sudo target/release/zerun prune -f                    # remove all exited containers
+sudo target/release/zerun prune -f --images           # also remove unreachable image blobs/rootfs
 sudo target/release/zerun system df                   # image and container disk usage
 ```
 
@@ -286,7 +287,8 @@ normally but cannot be selected by time. `--until` ends follow mode at that boun
 `--since` remains fixed while following.
 `prune` removes every retained exited container and its writable layer. It reconciles stale
 Running records first, never touches live containers, and requires `--force` when stdin is
-not a terminal.
+not a terminal. `--images` additionally runs the image-store garbage collector for unreachable
+blobs/rootfs left by interrupted pulls or removed records; tagged images are retained.
 `stats` is a one-shot snapshot of cgroup v2 memory, CPU, PID, and block-I/O data.
 It reads live control files while a container runs and persists a final snapshot
 when it exits. Metrics are `n/a` when the cgroup was unavailable or the command
