@@ -66,6 +66,7 @@ fn main() {
         Some("export") => cmd_export(&args[2..]),
         Some("import") => cmd_import(&args[2..]),
         Some("events") => cmd_events(&args[2..]),
+        Some("attach") => cmd_attach(&args[2..]),
         Some("exec") => cmd_exec(&args[2..]),
         Some("login") => cmd_login(&args[2..]),
         Some("logout") => cmd_logout(&args[2..]),
@@ -3551,6 +3552,99 @@ fn cmd_events(args: &[String]) -> i32 {
     }
 }
 
+/// `zerun attach CONTAINER` — stream a detached container's live output.
+///
+/// Connects to the reaper's per-container unix socket and prints captured
+/// output as it happens. The final control frame is runtime metadata, not
+/// workload output; attach uses it to propagate the container's exit code.
+/// Stdin is not forwarded in this version; use `exec` for interactive input.
+fn cmd_attach(args: &[String]) -> i32 {
+    let mut targets: Vec<&str> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "-h" | "--help" => {
+                println!("usage: zerun attach CONTAINER");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun attach: unknown option {other}");
+                return 2;
+            }
+            other => targets.push(other),
+        }
+    }
+    if targets.len() != 1 {
+        eprintln!("usage: zerun attach CONTAINER");
+        return 2;
+    }
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let mut st = match state::resolve(&store, targets[0]) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun attach: {e}");
+            return 1;
+        }
+    };
+    if lifecycle::reconcile_stale(&store, &mut st) {
+        let _ = st.save();
+    }
+    if st.status != state::Status::Running || !st.pid_alive() {
+        eprintln!(
+            "zerun attach: container {} is not running",
+            display_name(&st)
+        );
+        return 1;
+    }
+    let Some(sock_path) = Path::new(&st.log)
+        .parent()
+        .map(|dir| dir.join("attach.sock"))
+    else {
+        eprintln!("zerun attach: container {} has no state directory", st.id);
+        return 1;
+    };
+    if !sock_path.exists() {
+        eprintln!(
+            "zerun attach: container {} has no attach socket (older reaper or not running)",
+            display_name(&st)
+        );
+        return 1;
+    }
+    let mut stream = match std::os::unix::net::UnixStream::connect(&sock_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun attach: connect {}: {e}", sock_path.display());
+            return 1;
+        }
+    };
+    use std::io::Write as _;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    loop {
+        match lifecycle::read_attach_frame(&mut stream) {
+            Ok(Some(chunk)) => {
+                if out.write_all(&chunk).is_err() {
+                    break;
+                }
+                let _ = out.flush();
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    // If EOF raced the control frame, fall back to the persisted state.
+    match state::ContainerState::load(&store, &st.id) {
+        Some(final_state) => final_state.exit_code.unwrap_or(0),
+        // `--rm` removed the state; treat a clean EOF as success.
+        None => 0,
+    }
+}
+
 fn cmd_exec(args: &[String]) -> i32 {
     let mut env_extra: Vec<String> = Vec::new();
     let mut workdir: Option<String> = None;
@@ -3867,6 +3961,7 @@ USAGE:\n  \
   zerun export [-o FILE] CONTAINER       export a container rootfs as tar\n  \
   zerun import [-m MSG] FILE|- TARGET    import a rootfs tar as a local image\n  \
   zerun events                           stream container lifecycle events\n  \
+  zerun attach CONTAINER                 stream a detached container's output\n  \
   zerun exec [-e K=V] [-w DIR] CONTAINER CMD [ARG...]\n  \
                                         run a command in a running container\n  \
   zerun pull [--platform ...] IMAGE...   pull OCI images (Docker Hub, mirrors)\n  \

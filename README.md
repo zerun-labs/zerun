@@ -35,7 +35,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   proxy (Docker's docker-proxy in-binary), and `--dns` / host resolv.conf inheritance.
 - **M5 — detached lifecycle (done)**: `run -d` forks a tiny per-container reaper that
   redirects stdio to `console.log` and persists state to disk; `ps [-a]`, `stop`, `restart`,
-  `rm`, `logs [-f]`, `stats`, `exec`, and `commit` address containers by id/name with crash reconcile
+  `rm`, `logs [-f]`, `stats`, `exec`, `attach`, and `commit` address containers by id/name with crash reconcile
   of stale records; file-based IPAM; `--rm` for auto-removal (see AGENTS.md).
 
 ## Highlights
@@ -50,7 +50,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   `/proc`/`/sys` paths, and a deny-by-default seccomp allowlist (opt out with
   `--seccomp unconfined`).
 - **Docker-compatible top 20% CLI**: `run / ps / wait / stop / restart / rm / logs / exec / inspect /
-  port / rename / top / cp / export / import / events / update / pull / push / tag / save / load /
+  port / rename / top / cp / export / import / events / update / attach / pull / push / tag / save / load /
   login / logout / images / rmi / commit / generate-service / doctor`.
 
 ## Install
@@ -230,6 +230,7 @@ sudo target/release/zerun ps                          # running containers
 sudo target/release/zerun wait web                    # block until exit; prints the exit code
 sudo target/release/zerun logs --tail 20 web          # container console.log
 sudo target/release/zerun logs -t web                 # include capture timestamps
+sudo target/release/zerun attach web                  # stream live container output
 sudo target/release/zerun stats web                   # one-shot resource metrics
 sudo target/release/zerun exec web /bin/sh            # join the container
 sudo target/release/zerun stop --time 3 web           # SIGTERM, then SIGKILL
@@ -250,6 +251,10 @@ when it exits. Metrics are `n/a` when the cgroup was unavailable or the command
 cannot read it.
 `restart` recreates a detached container from the canonical launch options saved in
 `state.json`; containers created before this metadata was added are not restartable.
+`attach` streams a running detached container's live output over an owner-only Unix socket.
+When the workload exits, a final control frame closes the stream and the attach command
+returns the container's exit code without mixing runtime metadata into output.
+Use `exec` for interactive input.
 `commit` produces a single-layer OCI image from the container rootfs. Exited detached
 containers retain their writable layer until `rm`; `--rm` still removes it on exit.
 

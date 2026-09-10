@@ -21,9 +21,12 @@ use crate::namespace::{run_container_with_report, RunSpec};
 use crate::state::{self, ContainerState, Status};
 use crate::store::{ContainerFs, Store};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::RawFd;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -118,6 +121,9 @@ pub fn run_detached(
             store.cleanup_container_fs(&fs);
         }
     }
+    // Attach clients get the exit status as the very last bytes on the
+    // socket, then EOF.
+    captured_log.release_attach(code);
     if remove_state {
         let dir = state::ContainerState::dir(&store, &id);
         fsutil::remove_dir_all_quiet(&dir);
@@ -128,6 +134,9 @@ pub fn run_detached(
 /// Background pipe -> timestamped console.log collector.
 struct CapturedLog {
     reader: Option<JoinHandle<()>>,
+    /// Live-output fan-out for `zerun attach` (None when the socket could
+    /// not be bound; attach then reports no socket instead of failing runs).
+    attach: Option<AttachHub>,
 }
 
 impl CapturedLog {
@@ -145,12 +154,25 @@ impl CapturedLog {
         crate::syscalls::close(write_fd);
         crate::syscalls::close(previous_log_fd);
 
+        // Live attach socket next to console.log; a failed bind degrades to
+        // log-only operation (attach reports the missing socket clearly).
+        let sock_path = log_path.with_file_name("attach.sock");
+        let attach = match AttachHub::bind(&sock_path) {
+            Ok(hub) => Some(hub),
+            Err(e) => {
+                eprintln!("zerun: attach socket unavailable: {e}");
+                None
+            }
+        };
+        let attach_clients = attach.as_ref().map(|hub| Arc::clone(&hub.clients));
+
         let reader = std::thread::Builder::new()
             .name("zerun-log".to_string())
             .stack_size(64 * 1024)
-            .spawn(move || collect_timestamped(read_fd, log_file))?;
+            .spawn(move || collect_timestamped(read_fd, log_file, attach_clients))?;
         Ok(Self {
             reader: Some(reader),
+            attach,
         })
     }
 
@@ -162,9 +184,115 @@ impl CapturedLog {
             let _ = reader.join();
         }
     }
+
+    /// Tell attached clients the final exit status and remove the socket.
+    fn release_attach(&self, code: i32) {
+        if let Some(hub) = &self.attach {
+            hub.close_all(code);
+        }
+    }
 }
 
-fn collect_timestamped(read_fd: RawFd, mut output: File) {
+/// Fan-out hub for `zerun attach` clients over a per-container unix socket.
+///
+/// The collector writes every captured line as a length-prefixed frame;
+/// failed clients are dropped lazily. The reaper sends a zero-length control
+/// frame carrying the exit status, so workload bytes are never metadata.
+struct AttachHub {
+    clients: Arc<Mutex<Vec<UnixStream>>>,
+    sock_path: std::path::PathBuf,
+}
+
+impl AttachHub {
+    fn bind(sock_path: &Path) -> ZResult<AttachHub> {
+        let _ = std::fs::remove_file(sock_path); // stale socket from a crash
+        let listener = UnixListener::bind(sock_path)
+            .map_err(|e| crate::zerr!("bind {}: {e}", sock_path.display()))?;
+        // Owner-only: the socket streams container output.
+        let _ = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o600));
+        let clients: Arc<Mutex<Vec<UnixStream>>> = Arc::default();
+        let worker_clients = Arc::clone(&clients);
+        std::thread::Builder::new()
+            .name("zerun-attach".to_string())
+            .spawn(move || {
+                // Blocks on accept until the reaper process exits; the
+                // kernel closes the listener fd with the process.
+                for stream in listener.incoming() {
+                    match stream {
+                        Ok(s) => {
+                            // Keep the collector non-blocking even if an
+                            // attached client stops reading; such a client is
+                            // dropped and can catch up with `zerun logs`.
+                            let _ = s.set_nonblocking(true);
+                            if let Ok(mut list) = worker_clients.lock() {
+                                list.push(s);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })?;
+        Ok(AttachHub {
+            clients,
+            sock_path: sock_path.to_path_buf(),
+        })
+    }
+
+    /// Send the final exit status and disconnect everyone (reaper exit).
+    fn close_all(&self, code: i32) {
+        if let Ok(mut list) = self.clients.lock() {
+            for mut client in list.drain(..) {
+                let mut frame = 0u32.to_be_bytes().to_vec();
+                frame.extend_from_slice(&code.to_be_bytes());
+                let _ = client.write_all(&frame);
+            }
+        }
+        let _ = std::fs::remove_file(&self.sock_path);
+    }
+}
+
+/// Write `chunk` to every attached client; failed clients are dropped.
+fn broadcast(clients: &Mutex<Vec<UnixStream>>, chunk: &[u8]) {
+    if chunk.is_empty() {
+        return;
+    }
+    let Ok(mut list) = clients.lock() else {
+        return;
+    };
+    let mut frame = (chunk.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(chunk);
+    list.retain_mut(|client| client.write_all(&frame).is_ok());
+}
+
+/// Read one attach-socket frame. `None` means "container exited" and carries
+/// the final status in the control payload.
+pub fn read_attach_frame(stream: &mut UnixStream) -> std::io::Result<Option<Vec<u8>>> {
+    let mut prefix = [0u8; 4];
+    stream.read_exact(&mut prefix)?;
+    let len = u32::from_be_bytes(prefix);
+    if len == 0 {
+        let mut code = [0u8; 4];
+        stream.read_exact(&mut code)?;
+        return Ok(None);
+    }
+    // The reaper only writes pipe-sized workload frames; retain a hard bound
+    // anyway so a malformed local stream cannot force a huge allocation.
+    if len > 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "attach frame too large",
+        ));
+    }
+    let mut chunk = vec![0u8; len as usize];
+    stream.read_exact(&mut chunk)?;
+    Ok(Some(chunk))
+}
+
+fn collect_timestamped(
+    read_fd: RawFd,
+    mut output: File,
+    attach: Option<Arc<Mutex<Vec<UnixStream>>>>,
+) {
     let mut pending: Vec<u8> = Vec::new();
     let mut buf = [0u8; 8 * 1024];
     loop {
@@ -179,10 +307,16 @@ fn collect_timestamped(read_fd: RawFd, mut output: File) {
                 crate::syscalls::close(read_fd);
                 return;
             }
+            if let Some(clients) = &attach {
+                broadcast(clients, &line);
+            }
         }
     }
     if !pending.is_empty() {
         let _ = write_timestamped_line(&mut output, &pending);
+        if let Some(clients) = &attach {
+            broadcast(clients, &pending);
+        }
     }
     crate::syscalls::close(read_fd);
 }
@@ -280,4 +414,48 @@ fn write_all(fd: RawFd, buf: &[u8]) -> ZResult<()> {
         off += n as usize;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod attach_tests {
+    use super::*;
+
+    #[test]
+    fn attach_data_frames_preserve_arbitrary_workload_bytes() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let clients = Arc::new(Mutex::new(vec![server]));
+        broadcast(&clients, b"exit=7\n");
+        broadcast(&clients, b"no-newline");
+        assert_eq!(
+            read_attach_frame(&mut client).unwrap(),
+            Some(b"exit=7\n".to_vec())
+        );
+        assert_eq!(
+            read_attach_frame(&mut client).unwrap(),
+            Some(b"no-newline".to_vec())
+        );
+    }
+
+    #[test]
+    fn attach_control_frame_carries_the_exit_status() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let hub = AttachHub {
+            clients: Arc::new(Mutex::new(vec![server])),
+            sock_path: std::path::PathBuf::from("/nonexistent/zerun-test.sock"),
+        };
+        hub.close_all(7);
+        assert_eq!(read_attach_frame(&mut client).unwrap(), None);
+    }
+
+    #[test]
+    fn attach_rejects_oversized_frames() {
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        server
+            .write_all(&(1024u32 * 1024 + 1).to_be_bytes())
+            .unwrap();
+        assert_eq!(
+            read_attach_frame(&mut client).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
 }
