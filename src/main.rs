@@ -19,6 +19,7 @@ mod namespace;
 mod netlink;
 mod network;
 mod nfnetlink;
+mod procinfo;
 mod prompt;
 mod pty;
 mod seccomp;
@@ -55,6 +56,10 @@ fn main() {
         Some("rm") => cmd_rm(&args[2..]),
         Some("logs") => cmd_logs(&args[2..]),
         Some("stats") => cmd_stats(&args[2..]),
+        Some("inspect") => cmd_inspect(&args[2..]),
+        Some("port") => cmd_port(&args[2..]),
+        Some("rename") => cmd_rename(&args[2..]),
+        Some("top") => cmd_top(&args[2..]),
         Some("exec") => cmd_exec(&args[2..]),
         Some("login") => cmd_login(&args[2..]),
         Some("logout") => cmd_logout(&args[2..]),
@@ -284,7 +289,13 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 i += 1;
             }
             "--name" => {
-                a.name = Some(next_value(args, &mut i, "--name")?);
+                let v = next_value(args, &mut i, "--name")?;
+                if !state::valid_name(&v) {
+                    return Err(format!(
+                        "invalid --name '{v}' (allowed: [a-zA-Z0-9][a-zA-Z0-9_.-]*)"
+                    ));
+                }
+                a.name = Some(v);
             }
             "--rm" => {
                 a.rm = true;
@@ -2666,6 +2677,235 @@ fn human_duration(usec: u64) -> String {
     }
 }
 
+/// `zerun inspect CONTAINER...` — dump state records as pretty JSON.
+///
+/// The output is the raw on-disk `state.json` (plus crash reconciliation),
+/// so scripts can rely on the persisted schema rather than a second view.
+fn cmd_inspect(args: &[String]) -> i32 {
+    let mut targets: Vec<&str> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "-h" | "--help" => {
+                println!("usage: zerun inspect CONTAINER...");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun inspect: unknown option {other}");
+                return 2;
+            }
+            other => targets.push(other),
+        }
+    }
+    if targets.is_empty() {
+        eprintln!("zerun inspect: at least one CONTAINER is required");
+        return 2;
+    }
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    for target in targets {
+        let mut st = match state::resolve(&store, target) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("zerun inspect: {e}");
+                return 1;
+            }
+        };
+        if lifecycle::reconcile_stale(&store, &mut st) {
+            let _ = st.save();
+        }
+        match serde_json::to_string_pretty(&st) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                eprintln!("zerun inspect: serialize {}: {e}", st.id);
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+/// `zerun port CONTAINER` — list published port mappings.
+fn cmd_port(args: &[String]) -> i32 {
+    let mut targets: Vec<&str> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "-h" | "--help" => {
+                println!("usage: zerun port CONTAINER");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun port: unknown option {other}");
+                return 2;
+            }
+            other => targets.push(other),
+        }
+    }
+    if targets.len() != 1 {
+        eprintln!("usage: zerun port CONTAINER");
+        return 2;
+    }
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let mut st = match state::resolve(&store, targets[0]) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun port: {e}");
+            return 1;
+        }
+    };
+    if lifecycle::reconcile_stale(&store, &mut st) {
+        let _ = st.save();
+    }
+    for (i, (host, container)) in st.ports.iter().enumerate() {
+        let protocol = st
+            .port_protocols
+            .as_deref()
+            .and_then(|v| v.get(i).map(String::as_str))
+            .unwrap_or("tcp");
+        println!("{container}/{protocol} -> 0.0.0.0:{host}");
+    }
+    0
+}
+
+/// `zerun rename OLD NEW` — re-point a state record at a new name.
+///
+/// The detached reaper load-modify-saves its own copy at start/exit, so a
+/// rename racing one of those writes can be lost (the same tiny window any
+/// lockless state edit has); everything else observes the new name.
+fn cmd_rename(args: &[String]) -> i32 {
+    let mut positional: Vec<&str> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "-h" | "--help" => {
+                println!("usage: zerun rename OLD NEW");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun rename: unknown option {other}");
+                return 2;
+            }
+            other => positional.push(other),
+        }
+    }
+    if positional.len() != 2 {
+        eprintln!("usage: zerun rename OLD NEW");
+        return 2;
+    }
+    let (old, new) = (positional[0], positional[1]);
+    if !state::valid_name(new) {
+        eprintln!(
+            "zerun rename: invalid container name '{new}' (allowed: [a-zA-Z0-9][a-zA-Z0-9_.-]*)"
+        );
+        return 2;
+    }
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let mut st = match state::resolve(&store, old) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun rename: {e}");
+            return 1;
+        }
+    };
+    if st.name.as_deref() == Some(new) {
+        return 0;
+    }
+    if state::list(&store)
+        .iter()
+        .any(|other| other.id != st.id && other.name.as_deref() == Some(new))
+    {
+        eprintln!("zerun rename: name '{new}' is already in use");
+        return 1;
+    }
+    st.name = Some(new.to_string());
+    if let Err(e) = st.save() {
+        eprintln!("zerun rename: {e}");
+        return 1;
+    }
+    0
+}
+
+/// `zerun top CONTAINER` — host-side view of a container's processes.
+///
+/// PID-namespace membership is derived from /proc, so no setns and no
+/// in-container helper are needed; the view matches the host's clock for
+/// CPU time and never runs arbitrary code in the container.
+fn cmd_top(args: &[String]) -> i32 {
+    let mut positional: Vec<&str> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "-h" | "--help" => {
+                println!("usage: zerun top CONTAINER");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun top: unknown option {other} (ps arguments are not supported)");
+                return 2;
+            }
+            other => positional.push(other),
+        }
+    }
+    if positional.len() != 1 {
+        eprintln!("usage: zerun top CONTAINER");
+        return 2;
+    }
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let mut st = match state::resolve(&store, positional[0]) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun top: {e}");
+            return 1;
+        }
+    };
+    if lifecycle::reconcile_stale(&store, &mut st) {
+        let _ = st.save();
+    }
+    if st.status != state::Status::Running || !st.pid_alive() {
+        eprintln!("zerun top: container {} is not running", display_name(&st));
+        return 1;
+    }
+    let init_pid = st.pid.unwrap_or(0);
+    let procs = match procinfo::list_pid_namespace(init_pid) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("zerun top: {e}");
+            return 1;
+        }
+    };
+    println!(
+        "{:<8} {:>7} {:>7} {:<8} {:>8} CMD",
+        "UID", "PID", "PPID", "TTY", "TIME"
+    );
+    for p in procs {
+        println!(
+            "{:<8} {:>7} {:>7} {:<8} {:>8} {}",
+            p.uid, p.pid, p.ppid, p.tty, p.cpu_time, p.cmd
+        );
+    }
+    0
+}
+
 fn cmd_exec(args: &[String]) -> i32 {
     let mut env_extra: Vec<String> = Vec::new();
     let mut workdir: Option<String> = None;
@@ -2973,6 +3213,10 @@ USAGE:\n  \
   zerun rm [-f] CONTAINER...            remove stopped containers (-f: kill first)\n  \
   zerun logs [--tail N] [-f] [-t] CONTAINER  show a container's console.log\n  \
   zerun stats [-a] [CONTAINER...]        one-shot resource metrics\n  \
+  zerun inspect CONTAINER...             dump container state as JSON\n  \
+  zerun port CONTAINER                   list published port mappings\n  \
+  zerun rename OLD NEW                   rename a container\n  \
+  zerun top CONTAINER                    list a container's processes\n  \
   zerun exec [-e K=V] [-w DIR] CONTAINER CMD [ARG...]\n  \
                                         run a command in a running container\n  \
   zerun pull [--platform ...] IMAGE...   pull OCI images (Docker Hub, mirrors)\n  \

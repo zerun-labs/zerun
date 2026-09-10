@@ -49,8 +49,9 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
 - **Secure defaults**: `PR_SET_NO_NEW_PRIVS`, capability bounding-set cleared, masked
   `/proc`/`/sys` paths, and a deny-by-default seccomp allowlist (opt out with
   `--seccomp unconfined`).
-- **Docker-compatible top 20% CLI**: `run / ps / wait / stop / restart / rm / logs / exec / pull /
-  push / tag / save / load / login / logout / images / rmi / commit / generate-service / doctor`.
+- **Docker-compatible top 20% CLI**: `run / ps / wait / stop / restart / rm / logs / exec / inspect /
+  port / rename / top / pull / push / tag / save / load / login / logout / images / rmi / commit /
+  generate-service / doctor`.
 
 ## Install
 

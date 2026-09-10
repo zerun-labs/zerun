@@ -312,6 +312,20 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Docker-compatible container-name validation:
+/// `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, 1..=128 characters.
+///
+/// Names are addressable on the CLI (`ps`/`logs`/`rename`), so rejecting
+/// shell-hostile characters at creation keeps every consumer predictable.
+pub fn valid_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (1..=128).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[1..]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
 /// Resolve a user-supplied container argument (`<id>`/`<id-prefix>`/`<name>`)
 /// against every state record.
 ///
@@ -422,6 +436,20 @@ mod tests {
         // The malformed rbps contributes no aggregate.
         assert_eq!(write, Some(13));
         assert_eq!(io_bytes(""), (None, None));
+    }
+
+    #[test]
+    fn container_name_validation() {
+        assert!(valid_name("web"));
+        assert!(valid_name("a1._-x"));
+        assert!(valid_name("0"));
+        assert!(valid_name(&"x".repeat(128)));
+        assert!(!valid_name(""));
+        assert!(!valid_name("-lead"));
+        assert!(!valid_name(".dot"));
+        assert!(!valid_name("has space"));
+        assert!(!valid_name("uni\u{2026}code"));
+        assert!(!valid_name(&"x".repeat(129)));
     }
 
     #[test]
