@@ -3522,13 +3522,52 @@ fn cmd_import(args: &[String]) -> i32 {
 /// states' own timestamps. The first snapshot is silent, like
 /// `docker events` live mode.
 fn cmd_events(args: &[String]) -> i32 {
-    if let Some(a) = args.first() {
-        if a == "-h" || a == "--help" {
-            println!("usage: zerun events");
-            return 0;
+    let mut filters: Vec<events::EventFilter> = Vec::new();
+    let mut since = None;
+    let mut until = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                println!("usage: zerun events [--filter KEY=VALUE] [--since TIME] [--until TIME]");
+                return 0;
+            }
+            "--filter" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    eprintln!("zerun events: --filter requires KEY=VALUE");
+                    return 2;
+                };
+                let Some((key, selector)) = value.split_once('=') else {
+                    eprintln!("zerun events: --filter requires KEY=VALUE");
+                    return 2;
+                };
+                let mut filter = events::EventFilter::default();
+                if let Err(e) = filter.set(key, selector) {
+                    eprintln!("zerun events: {e}");
+                    return 2;
+                }
+                filters.push(filter);
+            }
+            "--since" | "--until" => {
+                let is_since = args[i] == "--since";
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    eprintln!("zerun events: {} requires an RFC3339 time", args[i - 1]);
+                    return 2;
+                };
+                if is_since {
+                    since = Some(value.as_str());
+                } else {
+                    until = Some(value.as_str());
+                }
+            }
+            other => {
+                eprintln!("zerun events: unknown option {other}");
+                return 2;
+            }
         }
-        eprintln!("zerun events: unknown option {a}");
-        return 2;
+        i += 1;
     }
     let store = match Store::detect() {
         Ok(s) => s,
@@ -3541,11 +3580,20 @@ fn cmd_events(args: &[String]) -> i32 {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let mut previous = state::list(&store);
+    if since.is_some() || until.is_some() {
+        // Time-bounded output is deliberately replayable: reconstruct the
+        // history of the current records before entering live-follow mode.
+        previous = Vec::new();
+    }
     loop {
         std::thread::sleep(Duration::from_millis(200));
         let current = state::list(&store);
         for event in events::diff_events(&previous, &current) {
-            let _ = writeln!(out, "{}", events::format_event(&event));
+            let event = events::select_events(vec![event], &filters, since, until);
+            let Some(event) = event.first() else {
+                continue;
+            };
+            let _ = writeln!(out, "{}", events::format_event(event));
         }
         let _ = out.flush();
         previous = current;
@@ -3960,7 +4008,8 @@ USAGE:\n  \
   zerun cp SRC DST                       copy files to/from a running container\n  \
   zerun export [-o FILE] CONTAINER       export a container rootfs as tar\n  \
   zerun import [-m MSG] FILE|- TARGET    import a rootfs tar as a local image\n  \
-  zerun events                           stream container lifecycle events\n  \
+  zerun events [--filter KEY=VALUE] [--since TIME] [--until TIME]\n  \
+                                         stream/replay container lifecycle events\n  \
   zerun attach CONTAINER                 stream a detached container's output\n  \
   zerun exec [-e K=V] [-w DIR] CONTAINER CMD [ARG...]\n  \
                                         run a command in a running container\n  \

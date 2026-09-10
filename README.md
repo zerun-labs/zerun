@@ -258,6 +258,10 @@ Use `exec` for interactive input.
 `commit` produces a single-layer OCI image from the container rootfs. Exited detached
 containers retain their writable layer until `rm`; `--rm` still removes it on exit.
 
+`events` follows lifecycle changes without a daemon. Repeated `--filter action=die`,
+`--filter container=web`, `--filter image=alpine`, and `--filter exitCode=0` selectors are
+ANDed; `--since`/`--until` accept RFC3339 UTC times and first replay matching history.
+
 ### systemd integration (M6)
 
 Generate a declarative systemd unit from the same arguments you would pass to `run`.

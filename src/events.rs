@@ -23,6 +23,105 @@ pub struct Event {
     pub detail: Option<String>,
 }
 
+/// Client-side selection rules for the daemonless event poll.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EventFilter {
+    action: Option<String>,
+    container: Option<String>,
+    name: Option<String>,
+    image: Option<String>,
+    exit_code: Option<i32>,
+}
+
+impl EventFilter {
+    /// Set one Docker-style `key=value` selector.
+    pub fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
+        let invalid = |what: &str| Err(format!("invalid {what}: {value:?}"));
+        match key {
+            "action" | "event" => {
+                self.action = Some(value.to_string());
+                Ok(())
+            }
+            "container" => {
+                if value.is_empty() {
+                    return invalid("container");
+                }
+                self.container = Some(value.to_string());
+                Ok(())
+            }
+            "name" => {
+                if value.is_empty() {
+                    return invalid("name");
+                }
+                self.name = Some(value.to_string());
+                Ok(())
+            }
+            "image" => {
+                if value.is_empty() {
+                    return invalid("image");
+                }
+                self.image = Some(value.to_string());
+                Ok(())
+            }
+            "exitCode" => match value.parse::<i32>() {
+                Ok(code) => {
+                    self.exit_code = Some(code);
+                    Ok(())
+                }
+                Err(_) => invalid("exit code"),
+            },
+            _ => Err(format!("unknown event filter {key:?}")),
+        }
+    }
+
+    fn matches(&self, event: &Event) -> bool {
+        let action_ok = self
+            .action
+            .as_ref()
+            .is_none_or(|want| event.action == want.as_str());
+        let container_ok = self.container.as_ref().is_none_or(|want| {
+            event.id == *want
+                || event.id.starts_with(want)
+                || event.name.as_deref() == Some(want.as_str())
+        });
+        let name_ok = self
+            .name
+            .as_ref()
+            .is_none_or(|want| event.name.as_deref() == Some(want.as_str()));
+        let image_ok = self.image.as_ref().is_none_or(|want| event.image == *want);
+        let exit_ok = self.exit_code.as_ref().is_none_or(|want| {
+            event
+                .detail
+                .as_deref()
+                .and_then(|detail| detail.strip_prefix("exitCode="))
+                .and_then(|code| code.parse::<i32>().ok())
+                == Some(*want)
+        });
+        action_ok && container_ok && name_ok && image_ok && exit_ok
+    }
+}
+
+/// Include only events whose timestamp is in `[since, until]`. State
+/// timestamps are normalized RFC3339 UTC, so lexical order matches time order.
+fn in_time_range(event: &Event, since: Option<&str>, until: Option<&str>) -> bool {
+    since.is_none_or(|since| event.at.as_str() >= since)
+        && until.is_none_or(|until| event.at.as_str() <= until)
+}
+
+/// Apply every filter (AND) and the inclusive timestamp range.
+pub fn select_events(
+    events: Vec<Event>,
+    filters: &[EventFilter],
+    since: Option<&str>,
+    until: Option<&str>,
+) -> Vec<Event> {
+    events
+        .into_iter()
+        .filter(|event| {
+            in_time_range(event, since, until) && filters.iter().all(|filter| filter.matches(event))
+        })
+        .collect()
+}
 /// Render an event in a Docker-events-like one-line format.
 pub fn format_event(event: &Event) -> String {
     let mut line = format!(
@@ -230,5 +329,39 @@ mod tests {
             line,
             "2026-09-10T00:00:05Z container die (id=abc123def456, image=alpine, name=web, exitCode=3)"
         );
+    }
+
+    #[test]
+    fn event_filters_match_precise_and_container_prefixes() {
+        let st = state("abc123def456", Some("web"), Status::Exited, Some(3));
+        let events = diff_events(&[], &[st]);
+
+        let mut filter = EventFilter::default();
+        filter.set("action", "die").unwrap();
+        filter.set("container", "abc").unwrap();
+        assert_eq!(
+            select_events(events.clone(), &[filter], None, None).len(),
+            1
+        );
+
+        let mut filter = EventFilter::default();
+        filter.set("exitCode", "4").unwrap();
+        assert!(select_events(events.clone(), &[filter], None, None).is_empty());
+
+        let mut filter = EventFilter::default();
+        assert!(filter.set("type", "container").is_err());
+    }
+
+    #[test]
+    fn event_time_ranges_are_inclusive() {
+        let st = state("abc123def456", Some("web"), Status::Exited, Some(3));
+        let events = diff_events(&[], &[st]);
+        let die_at = events[2].at.clone();
+
+        assert_eq!(
+            select_events(events.clone(), &[], Some(&die_at), Some(&die_at)).len(),
+            1
+        );
+        assert!(select_events(events, &[], Some("9999"), None).is_empty());
     }
 }
