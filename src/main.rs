@@ -57,6 +57,7 @@ fn main() {
         Some("rm") => cmd_rm(&args[2..]),
         Some("logs") => cmd_logs(&args[2..]),
         Some("stats") => cmd_stats(&args[2..]),
+        Some("update") => cmd_update(&args[2..]),
         Some("inspect") => cmd_inspect(&args[2..]),
         Some("port") => cmd_port(&args[2..]),
         Some("rename") => cmd_rename(&args[2..]),
@@ -2682,6 +2683,162 @@ fn human_duration(usec: u64) -> String {
     }
 }
 
+/// `zerun update [opts] CONTAINER` — change cgroup v2 limits of a running
+/// container in place (memory, memory-reservation, cpus, pids, oom-group).
+///
+/// The container must have been started with at least one resource flag so
+/// its cgroup exists; otherwise there is nothing to update and `restart`
+/// with the desired flags is the safe path. I/O ceilings are not yet
+/// updatable (io.max merges device state), and `restart` reverts to the
+/// launch-time limits captured in `launch_args`.
+fn cmd_update(args: &[String]) -> i32 {
+    let mut limits = cgroup::ResourceLimits::default();
+    let mut targets: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "-h" | "--help" => {
+                println!(
+                    "usage: zerun update [--memory SIZE] [--memory-reservation SIZE] \
+                     [--cpus N] [--pids N] [--oom-group] CONTAINER"
+                );
+                return 0;
+            }
+            "-m" | "--memory" => match next_value(args, &mut i, a) {
+                Ok(v) => {
+                    limits.memory = Some(v);
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("zerun update: {e}");
+                    return 2;
+                }
+            },
+            "--memory-reservation" => match next_value(args, &mut i, a) {
+                Ok(v) => {
+                    limits.memory_reservation = Some(v);
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("zerun update: {e}");
+                    return 2;
+                }
+            },
+            "--cpus" => match next_value(args, &mut i, a) {
+                Ok(v) => match v.parse::<f64>() {
+                    Ok(c) if c > 0.0 => {
+                        limits.cpus = Some(c);
+                        continue;
+                    }
+                    _ => {
+                        eprintln!("zerun update: --cpus expects a positive number, got '{v}'");
+                        return 2;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("zerun update: {e}");
+                    return 2;
+                }
+            },
+            "--pids" => match next_value(args, &mut i, a) {
+                Ok(v) => match v.parse::<i64>() {
+                    Ok(p) if p > 0 => {
+                        limits.pids = Some(p);
+                        continue;
+                    }
+                    _ => {
+                        eprintln!("zerun update: --pids expects a positive integer, got '{v}'");
+                        return 2;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("zerun update: {e}");
+                    return 2;
+                }
+            },
+            "--oom-group" => {
+                limits.oom_group = true;
+                i += 1;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun update: unknown option {other}");
+                return 2;
+            }
+            other => {
+                targets.push(other);
+                i += 1;
+            }
+        }
+    }
+    if targets.len() != 1 {
+        eprintln!("usage: zerun update [opts] CONTAINER");
+        return 2;
+    }
+    if limits.memory.is_none()
+        && limits.memory_reservation.is_none()
+        && limits.cpus.is_none()
+        && limits.pids.is_none()
+        && !limits.oom_group
+    {
+        eprintln!("zerun update: provide at least one limit to change");
+        return 2;
+    }
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let mut st = match state::resolve(&store, targets[0]) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun update: {e}");
+            return 1;
+        }
+    };
+    if lifecycle::reconcile_stale(&store, &mut st) {
+        let _ = st.save();
+    }
+    if st.status != state::Status::Running || !st.pid_alive() {
+        eprintln!(
+            "zerun update: container {} is not running",
+            display_name(&st)
+        );
+        return 1;
+    }
+    let Some(cgroup_path) = st.cgroup.clone() else {
+        eprintln!(
+            "zerun update: container {} has no cgroup (started without resource limits); \
+             restart it with the desired flags instead",
+            display_name(&st)
+        );
+        return 1;
+    };
+    let cg = match cgroup::CgroupV2::open(Path::new(&cgroup_path)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("zerun update: {e}");
+            return 1;
+        }
+    };
+    // The parent zerun cgroup is required by the io controller check inside
+    // apply; recompute it from the cgroup v2 root.
+    let parent = match cgroup::detect_cgroup2_root() {
+        Ok(root) => root.join("zerun"),
+        Err(e) => {
+            eprintln!("zerun update: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = cg.apply_limits(&parent, &limits) {
+        eprintln!("zerun update: {e}");
+        return 1;
+    }
+    0
+}
+
 /// `zerun inspect CONTAINER...` — dump state records as pretty JSON.
 ///
 /// The output is the raw on-disk `state.json` (plus crash reconciliation),
@@ -3701,6 +3858,7 @@ USAGE:\n  \
   zerun rm [-f] CONTAINER...            remove stopped containers (-f: kill first)\n  \
   zerun logs [--tail N] [-f] [-t] CONTAINER  show a container's console.log\n  \
   zerun stats [-a] [CONTAINER...]        one-shot resource metrics\n  \
+  zerun update [opts] CONTAINER          change live resource limits\n  \
   zerun inspect CONTAINER...             dump container state as JSON\n  \
   zerun port CONTAINER                   list published port mappings\n  \
   zerun rename OLD NEW                   rename a container\n  \

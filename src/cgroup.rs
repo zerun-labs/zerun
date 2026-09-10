@@ -60,35 +60,51 @@ impl CgroupV2 {
         })?;
         enable_controllers(&parent, &["memory", "cpu", "pids", "io"])?;
         let cg = CgroupV2 { path };
+        cg.apply_limits(&parent, limits)?;
+        trace::mark("parent:cgroup:configured");
+        Ok(cg)
+    }
 
+    /// Open an existing cgroup directory (for `zerun update`).
+    pub fn open(path: &Path) -> ZResult<Self> {
+        if !path.is_dir() {
+            return Err(crate::zerr!("cgroup {} does not exist", path.display()));
+        }
+        Ok(CgroupV2 {
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Write every provided limit onto this cgroup (shared by create and
+    /// `zerun update`).
+    pub fn apply_limits(&self, parent: &Path, limits: &ResourceLimits) -> ZResult<()> {
         if let Some(mem) = &limits.memory {
             let bytes = parse_size(mem)?;
-            cg.write("memory.max", bytes.to_string())?;
+            self.write("memory.max", bytes.to_string())?;
             // Lock swap to the same ceiling so memory limits cannot be bypassed.
-            let _ = cg.write("memory.swap.max", bytes.to_string());
+            let _ = self.write("memory.swap.max", bytes.to_string());
         }
         if let Some(high) = &limits.memory_reservation {
             let bytes = parse_size(high)?;
-            cg.write("memory.high", bytes.to_string())?;
+            self.write("memory.high", bytes.to_string())?;
         }
         if let Some(cpus) = limits.cpus {
             if cpus > 0.0 {
                 let quota = (cpus * 100_000.0).round() as i64;
-                cg.write("cpu.max", format!("{quota} 100000"))?;
+                self.write("cpu.max", format!("{quota} 100000"))?;
             }
         }
         if let Some(pids) = limits.pids {
-            cg.write("pids.max", pids.to_string())?;
+            self.write("pids.max", pids.to_string())?;
         }
         if !limits.io.is_empty() {
-            require_controller(&parent, "io")?;
-            cg.write("io.max", io_max_value(&limits.io))?;
+            require_controller(parent, "io")?;
+            self.write("io.max", io_max_value(&limits.io))?;
         }
         if limits.oom_group {
-            cg.write("memory.oom.group", "1".to_string())?;
+            self.write("memory.oom.group", "1".to_string())?;
         }
-        trace::mark("parent:cgroup:configured");
-        Ok(cg)
+        Ok(())
     }
 
     /// Absolute path of this cgroup directory (used by lifecycle state).
@@ -330,6 +346,14 @@ fn parse_size(s: &str) -> ZResult<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_rejects_missing_cgroup_dir() {
+        let missing =
+            std::env::temp_dir().join(format!("zerun-cgroup-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(CgroupV2::open(&missing).is_err());
+    }
 
     #[test]
     fn parses_device_io_limits() {
