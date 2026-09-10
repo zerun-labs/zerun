@@ -136,6 +136,8 @@ Run options (current subset):
 --memory-reservation 64M
                      cgroup v2 memory.high soft limit
 --cpus 0.5           cgroup v2 cpu.max (cores)
+--cpuset-cpus 0-3    pin CPUs (cgroups v2 cpuset.cpus)
+--cpuset-mems 0      pin memory nodes (cgroups v2 cpuset.mems)
 --pids 256           cgroup v2 pids.max
 --oom-group          kill the whole cgroup on OOM
 --device-read-bps DEV:RATE    cgroup v2 io.max (e.g. /dev/sda:10mb)

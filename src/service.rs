@@ -63,6 +63,14 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--cpus".into());
         run_args.push(v.to_string());
     }
+    if let Some(v) = &a.cpuset_cpus {
+        run_args.push("--cpuset-cpus".into());
+        run_args.push(v.clone());
+    }
+    if let Some(v) = &a.cpuset_mems {
+        run_args.push("--cpuset-mems".into());
+        run_args.push(v.clone());
+    }
     if let Some(v) = a.pids {
         run_args.push("--pids".into());
         run_args.push(v.to_string());
@@ -372,6 +380,7 @@ fn quote_environment(value: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     fn args(values: &[&str]) -> RunArgs {
         let owned: Vec<String> = values.iter().map(|s| s.to_string()).collect();
@@ -394,6 +403,21 @@ mod tests {
         assert!(unit.contains("alpine -- echo hello\n"));
         assert!(unit.contains("--publish 8080:80"));
         assert!(unit.contains("WantedBy=multi-user.target"));
+    }
+
+    #[test]
+    fn renders_cpuset_limits() {
+        let a = args(&[
+            "--cpuset-cpus",
+            "0-1",
+            "--cpuset-mems",
+            "0",
+            "alpine",
+            "true",
+        ]);
+        let unit = render(&PathBuf::from("/usr/local/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains("--cpuset-cpus 0-1"));
+        assert!(unit.contains("--cpuset-mems 0"));
     }
 
     #[test]

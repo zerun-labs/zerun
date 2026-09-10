@@ -19,6 +19,10 @@ pub struct ResourceLimits {
     pub memory_reservation: Option<String>,
     /// CPU cores (fractional), e.g. 0.5 -> cpu.max "50000 100000".
     pub cpus: Option<f64>,
+    /// CPU list bound to `cpuset.cpus`, e.g. "0-3" or "0,2".
+    pub cpuset_cpus: Option<String>,
+    /// Memory-node list bound to `cpuset.mems`, e.g. "0".
+    pub cpuset_mems: Option<String>,
     /// Process count limit pids.max (default suggestion for low-end hosts: 256).
     pub pids: Option<i64>,
     /// Block I/O limits for cgroups v2 `io.max`, grouped by device on write.
@@ -58,7 +62,7 @@ impl CgroupV2 {
                 path.display()
             )
         })?;
-        enable_controllers(&parent, &["memory", "cpu", "pids", "io"])?;
+        enable_controllers(&parent, &["memory", "cpu", "pids", "io", "cpuset"])?;
         let cg = CgroupV2 { path };
         cg.apply_limits(&parent, limits)?;
         trace::mark("parent:cgroup:configured");
@@ -93,6 +97,14 @@ impl CgroupV2 {
                 let quota = (cpus * 100_000.0).round() as i64;
                 self.write("cpu.max", format!("{quota} 100000"))?;
             }
+        }
+        if let Some(cpuset) = &limits.cpuset_cpus {
+            require_controller(parent, "cpuset")?;
+            self.write("cpuset.cpus", cpuset.clone())?;
+        }
+        if let Some(mems) = &limits.cpuset_mems {
+            require_controller(parent, "cpuset")?;
+            self.write("cpuset.mems", mems.clone())?;
         }
         if let Some(pids) = limits.pids {
             self.write("pids.max", pids.to_string())?;
@@ -259,6 +271,38 @@ fn parse_positive_byte_size(value: &str) -> ZResult<u64> {
     Ok(bytes)
 }
 
+/// Validate a cgroups v2 CPU/memory-node list (`cpuset.cpus` or `cpuset.mems`).
+/// Kernel bounds are checked by cgroupfs; this catches malformed values early
+/// and keeps whitespace/control characters out of service arguments.
+pub fn parse_cpuset(value: &str) -> ZResult<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(crate::zerr!("cpuset list cannot be empty"));
+    }
+    let valid_group = |group: &str| {
+        let (start, end) = match group.split_once('-') {
+            Some((start, end)) => (start, end),
+            None => (group, group),
+        };
+        let parsed = |s: &str| -> Option<u64> {
+            if s.is_empty() || s.len() > 20 || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            s.parse::<u64>().ok()
+        };
+        matches!(
+            (parsed(start), parsed(end)),
+            (Some(start), Some(end)) if start <= end
+        )
+    };
+    if !value.split(',').all(valid_group) {
+        return Err(crate::zerr!(
+            "invalid cpuset list '{value}' (expected N, N-M, or comma-separated groups)"
+        ));
+    }
+    Ok(value.to_string())
+}
+
 fn require_controller(parent: &Path, controller: &str) -> ZResult<()> {
     let available = fs::read_to_string(parent.join("cgroup.controllers"))
         .map_err(|e| crate::zerr!("read {}: {e}", parent.join("cgroup.controllers").display()))?;
@@ -353,6 +397,18 @@ mod tests {
             std::env::temp_dir().join(format!("zerun-cgroup-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&missing);
         assert!(CgroupV2::open(&missing).is_err());
+    }
+
+    #[test]
+    fn parses_cpu_and_memory_node_lists() {
+        assert_eq!(parse_cpuset("0").unwrap(), "0");
+        assert_eq!(parse_cpuset("0-3,8").unwrap(), "0-3,8");
+        assert_eq!(parse_cpuset(" 1,2-4 ").unwrap(), "1,2-4");
+        assert!(parse_cpuset("").is_err());
+        assert!(parse_cpuset("4-2").is_err());
+        assert!(parse_cpuset("0,,2").is_err());
+        assert!(parse_cpuset("0-").is_err());
+        assert!(parse_cpuset("0;2").is_err());
     }
 
     #[test]

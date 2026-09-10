@@ -121,6 +121,8 @@ struct RunArgs {
     memory: Option<String>,
     memory_reservation: Option<String>,
     cpus: Option<f64>,
+    cpuset_cpus: Option<String>,
+    cpuset_mems: Option<String>,
     pids: Option<i64>,
     oom_group: bool,
     device_read_bps: Vec<cgroup::IoLimit>,
@@ -186,9 +188,19 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             "--cpus" => {
                 let v = next_value(args, &mut i, "--cpus")?;
                 a.cpus = Some(
-                    v.parse()
-                        .map_err(|_| format!("invalid --cpus value '{v}'"))?,
+                    v.parse::<f64>()
+                        .ok()
+                        .filter(|c| *c > 0.0)
+                        .ok_or_else(|| format!("invalid --cpus value '{v}'"))?,
                 );
+            }
+            "--cpuset-cpus" => {
+                let v = next_value(args, &mut i, "--cpuset-cpus")?;
+                a.cpuset_cpus = Some(cgroup::parse_cpuset(&v).map_err(|e| e.to_string())?);
+            }
+            "--cpuset-mems" => {
+                let v = next_value(args, &mut i, "--cpuset-mems")?;
+                a.cpuset_mems = Some(cgroup::parse_cpuset(&v).map_err(|e| e.to_string())?);
             }
             "--pids" => {
                 let v = next_value(args, &mut i, "--pids")?;
@@ -634,6 +646,8 @@ fn cmd_run(args: &[String]) -> i32 {
             memory: a.memory,
             memory_reservation: a.memory_reservation,
             cpus: a.cpus,
+            cpuset_cpus: a.cpuset_cpus,
+            cpuset_mems: a.cpuset_mems,
             pids: a.pids,
             oom_group: a.oom_group,
             io: [
@@ -890,6 +904,12 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     }
     if let Some(v) = a.cpus {
         args.extend(["--cpus".to_string(), v.to_string()]);
+    }
+    if let Some(v) = &a.cpuset_cpus {
+        args.extend(["--cpuset-cpus".to_string(), v.clone()]);
+    }
+    if let Some(v) = &a.cpuset_mems {
+        args.extend(["--cpuset-mems".to_string(), v.clone()]);
     }
     if let Some(v) = a.pids {
         args.extend(["--pids".to_string(), v.to_string()]);
@@ -3102,7 +3122,7 @@ fn human_duration(usec: u64) -> String {
 }
 
 /// `zerun update [opts] CONTAINER` — change cgroup v2 limits of a running
-/// container in place (memory, memory-reservation, cpus, pids, oom-group).
+/// container in place (memory, CPU, cpuset, pids, oom-group).
 ///
 /// The container must have been started with at least one resource flag so
 /// its cgroup exists; otherwise there is nothing to update and `restart`
@@ -3119,7 +3139,8 @@ fn cmd_update(args: &[String]) -> i32 {
             "-h" | "--help" => {
                 println!(
                     "usage: zerun update [--memory SIZE] [--memory-reservation SIZE] \
-                     [--cpus N] [--pids N] [--oom-group] CONTAINER"
+                     [--cpuset-cpus LIST] [--cpuset-mems LIST] [--pids N] \
+                     [--oom-group] CONTAINER"
                 );
                 return 0;
             }
@@ -3151,6 +3172,38 @@ fn cmd_update(args: &[String]) -> i32 {
                     }
                     _ => {
                         eprintln!("zerun update: --cpus expects a positive number, got '{v}'");
+                        return 2;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("zerun update: {e}");
+                    return 2;
+                }
+            },
+            "--cpuset-cpus" => match next_value(args, &mut i, a) {
+                Ok(v) => match cgroup::parse_cpuset(&v) {
+                    Ok(list) => {
+                        limits.cpuset_cpus = Some(list);
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("zerun update: invalid --cpuset-cpus '{v}': {e}");
+                        return 2;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("zerun update: {e}");
+                    return 2;
+                }
+            },
+            "--cpuset-mems" => match next_value(args, &mut i, a) {
+                Ok(v) => match cgroup::parse_cpuset(&v) {
+                    Ok(list) => {
+                        limits.cpuset_mems = Some(list);
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("zerun update: invalid --cpuset-mems '{v}': {e}");
                         return 2;
                     }
                 },
@@ -3196,6 +3249,8 @@ fn cmd_update(args: &[String]) -> i32 {
     if limits.memory.is_none()
         && limits.memory_reservation.is_none()
         && limits.cpus.is_none()
+        && limits.cpuset_cpus.is_none()
+        && limits.cpuset_mems.is_none()
         && limits.pids.is_none()
         && !limits.oom_group
     {
@@ -4517,6 +4572,8 @@ RUN OPTIONS:\n  \
   -m, --memory 64M    cgroup v2 memory.max (K/M/G suffixes)\n  \
   --memory-reservation 64M    cgroup v2 memory.high soft limit\n  \
   --cpus 0.5          cgroup v2 cpu.max (cores)\n  \
+  --cpuset-cpus 0-3   pin CPUs (cgroups v2 cpuset.cpus)\n  \
+  --cpuset-mems 0     pin memory nodes (cgroups v2 cpuset.mems)\n  \
   --pids 256          cgroup v2 pids.max\n  \
   --oom-group         kill the whole cgroup on OOM (memory.oom.group)\n  \
   --device-read-bps DEV:BYTES    cgroup v2 io.max read rate (repeatable)\n  \
@@ -4875,6 +4932,35 @@ mod tests {
 
         assert!(cgroup::parse_io_limit("device-read-bps", "8:48:0").is_err());
         assert!(cgroup::parse_io_limit("device-read-iops", "bad:1").is_err());
+    }
+
+    #[test]
+    fn parses_and_launches_cpuset_limits() {
+        let args: Vec<_> = [
+            "--cpus",
+            "0.5",
+            "--cpuset-cpus",
+            "0-3,8",
+            "--cpuset-mems",
+            "0",
+            "alpine",
+            "true",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_run_args(&args).expect("valid cpuset flags");
+        assert_eq!(a.cpus, Some(0.5));
+        assert_eq!(a.cpuset_cpus.as_deref(), Some("0-3,8"));
+        assert_eq!(a.cpuset_mems.as_deref(), Some("0"));
+        let launch_args = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+        assert!(launch_args.contains(&"--cpus".to_string()));
+        assert!(launch_args.contains(&"0.5".to_string()));
+        assert!(launch_args.contains(&"--cpuset-cpus".to_string()));
+        assert!(launch_args.contains(&"0-3,8".to_string()));
+        assert!(launch_args.contains(&"--cpuset-mems".to_string()));
+        assert!(launch_args.contains(&"0".to_string()));
+        assert!(cgroup::parse_cpuset("4-2").is_err());
     }
 
     #[test]

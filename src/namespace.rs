@@ -137,6 +137,8 @@ where
     let has_limits = spec.limits.memory.is_some()
         || spec.limits.memory_reservation.is_some()
         || spec.limits.cpus.is_some()
+        || spec.limits.cpuset_cpus.is_some()
+        || spec.limits.cpuset_mems.is_some()
         || spec.limits.pids.is_some()
         || spec.limits.oom_group
         || !spec.limits.io.is_empty();
