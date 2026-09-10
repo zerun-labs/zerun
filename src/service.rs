@@ -11,7 +11,7 @@
 //! `/run` (which does not survive a reboot).
 use crate::namespace::NetMode;
 use crate::seccomp::SeccompMode;
-use crate::RunArgs;
+use crate::{PullPolicy, RunArgs};
 use std::io::Write;
 use std::path::Path;
 
@@ -146,6 +146,18 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--platform".into());
         run_args.push(v.clone());
     }
+    if let Some(v) = &a.entrypoint {
+        run_args.push("--entrypoint".into());
+        run_args.push(v.clone());
+    }
+    if let Some(v) = &a.workdir {
+        run_args.push("--workdir".into());
+        run_args.push(v.clone());
+    }
+    if a.pull != PullPolicy::Missing {
+        run_args.push("--pull".into());
+        run_args.push(a.pull.label().into());
+    }
     for v in &a.env {
         run_args.push("--env".into());
         run_args.push(v.clone());
@@ -276,6 +288,15 @@ fn validate(a: &RunArgs) -> Result<(), String> {
     }
     if a.rootfs.is_some() && !a.env.is_empty() {
         return Err("-e/--env requires image mode (drop --rootfs)".into());
+    }
+    if a.rootfs.is_some() && a.entrypoint.is_some() {
+        return Err("--entrypoint requires image mode (drop --rootfs)".into());
+    }
+    if a.rootfs.is_some() && a.pull != PullPolicy::Missing {
+        return Err("--pull requires image mode (drop --rootfs)".into());
+    }
+    if a.workdir.as_deref() == Some("") {
+        return Err("--workdir cannot be empty".into());
     }
     if a.rootfs.is_none() && a.image.is_none() {
         return Err("an IMAGE (or --rootfs DIR for legacy mode) is required".into());
@@ -436,6 +457,25 @@ mod tests {
         generate(&a, &mut out).unwrap();
         let unit = String::from_utf8(out).unwrap();
         assert!(unit.contains("--label tier=prod"));
+    }
+
+    #[test]
+    fn renders_image_command_overrides() {
+        let a = args(&[
+            "--entrypoint",
+            "/bin/sh",
+            "--workdir",
+            "/srv/app",
+            "--pull",
+            "never",
+            "alpine",
+            "-c",
+            "echo hi",
+        ]);
+        let unit = render(Path::new("/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains(" --entrypoint /bin/sh "));
+        assert!(unit.contains(" --workdir /srv/app "));
+        assert!(unit.contains(" --pull never "));
     }
 
     #[test]

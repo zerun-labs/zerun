@@ -148,6 +148,12 @@ struct RunArgs {
     /// `--tmpfs PATH[:opts]`: extra in-container tmpfs mounts.
     tmpfs: Vec<mounts::TmpfsMount>,
     platform: Option<String>,
+    /// Override the image `ENTRYPOINT`; an empty string resets it.
+    entrypoint: Option<String>,
+    /// Override the image `WorkingDir`.
+    workdir: Option<String>,
+    /// Whether `run IMAGE` may use a local image or must contact the registry.
+    pull: PullPolicy,
     env: Vec<String>,
     ports: Vec<network::PublishedPort>,
     volumes: Vec<mounts::BindMount>,
@@ -164,6 +170,38 @@ struct RunArgs {
     name: Option<String>,
     /// `--rm`: remove state + overlay automatically when the container exits.
     rm: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PullPolicy {
+    /// Use a local image when present, otherwise pull it.
+    #[default]
+    Missing,
+    /// Always resolve the tag and refresh the local image.
+    Always,
+    /// Never contact a registry.
+    Never,
+}
+
+impl PullPolicy {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "missing" => Ok(Self::Missing),
+            "always" => Ok(Self::Always),
+            "never" => Ok(Self::Never),
+            other => Err(format!(
+                "invalid --pull value '{other}' (missing|always|never)"
+            )),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
 }
 
 /// Parse `run` arguments. Two invocation styles:
@@ -278,6 +316,16 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             "--platform" => {
                 a.platform = Some(next_value(args, &mut i, "--platform")?);
             }
+            "--entrypoint" => {
+                a.entrypoint = Some(next_value(args, &mut i, "--entrypoint")?);
+            }
+            "--workdir" | "-w" => {
+                a.workdir = Some(next_value(args, &mut i, s)?);
+            }
+            "--pull" => {
+                let v = next_value(args, &mut i, "--pull")?;
+                a.pull = PullPolicy::parse(&v)?;
+            }
             "--env" | "-e" => {
                 a.env.push(next_value(args, &mut i, s)?);
             }
@@ -352,6 +400,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                     a.argv = rest[1..].to_vec();
                 }
                 i = args.len();
+            }
+            other if other.starts_with("--pull=") => {
+                a.pull = PullPolicy::parse(&other["--pull=".len()..])?;
+                i += 1;
             }
             other if other.starts_with("--") && other.len() > 2 => {
                 return Err(format!("unknown option {other}"));
@@ -538,6 +590,18 @@ fn cmd_run(args: &[String]) -> i32 {
         print_run_usage();
         return 2;
     }
+    if a.rootfs.is_some() && a.entrypoint.is_some() {
+        eprintln!("zerun run: --entrypoint requires image mode (drop --rootfs)");
+        return 2;
+    }
+    if a.rootfs.is_some() && a.pull != PullPolicy::Missing {
+        eprintln!("zerun run: --pull requires image mode (drop --rootfs)");
+        return 2;
+    }
+    if a.workdir.as_deref() == Some("") {
+        eprintln!("zerun run: --workdir cannot be empty");
+        return 2;
+    }
 
     let store = match Store::detect() {
         Ok(s) => s,
@@ -578,7 +642,14 @@ fn cmd_run(args: &[String]) -> i32 {
         if argv.is_empty() {
             argv = vec!["/bin/sh".to_string()];
         }
-        (rootfs, None, None, None, argv, a.labels.clone())
+        (
+            rootfs,
+            None,
+            a.workdir.clone(),
+            None,
+            argv,
+            a.labels.clone(),
+        )
     } else {
         let image = a.image.as_deref().expect("image required");
         let reference = match Reference::parse(image) {
@@ -588,18 +659,16 @@ fn cmd_run(args: &[String]) -> i32 {
                 return 2;
             }
         };
-        match resolve_run_image(&store, &reference, a.platform.as_deref()) {
+        match resolve_run_image(&store, &reference, a.platform.as_deref(), a.pull) {
             Ok((rootfs, cfg)) => {
                 let env =
                     build_image_env(&cfg.config.env, &a.env, a.hostname.as_deref(), &id, a.tty);
-                let argv = resolve_image_argv(&cfg, &a.argv);
+                let argv = resolve_image_argv(&cfg, a.entrypoint.as_deref(), &a.argv);
                 let mut labels = cfg.config.labels.clone();
                 labels.extend(a.labels.clone());
-                let cwd = if cfg.config.working_dir.is_empty() {
-                    None
-                } else {
-                    Some(cfg.config.working_dir.clone())
-                };
+                let cwd = a.workdir.clone().or_else(|| {
+                    (!cfg.config.working_dir.is_empty()).then(|| cfg.config.working_dir.clone())
+                });
                 let rootless = unsafe { libc::geteuid() } != 0;
                 let image_user = if cfg.config.user.is_empty() {
                     None
@@ -1014,6 +1083,15 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     if let Some(v) = &a.platform {
         args.extend(["--platform".to_string(), v.clone()]);
     }
+    if let Some(v) = &a.entrypoint {
+        args.extend(["--entrypoint".to_string(), v.clone()]);
+    }
+    if let Some(v) = &a.workdir {
+        args.extend(["--workdir".to_string(), v.clone()]);
+    }
+    if a.pull != PullPolicy::Missing {
+        args.extend(["--pull".to_string(), a.pull.label().to_string()]);
+    }
     for v in &a.env {
         args.extend(["--env".to_string(), v.clone()]);
     }
@@ -1396,15 +1474,28 @@ fn resolve_run_image(
     store: &Store,
     reference: &Reference,
     platform: Option<&str>,
+    pull: PullPolicy,
 ) -> Result<(PathBuf, image::config::ImageConfig), error::ZError> {
     let imgstore = image::store::ImageStore::open(store)?;
-    if let Some(found) = image::local_image(&imgstore, reference)? {
-        return Ok(found);
+    if pull != PullPolicy::Always {
+        if let Some(found) = image::local_image(&imgstore, reference)? {
+            return Ok(found);
+        }
     }
-    eprintln!(
-        "zerun: image {} not found locally, pulling...",
-        reference.canonical()
-    );
+    if pull == PullPolicy::Never {
+        return Err(crate::zerr!(
+            "image {} is not present locally and --pull=never was set",
+            reference.canonical()
+        ));
+    }
+    if pull == PullPolicy::Always {
+        eprintln!("zerun: refreshing image {}...", reference.canonical());
+    } else {
+        eprintln!(
+            "zerun: image {} not found locally, pulling...",
+            reference.canonical()
+        );
+    }
     let mut client = image::registry::RegistryClient::new();
     let opts = PullOptions {
         platform: platform.map(str::to_string),
@@ -1524,8 +1615,18 @@ fn upsert_env(env: &mut Vec<(String, String)>, key: String, value: String) {
 
 /// Combine image Entrypoint/Cmd with CLI arguments (docker semantics):
 /// CLI args replace Cmd but never Entrypoint; no CLI args run Entrypoint+Cmd.
-fn resolve_image_argv(cfg: &image::config::ImageConfig, cli: &[String]) -> Vec<String> {
-    let entry = &cfg.config.entrypoint;
+/// An explicit `--entrypoint` replaces the image entrypoint; an empty value
+/// resets it.
+fn resolve_image_argv(
+    cfg: &image::config::ImageConfig,
+    entrypoint: Option<&str>,
+    cli: &[String],
+) -> Vec<String> {
+    let entry = match entrypoint {
+        Some("") => Vec::new(),
+        Some(value) => vec![value.to_string()],
+        None => cfg.config.entrypoint.clone(),
+    };
     let cmd = &cfg.config.cmd;
     let mut argv: Vec<String> = Vec::new();
     if !cli.is_empty() {
@@ -4878,6 +4979,9 @@ RUN OPTIONS:\n  \
   --init              run the built-in mini-init (reap orphans + forward signals)\n  \
   --seccomp default|unconfined\n  \
   --platform os/arch[/variant]  pull/run a specific platform\n  \
+  --entrypoint CMD    override the image ENTRYPOINT (empty resets it)\n  \
+  -w, --workdir DIR   override the image WorkingDir\n  \
+  --pull POLICY       missing|always|never (default: missing)\n  \
   -e, --env NAME[=VALUE]  set a container environment variable (image mode)\n  \
   --no-overlay        pivot directly into the rootfs (no writable upper layer)\n  \
   --tmpfs-upper       keep the overlay writable layer in tmpfs (not committable)\n  \
@@ -5041,6 +5145,68 @@ mod tests {
                 "sleep",
                 "1"
             ]
+        );
+    }
+
+    #[test]
+    fn parses_entrypoint_workdir_and_pull_policy() {
+        let args: Vec<_> = [
+            "--entrypoint",
+            "",
+            "-w",
+            "/srv/app",
+            "--pull=always",
+            "alpine",
+            "echo",
+            "hi",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_run_args(&args).expect("valid image overrides");
+        assert_eq!(a.entrypoint.as_deref(), Some(""));
+        assert_eq!(a.workdir.as_deref(), Some("/srv/app"));
+        assert_eq!(a.pull, PullPolicy::Always);
+
+        let launch = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+        assert!(launch.windows(2).any(|pair| pair == ["--entrypoint", ""]));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--workdir", "/srv/app"]));
+        assert!(launch.windows(2).any(|pair| pair == ["--pull", "always"]));
+
+        let args: Vec<_> = ["--pull", "never", "alpine"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(parse_run_args(&args).unwrap().pull, PullPolicy::Never);
+        assert!(PullPolicy::parse("sometimes").is_err());
+    }
+
+    #[test]
+    fn image_argv_honors_entrypoint_override_and_reset() {
+        let cfg = image::config::ImageConfig::parse(
+            br#"{
+                "config": {
+                    "Entrypoint": ["/image-entry"],
+                    "Cmd": ["default-cmd"]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_image_argv(&cfg, None, &["cli".to_string()]),
+            vec!["/image-entry", "cli"]
+        );
+        assert_eq!(
+            resolve_image_argv(&cfg, Some("/override"), &["cli".to_string()]),
+            vec!["/override", "cli"]
+        );
+        assert_eq!(resolve_image_argv(&cfg, Some(""), &[]), vec!["default-cmd"]);
+        assert_eq!(
+            resolve_image_argv(&cfg, Some("/override"), &[]),
+            vec!["/override", "default-cmd"]
         );
     }
 

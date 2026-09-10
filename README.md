@@ -170,6 +170,9 @@ Run options (current subset):
 --init               run built-in mini-init (reap orphans, forward signals)
 --seccomp default|unconfined   seccomp policy (default: deny-by-default allowlist)
 --platform os/arch[/variant]   pull/run a specific platform
+--entrypoint CMD               override the image ENTRYPOINT (empty string resets it)
+-w, --workdir DIR              override the image WorkingDir
+--pull missing|always|never    image refresh policy (default: missing)
 -e, --env NAME[=VALUE]         set a container environment variable (image mode)
 --label KEY=VALUE             add container metadata (repeatable; overrides image labels)
 -v, --volume HOST|NAME:CONTAINER[:ro]
