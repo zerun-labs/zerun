@@ -24,6 +24,7 @@ mod network;
 mod nfnetlink;
 mod procinfo;
 mod prompt;
+mod psfilter;
 mod pty;
 mod seccomp;
 mod security;
@@ -42,6 +43,7 @@ use image::PullOptions;
 use logs::LogTimeFilter;
 use mounts::OverlayPaths;
 use namespace::{NetMode, RunSpec};
+use psfilter::PsFilter;
 use seccomp::SeccompMode;
 use state::ContainerState;
 use std::path::{Path, PathBuf};
@@ -2114,11 +2116,33 @@ fn cmd_doctor() -> i32 {
 
 fn cmd_ps(args: &[String]) -> i32 {
     let mut all = false;
-    for a in args {
-        match a.as_str() {
-            "-a" | "--all" => all = true,
+    let mut filter = PsFilter::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-a" | "--all" => {
+                all = true;
+                i += 1;
+            }
+            "-f" | "--filter" => {
+                let value = match next_value(args, &mut i, "--filter") {
+                    Ok(value) => value,
+                    Err(e) => {
+                        eprintln!("zerun ps: {e}");
+                        return 2;
+                    }
+                };
+                let Some((key, value)) = value.split_once('=') else {
+                    eprintln!("zerun ps: invalid --filter '{value}' (expected KEY=VALUE)");
+                    return 2;
+                };
+                if let Err(e) = filter.set(key, value) {
+                    eprintln!("zerun ps: {e}");
+                    return 2;
+                }
+            }
             "-h" | "--help" => {
-                println!("usage: zerun ps [-a]");
+                println!("usage: zerun ps [-a] [-f|--filter KEY=VALUE]...");
                 return 0;
             }
             other if other.starts_with('-') && other.len() > 1 => {
@@ -2146,7 +2170,10 @@ fn cmd_ps(args: &[String]) -> i32 {
         if lifecycle::reconcile_stale(&store, &mut st) {
             let _ = st.save();
         }
-        if !all && st.status != state::Status::Running {
+        if !all && !filter.widens_status() && st.status != state::Status::Running {
+            continue;
+        }
+        if !filter.matches(&st) {
             continue;
         }
         rows.push(ps_row(&st));
@@ -4374,7 +4401,7 @@ USAGE:\n  \
   zerun run [opts] IMAGE [CMD...]        run a container from an OCI image\n  \
   zerun run -d [--name N] [opts] IMAGE [CMD...]\n  \
                                         run detached (logs/ps/stop/rm/exec)\n  \
-  zerun ps [-a]                         list containers (detached)\n  \
+  zerun ps [-a] [-f KEY=VALUE]...       list filtered containers (detached)\n  \
   zerun wait CONTAINER...               block for detached containers to exit\n  \
   zerun stop [--time S] CONTAINER...    SIGTERM, then SIGKILL after the timeout\n  \
   zerun kill [--signal SIG] CONTAINER... signal detached containers (default KILL)\n  \

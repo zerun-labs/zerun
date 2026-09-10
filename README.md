@@ -34,7 +34,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   (pure netlink), `-p [ADDR:]HOST[:CONTAINER][/tcp|/udp]` publishing through a built-in userland
   proxy (Docker's docker-proxy in-binary), and `--dns` / host resolv.conf inheritance.
 - **M5 — detached lifecycle (done)**: `run -d` forks a tiny per-container reaper that
-  redirects stdio to `console.log` and persists state to disk; `ps [-a]`, `stop`, `restart`,
+  redirects stdio to `console.log` and persists state to disk; `ps [-a] [--filter KEY=VALUE]`, `stop`, `restart`,
   `rm`, `prune [-f]`, `logs [--since/--until/-f]`, `stats`, `exec`, `attach`, and `commit` address containers by id/name with crash reconcile
   of stale records; file-based IPAM; `--rm` for auto-removal (see AGENTS.md).
 
@@ -228,6 +228,9 @@ sudo target/release/zerun run -d --name web -p 18080:80 --net bridge --init \
   alpine /bin/sh -c 'while true; do echo hi | nc -l -p 80; done'
 
 sudo target/release/zerun ps                          # running containers
+sudo target/release/zerun ps -a --filter name=web     # inspect one container's records
+sudo target/release/zerun ps --filter status=exited   # exited detached containers
+sudo target/release/zerun ps --filter exitCode=0      # successful detached exits
 sudo target/release/zerun wait web                    # block until exit; prints the exit code
 sudo target/release/zerun logs --tail 20 web          # container console.log
 sudo target/release/zerun logs --since 10m web        # last ten minutes
@@ -274,6 +277,10 @@ Use `exec` for interactive input.
 `commit` produces a single-layer OCI image from the container rootfs. Exited detached
 containers retain their writable layer until `rm`; `--rm` still removes it on exit.
 
+`ps` supports repeated Docker-style filters, combined with AND:
+`status=created|running|exited`, `name=NAME`, `id=PREFIX`, `image=IMAGE`, `net=MODE`, and
+`exitCode=CODE`. An explicit non-running status or an exit-code filter also surfaces those
+records without `-a`; other filters narrow the normal running-only view unless `-a` is set.
 `events` follows lifecycle changes without a daemon. Repeated `--filter action=die`,
 `--filter container=web`, `--filter image=alpine`, and `--filter exitCode=0` selectors are
 ANDed; `--since`/`--until` accept RFC3339 UTC times and first replay matching history.
