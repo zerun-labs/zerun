@@ -139,6 +139,24 @@ pub fn mkdir_p(p: &Path) -> ZResult<()> {
 pub fn canonical_or_self(p: &Path) -> PathBuf {
     fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
+/// Recursively sum regular-file sizes under `path` (apparent bytes).
+///
+/// This is reporting metadata, not a cleanup primitive: symlinks count as zero
+/// and unreadable entries are skipped so a single mode-000 overlay workdir
+/// cannot make a diagnostic command fail.
+pub fn dir_size(path: &Path) -> u64 {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !meta.file_type().is_dir() {
+        return if meta.is_file() { meta.len() } else { 0 };
+    }
+    let Ok(rd) = fs::read_dir(path) else {
+        return 0;
+    };
+    rd.flatten().map(|entry| dir_size(&entry.path())).sum()
+}
+
 /// Render a byte count for humans ("3.7 MB"); used in CLI progress output.
 pub fn human_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
@@ -158,6 +176,27 @@ pub fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dir_size_skips_symlinks_and_errors() {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-dir-size-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("nested")).unwrap();
+        fs::write(dir.join("a"), [0_u8; 10]).unwrap();
+        fs::write(dir.join("nested/b"), [0_u8; 15]).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("missing"), dir.join("broken")).unwrap();
+
+        assert_eq!(dir_size(&dir), 25);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn human_size_rounds() {

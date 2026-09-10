@@ -52,7 +52,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   `--seccomp unconfined`).
 - **Docker-compatible top 20% CLI**: `run / ps / wait / stop / restart / rm / prune / logs / exec / inspect /
   port / rename / top / diff / cp / export / import / events / update / attach / kill / pull / push / tag / save / load /
-  login / logout / images / rmi / commit / generate-service / doctor`.
+  login / logout / images / rmi / commit / generate-service / system df / doctor`.
 
 ## Install
 
@@ -254,6 +254,7 @@ sudo target/release/zerun restart --time 3 web        # stop, then recreate from
 sudo target/release/zerun commit -m snapshot web web:snapshot
 sudo target/release/zerun rm web                      # remove the stopped container
 sudo target/release/zerun prune -f                    # remove all exited containers
+sudo target/release/zerun system df                   # image and container disk usage
 ```
 
 Detached containers keep no daemon: the per-container reaper is a tiny process that

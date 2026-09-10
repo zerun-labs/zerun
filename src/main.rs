@@ -82,6 +82,7 @@ fn main() {
         Some("images") => cmd_images(&args[2..]),
         Some("tag") => cmd_tag(&args[2..]),
         Some("rmi") => cmd_rmi(&args[2..]),
+        Some("system") => cmd_system(&args[2..]),
         Some("prune") => cmd_prune(&args[2..]),
         Some("push") => cmd_push(&args[2..]),
         Some("save") => cmd_save(&args[2..]),
@@ -2670,6 +2671,101 @@ fn stop_one(store: &Store, target: &str, timeout_secs: u64) -> Result<String, St
     Ok(name)
 }
 
+/// `zerun system` — top-level system diagnostics. Currently only `df`.
+fn cmd_system(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("df") => cmd_system_df(&args[1..]),
+        Some("-h" | "--help") | None => {
+            println!("usage: zerun system df");
+            0
+        }
+        Some(other) => {
+            eprintln!("zerun system: unknown subcommand '{other}'");
+            println!("usage: zerun system df");
+            2
+        }
+    }
+}
+
+/// `zerun system df` — summarize disk held by the image store and detached
+/// container records. Image usage is the real content-addressed blob and
+/// materialized-rootfs size. Container usage includes persisted state/log and
+/// any retained overlay; stopped records are considered reclaimable.
+fn cmd_system_df(args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("usage: zerun system df");
+        return 0;
+    }
+    if !args.is_empty() {
+        eprintln!("zerun system df: no options or arguments are accepted");
+        return 2;
+    }
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let imgstore = match image::store::ImageStore::open(&store) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun system df: {e}");
+            return 1;
+        }
+    };
+    let image_records = match imgstore.records() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("zerun system df: {e}");
+            return 1;
+        }
+    };
+    let image_bytes = fsutil::dir_size(&store.data_root().join("blobs"))
+        + fsutil::dir_size(&store.data_root().join("rootfs"));
+
+    let mut containers = 0;
+    let mut container_bytes = 0;
+    let mut reclaimable_bytes = 0;
+    for mut st in state::list(&store) {
+        if lifecycle::reconcile_stale(&store, &mut st) {
+            let _ = st.save();
+        }
+        let state_dir = state::ContainerState::dir(&store, &st.id);
+        let overlay_bytes = st
+            .overlay
+            .as_deref()
+            .map(|dir| fsutil::dir_size(Path::new(dir)))
+            .unwrap_or(0);
+        let bytes = fsutil::dir_size(&state_dir) + overlay_bytes;
+        containers += 1;
+        container_bytes += bytes;
+        if st.status != state::Status::Running {
+            reclaimable_bytes += bytes;
+        }
+    }
+
+    println!(
+        "{:<12} {:>7} {:>14} {:>14}",
+        "TYPE", "COUNT", "DISK USAGE", "RECLAIMABLE"
+    );
+    println!(
+        "{:<12} {:>7} {:>14} {:>14}",
+        "Images",
+        image_records.len(),
+        fsutil::human_size(image_bytes),
+        "0 B"
+    );
+    println!(
+        "{:<12} {:>7} {:>14} {:>14}",
+        "Containers",
+        containers,
+        fsutil::human_size(container_bytes),
+        fsutil::human_size(reclaimable_bytes)
+    );
+    0
+}
+
 /// `zerun prune` — remove every retained exited container. Stale Running
 /// records are reconciled first, so this is also the bulk crash-recovery path.
 /// Live containers are deliberately never touched.
@@ -4588,7 +4684,7 @@ USAGE:\n  \
   zerun logout [REGISTRY]               remove stored registry credentials\n  \
   zerun images                           list local images\n  \
   zerun rmi IMAGE...                     remove local images\n  \
-  zerun prune [-f]                       remove all exited containers\n  \
+  zerun system df                        summarize image/container disk usage\n  \
   zerun tag SOURCE TARGET[:TAG]          add a local tag to an image\n  \
   zerun push IMAGE[:TAG]                 push a local image to a registry\n  \
   zerun save -o FILE.tar IMAGE...        export images as an OCI archive\n  \
