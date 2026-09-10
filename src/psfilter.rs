@@ -130,6 +130,7 @@ mod tests {
             cwd: None,
             user: None,
             capabilities: None,
+            seccomp: None,
             labels: BTreeMap::new(),
             log: String::new(),
             log_max_size: None,

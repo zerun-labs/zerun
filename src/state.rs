@@ -12,6 +12,7 @@
 //! containers, like `docker run -d`.
 use crate::error::ZResult;
 use crate::fsutil;
+use crate::seccomp::SeccompMode;
 use crate::store::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -183,6 +184,10 @@ pub struct ContainerState {
     /// the secure default set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<String>>,
+    /// Seccomp policy applied to the workload. None = legacy record using the
+    /// default deny-by-default profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seccomp: Option<SeccompMode>,
     /// Absolute path to this container's console.log.
     pub log: String,
     /// Rotation threshold for the console log. None = legacy/unbounded record.
@@ -493,6 +498,7 @@ mod tests {
             cwd: None,
             user: None,
             capabilities: Some(vec!["CAP_NET_RAW".to_string()]),
+            seccomp: Some(SeccompMode::Unconfined),
             log: format!("{}/x/console.log", std::env::temp_dir().display()),
             log_max_size: None,
             log_max_file: None,
@@ -524,6 +530,7 @@ mod tests {
             loaded.capabilities.as_deref(),
             Some(&["CAP_NET_RAW".to_string()][..])
         );
+        assert_eq!(loaded.seccomp, Some(SeccompMode::Unconfined));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

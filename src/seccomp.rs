@@ -10,6 +10,7 @@
 //! silently claiming seccomp support.
 use crate::error::ZResult;
 use crate::trace;
+use serde::{Deserialize, Serialize};
 
 // --- BPF / seccomp ABI constants ---------------------------------------------
 // Stable Linux UAPI values; libc does not export the BPF_* macros.
@@ -50,7 +51,8 @@ struct SockFprog {
     filter: *const libc::sock_filter,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SeccompMode {
     /// Deny-by-default allowlist (recommended).
     #[default]

@@ -950,6 +950,7 @@ fn run_detached(
         cwd: spec.cwd.clone(),
         user: spec.user.clone(),
         capabilities: Some(spec.capabilities.names()),
+        seccomp: Some(spec.seccomp),
         labels: info.labels,
         log: log_path.display().to_string(),
         log_max_size: Some(info.log.max_size),
