@@ -15,6 +15,7 @@ pub mod archive;
 pub mod auth;
 pub mod commit;
 pub mod config;
+pub mod import;
 pub mod manifest;
 pub mod name;
 pub mod push;

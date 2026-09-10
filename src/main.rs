@@ -62,6 +62,7 @@ fn main() {
         Some("top") => cmd_top(&args[2..]),
         Some("cp") => cmd_cp(&args[2..]),
         Some("export") => cmd_export(&args[2..]),
+        Some("import") => cmd_import(&args[2..]),
         Some("exec") => cmd_exec(&args[2..]),
         Some("login") => cmd_login(&args[2..]),
         Some("logout") => cmd_logout(&args[2..]),
@@ -3264,6 +3265,96 @@ fn archive_dir<W: std::io::Write>(
     Ok(())
 }
 
+/// `zerun import [-m MSG] FILE|- TARGET[:TAG]` — create a local image from
+/// a rootfs tar (the inverse of `export`; plain/gzip/zstd accepted, `-`
+/// reads stdin).
+fn cmd_import(args: &[String]) -> i32 {
+    let mut message: Option<String> = None;
+    let mut author: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "-m" | "--message" => match next_value(args, &mut i, arg) {
+                // next_value already advanced past the value.
+                Ok(v) => {
+                    message = Some(v);
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("zerun import: {e}");
+                    return 2;
+                }
+            },
+            "--author" => match next_value(args, &mut i, arg) {
+                Ok(v) => {
+                    author = Some(v);
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("zerun import: {e}");
+                    return 2;
+                }
+            },
+            "-h" | "--help" => {
+                println!("usage: zerun import [-m MSG] FILE|- TARGET[:TAG]");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun import: unknown option {other}");
+                return 2;
+            }
+            _ => {
+                positional.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    let [file, target] = positional.as_slice() else {
+        eprintln!("usage: zerun import [-m MSG] FILE|- TARGET[:TAG]");
+        return 2;
+    };
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let imgstore = match image::store::ImageStore::open(&store) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    match image::import::import_image(
+        &imgstore,
+        Path::new(file),
+        target,
+        image::import::ImportOptions {
+            comment: message,
+            author,
+        },
+    ) {
+        Ok(record) => {
+            println!(
+                "sha256:{}",
+                record
+                    .manifest
+                    .strip_prefix("sha256:")
+                    .unwrap_or(&record.manifest)
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("zerun import: {e}");
+            1
+        }
+    }
+}
+
 fn cmd_exec(args: &[String]) -> i32 {
     let mut env_extra: Vec<String> = Vec::new();
     let mut workdir: Option<String> = None;
@@ -3577,6 +3668,7 @@ USAGE:\n  \
   zerun top CONTAINER                    list a container's processes\n  \
   zerun cp SRC DST                       copy files to/from a running container\n  \
   zerun export [-o FILE] CONTAINER       export a container rootfs as tar\n  \
+  zerun import [-m MSG] FILE|- TARGET    import a rootfs tar as a local image\n  \
   zerun exec [-e K=V] [-w DIR] CONTAINER CMD [ARG...]\n  \
                                         run a command in a running container\n  \
   zerun pull [--platform ...] IMAGE...   pull OCI images (Docker Hub, mirrors)\n  \

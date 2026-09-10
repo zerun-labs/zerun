@@ -406,7 +406,7 @@ fn hex(bytes: &[u8]) -> String {
 /// a correctly compressed layer still unpacks even if registry metadata is
 /// wrong. Chunked variants (`zstd:chunked`) use a different framing and get a
 /// clear error instead of silent corruption.
-fn open_layer_reader(path: &Path, media_type: &str) -> ZResult<Box<dyn Read>> {
+pub(crate) fn open_layer_reader(path: &Path, media_type: &str) -> ZResult<Box<dyn Read>> {
     let file = File::open(path).map_err(|e| crate::zerr!("open layer {}: {e}", path.display()))?;
     let mut reader = io::BufReader::new(file);
 
