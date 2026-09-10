@@ -14,6 +14,9 @@ bench/results/mem-*.csv
 bench/results/report-*.md
 bench/results/latest-report.md
 
+# --- Python ---
+__pycache__/
+
 # --- editors / OS ---
 .idea/
 .vscode/
