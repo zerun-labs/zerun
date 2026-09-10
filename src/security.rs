@@ -49,8 +49,11 @@ const DEFAULT_CAPS: &[i32] = &[
 /// then capabilities, then seccomp (loading a seccomp filter without CAP_SYS_ADMIN
 /// requires NO_NEW_PRIVS to be set first).
 pub fn harden(seccomp_mode: SeccompMode) -> ZResult<()> {
+    trace::mark("child:security:begin");
     no_new_privs()?;
+    trace::mark("child:nnp:done");
     apply_capabilities(DEFAULT_CAPS)?;
+    trace::mark("child:caps:done");
     seccomp::apply(seccomp_mode)?;
     trace::mark("child:security:done");
     Ok(())

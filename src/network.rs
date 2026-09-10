@@ -9,13 +9,13 @@
 //! them before signalling the child over the net-ready pipe (see
 //! `namespace.rs`).
 //!
-//! Outbound NAT lives in a per-container nft table `zerun-<id>`
-//! (src/nfnetlink.rs, pure netlink — no `nft` binary): one postrouting
-//! masquerade rule per container (`ip saddr <ip> oifname != "zerun0"
-//! masquerade`) so the container reaches the outside world while
-//! container-to-container traffic keeps its source addresses (Docker
-//! `-s <subnet> ! -o docker0` semantics). The whole table is dropped
-//! atomically when the container exits.
+//! Outbound NAT lives in one shared nft table `zerun-nat`
+//! (src/nfnetlink.rs, pure netlink — no `nft` binary): `ip saddr
+//! 10.88.0.0/24 oifname != "zerun0" masquerade` lets containers reach the
+//! outside world while container-to-container traffic keeps its source
+//! addresses (Docker `-s <subnet> ! -o docker0` semantics). The table is
+//! deterministic and persists across containers, avoiding a per-run netfilter
+//! setup/teardown round trip.
 //!
 //! Published ports (`-p HOST:CONTAINER`) are NOT kernel-DNAT'd: DNAT-ing a
 //! locally generated 127.0.0.1-sourced packet towards the bridge dies at the
@@ -36,6 +36,7 @@
 use crate::error::ZResult;
 use crate::netlink::Netlink;
 use crate::nfnetlink::{NatConfig, Nftables};
+use crate::trace;
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
@@ -78,8 +79,8 @@ pub const SUBNET_PREFIX: u8 = 24;
 /// What the parent created for one container; torn down after the run exits.
 pub struct HostNet {
     veth_name: String,
-    /// nft table holding this container's NAT rules.
-    table: String,
+    /// Legacy per-container nft table, when this run created one.
+    table: Option<String>,
 }
 
 impl HostNet {
@@ -88,9 +89,9 @@ impl HostNet {
         &self.veth_name
     }
 
-    /// nft table name holding this container's egress NAT.
-    pub fn table(&self) -> &str {
-        &self.table
+    /// Legacy nft table name, if this container owns one.
+    pub fn table(&self) -> Option<&str> {
+        self.table.as_deref()
     }
 }
 
@@ -243,10 +244,8 @@ pub fn peer_name(id: &str) -> String {
     format!("p{}", &id[..id.len().min(8)])
 }
 
-/// Per-container nft table name holding the NAT rules (`table ip zerun-<id>`).
-pub fn nat_table(id: &str) -> String {
-    format!("zerun-{}", &id[..id.len().min(16)])
-}
+/// Shared nft table for all managed bridge containers (`table ip zerun-nat`).
+pub const SHARED_NAT_TABLE: &str = "zerun-nat";
 
 /// Deterministic container IPv4 address derived from the container id:
 /// 10.88.0.2 ..= 10.88.0.254 (FNV-1a over the id string).
@@ -346,13 +345,15 @@ pub fn release_ip(run_root: &Path, id: &str) {
     let _ = write_ipam(&path, &map);
 }
 
-/// Host side: ensure the bridge, create the veth pair, move the peer into the
-/// child's netns, attach the host end to the bridge and install the
-/// per-container egress-NAT table.
-pub fn setup_host_side(id: &str, child_pid: i32, ip: Ipv4Addr) -> ZResult<HostNet> {
+/// Host side: ensure the bridge and shared NAT rule, create the veth peer
+/// directly in the child's netns, then attach and bring up the host end.
+pub fn setup_host_side(id: &str, child_pid: i32) -> ZResult<HostNet> {
+    trace::mark("parent:net:begin");
     let nl = Netlink::new()?;
+    trace::mark("parent:net:socket");
     let bridge = nl.ensure_bridge(BRIDGE_NAME)?;
     nl.ensure_address(bridge, GATEWAY_IP, SUBNET_PREFIX)?;
+    trace::mark("parent:net:bridge");
 
     let host = veth_name(id);
     let peer = peer_name(id);
@@ -361,26 +362,33 @@ pub fn setup_host_side(id: &str, child_pid: i32, ip: Ipv4Addr) -> ZResult<HostNe
             "stale veth {host} already exists; remove it and retry"
         ));
     }
-    nl.create_veth(&host, &peer)?;
+    trace::mark("parent:net:veth-create-begin");
+    let netns = std::fs::File::open(format!("/proc/{child_pid}/ns/net"))
+        .map_err(|e| crate::zerr!("open netns for pid {child_pid}: {e}"))?;
+    nl.create_veth_peer_fd(&host, &peer, netns.as_raw_fd())?;
+    trace::mark("parent:net:veth-created");
     let host_index = nl
         .link_index(&host)?
         .ok_or_else(|| crate::zerr!("veth {host} missing after create"))?;
-    nl.move_to_pid(&peer, child_pid as u32)?;
+    trace::mark("parent:net:veth-index");
     nl.set_master(host_index, bridge)?;
+    trace::mark("parent:net:veth-master");
     nl.link_up(host_index)?;
+    trace::mark("parent:net:veth");
 
     enable_ip_forward()?;
-    let table = nat_table(id);
     let nft = Nftables::new()?;
     let cfg = NatConfig {
-        table: &table,
-        container_ip: ip,
+        table: SHARED_NAT_TABLE,
+        source_network: Ipv4Addr::new(10, 88, 0, 0),
+        prefix_len: SUBNET_PREFIX,
     };
     nft.install_nat(&cfg)?;
+    trace::mark("parent:net:nat");
 
     Ok(HostNet {
         veth_name: host,
-        table,
+        table: None,
     })
 }
 
@@ -405,28 +413,33 @@ pub fn setup_container_side(id: &str, ip: Ipv4Addr) -> ZResult<()> {
     Ok(())
 }
 
-/// Host side cleanup after the container exited: drop the NAT table (atomic,
-/// removes every rule of this container) and remove any leftover veth host end.
+/// Host side cleanup after the container exited: remove any legacy per-container
+/// NAT table and any leftover veth host end.
 ///
 /// When the child netns goes away the kernel removes the whole veth pair, so
 /// usually there is nothing left to do; this only deletes a leftover host end
 /// (e.g. after an unclean kill). Both steps are best-effort and never fail the
 /// caller.
 pub fn teardown_host_side(net: &HostNet) {
-    teardown_named(&net.veth_name, &net.table);
+    teardown_named(&net.veth_name, net.table.as_deref());
 }
 
 /// Best-effort removal of a container's host-side leftovers by name. Used by
 /// normal teardown and by crash reconcile (`ze ps`, `ze rm -f`) where the
 /// reaper died before it could clean up.
-pub fn teardown_named(veth: &str, table: &str) {
-    if let Ok(nft) = Nftables::new() {
-        nft.remove_table(table);
+pub fn teardown_named(veth: &str, table: Option<&str>) {
+    trace::mark("teardown:begin");
+    if let Some(table) = table {
+        if let Ok(nft) = Nftables::new() {
+            nft.remove_table(table);
+        }
     }
+    trace::mark("teardown:nft");
     let nl = match Netlink::new() {
         Ok(nl) => nl,
         Err(_) => return,
     };
+    trace::mark("teardown:netlink");
     let index = match nl.link_index(veth) {
         Ok(Some(i)) => i,
         _ => return, // already gone with the container netns
@@ -464,7 +477,7 @@ mod tests {
         assert!(peer_name(id).len() <= 15);
         assert_eq!(veth_name(id), "v01234567");
         assert_eq!(peer_name(id), "p01234567");
-        assert_eq!(nat_table(id), "zerun-0123456789ab");
+        assert_eq!(SHARED_NAT_TABLE, "zerun-nat");
     }
 
     #[test]

@@ -9,7 +9,10 @@
 
 use crate::error::ZResult;
 use futures_util::StreamExt;
-use rtnetlink::packet_route::{address::AddressAttribute, link::LinkAttribute};
+use rtnetlink::packet_route::{
+    address::AddressAttribute,
+    link::{InfoData, InfoKind, InfoVeth, LinkAttribute},
+};
 use std::net::Ipv4Addr;
 
 pub struct Netlink {
@@ -90,16 +93,6 @@ impl Netlink {
             .map_err(|e| crate::zerr!("create bridge {name}: {e}"))
     }
 
-    /// Create a veth pair in this network namespace: `host` and `peer`.
-    pub fn create_veth(&self, host: &str, peer: &str) -> ZResult<()> {
-        let req = self
-            .handle
-            .link()
-            .add(rtnetlink::LinkVeth::new(host, peer).build());
-        self.block_on(req.execute())
-            .map_err(|e| crate::zerr!("create veth pair {host}<->{peer}: {e}"))
-    }
-
     /// Bring a link up (`ip link set NAME up`).
     pub fn link_up(&self, index: u32) -> ZResult<()> {
         let msg = rtnetlink::LinkUnspec::new_with_index(index).up().build();
@@ -116,13 +109,26 @@ impl Netlink {
             .map_err(|e| crate::zerr!("attach link {index} to bridge {master}: {e}"))
     }
 
-    /// Move the link named `name` into the network namespace of `pid`.
-    pub fn move_to_pid(&self, name: &str, pid: u32) -> ZResult<()> {
-        let msg = rtnetlink::LinkUnspec::new_with_name(name)
-            .setns_by_pid(pid)
+    /// Create a veth pair whose peer is born directly in the netns referenced
+    /// by an open `/proc/<pid>/ns/net` descriptor.
+    pub fn create_veth_peer_fd(
+        &self,
+        host: &str,
+        peer: &str,
+        fd: std::os::fd::RawFd,
+    ) -> ZResult<()> {
+        let mut peer_msg = rtnetlink::LinkMessageBuilder::<rtnetlink::LinkUnspec>::new()
+            .name(peer)
             .build();
-        self.block_on(self.handle.link().change(msg).execute())
-            .map_err(|e| crate::zerr!("move link {name} into pid {pid}: {e}"))
+        peer_msg.attributes.push(LinkAttribute::NetNsFd(fd));
+        let req = rtnetlink::LinkMessageBuilder::<rtnetlink::LinkVeth>::new_with_info_kind(
+            InfoKind::Veth,
+        )
+        .name(host)
+        .set_info_data(InfoData::Veth(InfoVeth::Peer(peer_msg)))
+        .build();
+        self.block_on(self.handle.link().add(req).execute())
+            .map_err(|e| crate::zerr!("create veth pair {host}<->{peer}: {e}"))
     }
 
     /// Rename the link `index` to `name` (container-side: `p<id>` -> `eth0`).

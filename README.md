@@ -31,7 +31,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
 - **M4 — kernel networking (done)**: `--net bridge` (rootful) creates the `zerun0` bridge
   (10.88.0.1/24) and a per-container veth pair with container-side `eth0` and a default
   route (verified: host ↔ container reachable). Per-container egress NAT via nf_tables
-  (pure netlink), `-p [ADDR:]HOST[:CONTAINER][/tcp|/udp]` publishing through a built-in userland
+  (pure netlink, shared `zerun-nat` subnet rule), `-p [ADDR:]HOST[:CONTAINER][/tcp|/udp]` publishing through a built-in userland
   proxy (Docker's docker-proxy in-binary), and `--dns` / host resolv.conf inheritance.
 - **M5 — detached lifecycle (done)**: `run -d` forks a tiny per-container reaper that
   redirects stdio to `console.log` and persists state to disk;

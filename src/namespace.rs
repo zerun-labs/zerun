@@ -242,7 +242,7 @@ where
     let mut host_net: Option<crate::network::HostNet> = None;
     if let Some((net_r, net_w)) = net_sync {
         syscalls::close(net_r); // the parent never reads the net-ready pipe
-        let msg = match crate::network::setup_host_side(&spec.id, pid, spec.bridge_ip.unwrap()) {
+        let msg = match crate::network::setup_host_side(&spec.id, pid) {
             Ok(net) => {
                 host_net = Some(net);
                 vec![0]
@@ -297,7 +297,9 @@ where
     let started = StartedInfo {
         pid,
         ip: spec.bridge_ip,
-        table: host_net.as_ref().map(|n| n.table().to_string()),
+        table: host_net
+            .as_ref()
+            .and_then(|net| net.table().map(str::to_string)),
         veth: host_net.as_ref().map(|n| n.veth_name().to_string()),
         cgroup: cg.as_ref().map(|c| c.path().display().to_string()),
     };
@@ -445,7 +447,9 @@ fn child_stage(
     match spec.net {
         NetMode::Bridge => {
             let fd = net_r.ok_or_else(|| crate::zerr!("bridge mode lost its net-ready pipe"))?;
+            trace::mark("child:net:wait-begin");
             net_sync_wait(fd)?;
+            trace::mark("child:net:ready");
             syscalls::close(fd);
             let ip = spec
                 .bridge_ip

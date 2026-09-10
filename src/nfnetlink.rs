@@ -4,7 +4,7 @@
 //! them over a `NETLINK_NETFILTER` socket. No `nft` binary is ever executed.
 //! Only the tiny subset the bridge NAT needs is implemented:
 //!
-//!   * per-container IPv4 tables (`table ip zerun-<id>`),
+//!   * one shared IPv4 table (`table ip zerun-nat`) for the managed bridge,
 //!   * one base chain of type `nat` (POSTROUTING),
 //!   * rules built from the expressions: payload, cmp, meta and masq.
 //!
@@ -90,6 +90,11 @@ const NFTA_PAYLOAD_BASE: u16 = 2;
 const NFTA_PAYLOAD_OFFSET: u16 = 3;
 const NFTA_PAYLOAD_LEN: u16 = 4;
 const NFTA_DATA_VALUE: u16 = 1;
+const NFTA_BITWISE_SREG: u16 = 1;
+const NFTA_BITWISE_DREG: u16 = 2;
+const NFTA_BITWISE_LEN: u16 = 3;
+const NFTA_BITWISE_MASK: u16 = 4;
+const NFTA_BITWISE_XOR: u16 = 5;
 
 // --- expression / hook value constants ---------------------------------------
 
@@ -110,12 +115,14 @@ const PRIO_SRCNAT: i32 = 100;
 const IP_SADDR_OFFSET: u32 = 12;
 const IPV4_LEN: u32 = 4;
 
-/// Per-container bridge NAT configuration.
+/// Shared bridge NAT configuration.
 pub struct NatConfig<'a> {
-    /// nft table name (`zerun-<id>`).
+    /// nft table name (`zerun-nat`).
     pub table: &'a str,
-    /// Container IPv4 address (masquerade source guard).
-    pub container_ip: Ipv4Addr,
+    /// Source network to masquerade when leaving the managed bridge.
+    pub source_network: Ipv4Addr,
+    /// Prefix length of `source_network`.
+    pub prefix_len: u8,
 }
 
 /// Raw nfnetlink client. One socket, blocking, used from the host side only.
@@ -135,20 +142,28 @@ impl Nftables {
         Ok(Nftables { sock })
     }
 
-    /// Install (or refresh) the per-container NAT table.
+    /// Install the shared bridge NAT table if it is not already present.
     ///
-    /// Table + chains + rules are created in one atomic batch; a stale table
-    /// left over from a crashed run is deleted first (best effort).
+    /// Table + chains + rules are created in one atomic batch. `EEXIST` means
+    /// a previous run installed the same deterministic table; unlike the old
+    /// per-container tables it must not be deleted or recreated per run.
     pub fn install_nat(&self, cfg: &NatConfig) -> ZResult<()> {
-        // Best-effort cleanup of a stale table from a crashed run.
-        let _ = self.delete_table(cfg.table);
-
         let msgs: Vec<Vec<u8>> = vec![
             msg_new_table(cfg.table),
             msg_new_chain(cfg.table, "postrouting", NF_INET_POST_ROUTING, PRIO_SRCNAT),
-            msg_new_rule(cfg.table, "postrouting", &masquerade_rule(cfg.container_ip)),
+            msg_new_rule(
+                cfg.table,
+                "postrouting",
+                &masquerade_rule(cfg.source_network, cfg.prefix_len),
+            ),
         ];
-        self.send_batch(&msgs)
+        match self.send_batch_errno(&msgs) {
+            Ok(()) | Err(libc::EEXIST) => Ok(()),
+            Err(code) => Err(crate::zerr!(
+                "nftables: {}",
+                io::Error::from_raw_os_error(code)
+            )),
+        }
     }
 
     /// Delete the whole table `name` (with all chains and rules).
@@ -180,7 +195,7 @@ impl Nftables {
     }
 
     /// Send one atomic batch and surface the first kernel error.
-    fn send_batch(&self, msgs: &[Vec<u8>]) -> ZResult<()> {
+    fn send_batch_errno(&self, msgs: &[Vec<u8>]) -> std::result::Result<(), i32> {
         let mut buf = Vec::new();
         buf.extend(batch_bookend(NFNL_MSG_BATCH_BEGIN));
         for m in msgs {
@@ -190,9 +205,8 @@ impl Nftables {
 
         self.sock
             .send(&buf, 0)
-            .map_err(|e| crate::zerr!("send nftables batch: {e}"))?;
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
         self.drain_errors()
-            .map_err(|code| crate::zerr!("nftables: {}", io::Error::from_raw_os_error(code)))
     }
 
     /// Read kernel error replies until the socket is drained.
@@ -385,16 +399,41 @@ fn masq_expr() -> Vec<u8> {
     expr("masq", &[])
 }
 
-/// `ip saddr <ip>` exact match.
-fn ip_saddr_match(ip: Ipv4Addr) -> Vec<u8> {
+/// `ip saddr <ip>[/prefix]` match. Prefixes use an explicit bitwise AND.
+fn ip_saddr_match(network: Ipv4Addr, prefix: u8) -> Vec<u8> {
     let mut out = payload_expr(
         NFT_REG_1,
         NFT_PAYLOAD_NETWORK_HEADER,
         IP_SADDR_OFFSET,
         IPV4_LEN,
     );
-    out.extend(cmp_expr(NFT_REG_1, NFT_CMP_EQ, &ip.octets()));
+    if prefix < 32 {
+        let mask = prefix_to_mask(prefix);
+        out.extend(bitwise_and_expr(NFT_REG_1, IPV4_LEN, &mask));
+        out.extend(cmp_expr(NFT_REG_1, NFT_CMP_EQ, &network.octets()));
+    } else {
+        out.extend(cmp_expr(NFT_REG_1, NFT_CMP_EQ, &network.octets()));
+    }
     out
+}
+
+fn prefix_to_mask(prefix: u8) -> [u8; 4] {
+    let value = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix))
+    };
+    value.to_be_bytes()
+}
+
+/// `reg = reg & mask` (used for CIDR source-address matches).
+fn bitwise_and_expr(reg: u32, len: u32, mask: &[u8]) -> Vec<u8> {
+    let mut data = nla_be32(NFTA_BITWISE_SREG, reg);
+    data.extend(nla_be32(NFTA_BITWISE_DREG, reg));
+    data.extend(nla_be32(NFTA_BITWISE_LEN, len));
+    data.extend(nla_nested(NFTA_BITWISE_MASK, &data_value(mask)));
+    data.extend(nla_nested(NFTA_BITWISE_XOR, &data_value(&[0; 4])));
+    expr("bitwise", &data)
 }
 
 /// Interface-name strings are compared as zero-padded IFNAMSIZ (16) bytes.
@@ -413,13 +452,37 @@ fn oifname_neq(name: &str) -> Vec<u8> {
     out
 }
 
-/// postrouting masquerade for one container's traffic:
-/// `ip saddr <ip> oifname != "zerun0" masquerade` — the oifname guard keeps
-/// container-to-container (and container-to-gateway) traffic un-NATed, exactly
-/// like Docker's `-s <subnet> ! -o docker0 -j MASQUERADE`.
-fn masquerade_rule(ip: Ipv4Addr) -> Vec<u8> {
-    let mut out = ip_saddr_match(ip);
+/// postrouting masquerade for the managed bridge subnet:
+/// `ip saddr <network>/<prefix> oifname != "zerun0" masquerade` — the oifname
+/// guard keeps container-to-container (and container-to-gateway) traffic
+/// un-NATed, exactly like Docker's `-s <subnet> ! -o docker0 -j MASQUERADE`.
+fn masquerade_rule(network: Ipv4Addr, prefix: u8) -> Vec<u8> {
+    let mut out = ip_saddr_match(network, prefix);
     out.extend(oifname_neq("zerun0"));
     out.extend(masq_expr());
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefix_masks_are_network_order() {
+        assert_eq!(prefix_to_mask(0), [0, 0, 0, 0]);
+        assert_eq!(prefix_to_mask(8), [255, 0, 0, 0]);
+        assert_eq!(prefix_to_mask(24), [255, 255, 255, 0]);
+        assert_eq!(prefix_to_mask(32), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn bridge_rule_masks_the_whole_managed_subnet() {
+        let rule = masquerade_rule(Ipv4Addr::new(10, 88, 0, 0), 24);
+        let text = String::from_utf8_lossy(&rule);
+        assert!(text.contains("bitwise"));
+        assert!(text.contains("masq"));
+        // The network bytes and oifname payload are embedded in the TLV data.
+        assert!(rule.windows(4).any(|w| w == [10, 88, 0, 0]));
+        assert!(rule.windows(7).any(|w| w == *b"zerun0\x00"));
+    }
 }

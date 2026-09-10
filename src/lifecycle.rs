@@ -337,8 +337,8 @@ pub fn reconcile_stale(store: &Store, st: &mut ContainerState) -> bool {
     // The PID is gone but state still says running: the reaper was killed or
     // the host rebooted. Best-effort reclaim of everything the reaper would
     // have torn down.
-    if let (Some(veth), Some(table)) = (st.veth.as_deref(), st.table.as_deref()) {
-        crate::network::teardown_named(veth, table);
+    if let Some(veth) = st.veth.as_deref() {
+        crate::network::teardown_named(veth, st.table.as_deref());
     }
     if let Some(cg) = st.cgroup.as_deref() {
         let path = Path::new(cg);
@@ -385,8 +385,8 @@ pub fn settle_exit(store: &Store, id: &str) {
 /// Reclaim host-side resources for an exited container that still holds them
 /// (used by `rm` on records whose reaper did not clean up).
 pub fn reclaim_resources(store: &Store, st: &ContainerState) {
-    if let (Some(veth), Some(table)) = (st.veth.as_deref(), st.table.as_deref()) {
-        crate::network::teardown_named(veth, table);
+    if let Some(veth) = st.veth.as_deref() {
+        crate::network::teardown_named(veth, st.table.as_deref());
     }
     if st.net == "bridge" {
         crate::network::release_ip(store.run_root(), &st.id);
