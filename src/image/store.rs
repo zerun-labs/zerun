@@ -4,6 +4,7 @@
 //!   <data>/blobs/sha256/<hex>   raw registry blobs (manifests, configs, layers)
 //!   <data>/rootfs/<hex>         materialized image rootfs, keyed by config digest
 //!   <data>/images.json          tag index (name/tag -> manifest digest)
+//!   <data>/images.lock          cross-process lock for index mutations
 //!
 //! Everything is plain files + one small JSON index: there is no daemon, and
 //! `rmi` garbage-collects by recomputing what is reachable from the index.
@@ -14,7 +15,7 @@ use crate::store::Store;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -211,6 +212,23 @@ impl ImageStore {
         self.data_root.join("images.json")
     }
 
+    /// Serialize image-index read-modify-write sections across CLI processes.
+    /// The lock file is separate from the atomically replaced JSON so locking
+    /// is stable even when the index does not exist yet.
+    fn lock_index(&self) -> ZResult<File> {
+        let path = self.data_root.join("images.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| crate::zerr!("open image index lock {}: {e}", path.display()))?;
+        file.lock()
+            .map_err(|e| crate::zerr!("lock image index {}: {e}", path.display()))?;
+        Ok(file)
+    }
+
     pub fn records(&self) -> ZResult<Vec<ImageRecord>> {
         let path = self.index_path();
         if !path.is_file() {
@@ -250,21 +268,17 @@ impl ImageStore {
         size_bytes: u64,
         index_digest: Option<&str>,
     ) -> ZResult<()> {
+        let _lock = self.lock_index()?;
         let mut records = self.records()?;
-        // Replace a previous entry for the same name+tag (re-pull updates it).
-        records.retain(|r| !(r.name == name && r.tag.as_deref() == tag));
-        records.push(ImageRecord {
-            name: name.to_string(),
-            tag: tag.map(str::to_string),
-            manifest: manifest_digest.to_string(),
-            index: index_digest.map(str::to_string),
-            config: config_digest.to_string(),
+        let record = new_record(
+            name,
+            tag,
+            manifest_digest,
+            config_digest,
             size_bytes,
-            created_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-        });
+            index_digest,
+        );
+        upsert_record(&mut records, record);
         self.save_records(&records)
     }
 
@@ -277,19 +291,7 @@ impl ImageStore {
         digest: Option<&str>,
     ) -> ZResult<Option<ImageRecord>> {
         let records = self.records()?;
-        if let Some(d) = digest {
-            if let Some(r) = records
-                .iter()
-                .find(|r| r.manifest == d || r.index.as_deref() == Some(d))
-            {
-                return Ok(Some(r.clone()));
-            }
-            return Ok(None);
-        }
-        let tag = tag.unwrap_or("latest");
-        Ok(records
-            .into_iter()
-            .find(|r| r.name == name && r.tag.as_deref() == Some(tag)))
+        Ok(find_record_in(&records, name, tag, digest).cloned())
     }
 
     /// Add another tag for an existing record (Docker `tag` semantics).
@@ -305,7 +307,9 @@ impl ImageStore {
         target_name: &str,
         target_tag: Option<&str>,
     ) -> ZResult<ImageRecord> {
-        let Some(source) = self.find_record(source_name, source_tag, source_digest)? else {
+        let _lock = self.lock_index()?;
+        let mut records = self.records()?;
+        let Some(source) = find_record_in(&records, source_name, source_tag, source_digest) else {
             let reference = match source_digest {
                 Some(d) => format!("{source_name}@{d}"),
                 None => format!("{}:{}", source_name, source_tag.unwrap_or("latest")),
@@ -317,18 +321,17 @@ impl ImageStore {
                 "tag target must be REPOSITORY[:TAG], not a digest reference"
             ));
         };
-        self.add_index_image(
+        let record = new_record(
             target_name,
             Some(tag),
             &source.manifest,
             &source.config,
             source.size_bytes,
             source.index.as_deref(),
-        )?;
-        // `add_image` creates a new timestamped record; re-read it so callers
-        // observe exactly what is in the index after replacement.
-        self.find_record(target_name, Some(tag), None)?
-            .ok_or_else(|| crate::zerr!("tagged image vanished before it could be reported"))
+        );
+        upsert_record(&mut records, record.clone());
+        self.save_records(&records)?;
+        Ok(record)
     }
 
     /// Remove one record for a reference (tag semantics like `docker rmi`).
@@ -338,6 +341,7 @@ impl ImageStore {
         tag: Option<&str>,
         digest: Option<&str>,
     ) -> ZResult<Option<ImageRecord>> {
+        let _lock = self.lock_index()?;
         let mut records = self.records()?;
         let idx = if let Some(d) = digest {
             records
@@ -362,6 +366,9 @@ impl ImageStore {
     /// This stays a read-only dry run so `system df` can report stale pull
     /// artifacts without mutating the store or requiring a privileged caller.
     pub fn reclaimable_bytes(&self) -> u64 {
+        let Ok(_lock) = self.lock_index() else {
+            return 0;
+        };
         let Ok(records) = self.records() else {
             return 0;
         };
@@ -409,6 +416,7 @@ impl ImageStore {
     /// Delete blobs and rootfs dirs no longer reachable from the tag index.
     /// Best-effort per entry: a broken record must not wedge `rmi`.
     pub fn gc(&self) -> ZResult<()> {
+        let _lock = self.lock_index()?;
         let records = self.records()?;
         let mut keep_blobs: BTreeSet<String> = BTreeSet::new(); // "sha256:<hex>"
         let mut keep_rootfs: BTreeSet<String> = BTreeSet::new(); // "<hex>"
@@ -497,6 +505,51 @@ impl ImageStore {
     }
 }
 
+fn find_record_in<'a>(
+    records: &'a [ImageRecord],
+    name: &str,
+    tag: Option<&str>,
+    digest: Option<&str>,
+) -> Option<&'a ImageRecord> {
+    if let Some(digest) = digest {
+        return records
+            .iter()
+            .find(|r| r.manifest == digest || r.index.as_deref() == Some(digest));
+    }
+    let tag = tag.unwrap_or("latest");
+    records
+        .iter()
+        .find(|r| r.name == name && r.tag.as_deref() == Some(tag))
+}
+
+fn new_record(
+    name: &str,
+    tag: Option<&str>,
+    manifest_digest: &str,
+    config_digest: &str,
+    size_bytes: u64,
+    index_digest: Option<&str>,
+) -> ImageRecord {
+    ImageRecord {
+        name: name.to_string(),
+        tag: tag.map(str::to_string),
+        manifest: manifest_digest.to_string(),
+        index: index_digest.map(str::to_string),
+        config: config_digest.to_string(),
+        size_bytes,
+        created_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    }
+}
+
+fn upsert_record(records: &mut Vec<ImageRecord>, record: ImageRecord) {
+    // Replace a previous entry for the same name+tag (re-pull/tag updates it).
+    records.retain(|r| !(r.name == record.name && r.tag == record.tag));
+    records.push(record);
+}
+
 /// Extract the hex half of `sha256:<hex>`, validating the shape.
 pub fn digest_hex(digest: &str) -> ZResult<String> {
     let hex = digest
@@ -543,6 +596,7 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -707,5 +761,30 @@ mod tests {
         assert!(removed.is_some());
         assert!(s.records().unwrap().is_empty());
         let _ = fs::remove_dir_all(&s.data_root);
+    }
+
+    #[test]
+    fn concurrent_record_adds_do_not_lose_tags() {
+        let store = Arc::new(test_store());
+        let workers = 16;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut handles = Vec::new();
+        for i in 0..workers {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let digest = format!("sha256:{i:064x}");
+                let name = format!("registry.test/app{i}");
+                barrier.wait();
+                store
+                    .add_image(&name, Some("latest"), &digest, &digest, i as u64)
+                    .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(store.records().unwrap().len(), workers);
+        let _ = fs::remove_dir_all(&store.data_root);
     }
 }

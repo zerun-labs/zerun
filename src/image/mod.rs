@@ -5,6 +5,7 @@
 //!   blobs/sha256/<hex>   raw registry blobs (manifests, configs, layer tars)
 //!   rootfs/<hex>         materialized image rootfs, keyed by config digest
 //!   images.json          tag index (name/tag -> manifest digest)
+//!   images.lock          cross-process lock for index mutations
 //!
 //! Engineering notes (deviations from the design doc are deliberate):
 //! - Layers are materialized into one read-only rootfs per image *config digest*
