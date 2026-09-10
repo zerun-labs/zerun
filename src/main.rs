@@ -61,6 +61,7 @@ fn main() {
         Some("rename") => cmd_rename(&args[2..]),
         Some("top") => cmd_top(&args[2..]),
         Some("cp") => cmd_cp(&args[2..]),
+        Some("export") => cmd_export(&args[2..]),
         Some("exec") => cmd_exec(&args[2..]),
         Some("login") => cmd_login(&args[2..]),
         Some("logout") => cmd_logout(&args[2..]),
@@ -3074,6 +3075,195 @@ fn copy_between(src: &Path, dst: &Path) -> crate::error::ZResult<()> {
     }
 }
 
+/// `zerun export [-o FILE] CONTAINER` — stream the live container rootfs
+/// as an uncompressed tar.
+///
+/// The tree is read through `/proc/<pid>/root`, so the container keeps
+/// running while its filesystem is exported (consistency is the caller's
+/// concern, like `docker export`). Mount points inside the container
+/// (/proc, /sys, /dev, tmpfs, bind volumes) are recorded as empty
+/// directories: their contents belong to the kernel or the host, not to
+/// the container's filesystem layer.
+fn cmd_export(args: &[String]) -> i32 {
+    let mut output: Option<PathBuf> = None;
+    let mut targets: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "-h" | "--help" => {
+                println!("usage: zerun export [-o FILE] CONTAINER");
+                return 0;
+            }
+            "-o" | "--output" => match next_value(args, &mut i, a) {
+                // next_value already advanced past the value.
+                Ok(v) => {
+                    output = Some(PathBuf::from(v));
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("zerun export: {e}");
+                    return 2;
+                }
+            },
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun export: unknown option {other}");
+                return 2;
+            }
+            other => targets.push(other),
+        }
+        i += 1;
+    }
+    if targets.len() != 1 {
+        eprintln!("usage: zerun export [-o FILE] CONTAINER");
+        return 2;
+    }
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let mut st = match state::resolve(&store, targets[0]) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun export: {e}");
+            return 1;
+        }
+    };
+    if lifecycle::reconcile_stale(&store, &mut st) {
+        let _ = st.save();
+    }
+    if st.status != state::Status::Running || !st.pid_alive() {
+        eprintln!(
+            "zerun export: container {} is not running (export needs a live container root)",
+            display_name(&st)
+        );
+        return 1;
+    }
+    let pid = st.pid.unwrap_or(0);
+    let root = PathBuf::from(format!("/proc/{pid}/root"));
+    let mounts = match read_mount_points(pid) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("zerun export: read mountinfo: {e}");
+            return 1;
+        }
+    };
+    use std::io::Write as _;
+    let result = if let Some(path) = output {
+        std::fs::File::create(&path)
+            .map_err(|e| crate::zerr!("create {}: {e}", path.display()))
+            .and_then(|mut f| {
+                archive_tree(&mut f, &root, &mounts)?;
+                f.flush()
+                    .map_err(|e| crate::zerr!("flush {}: {e}", path.display()))
+            })
+    } else {
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        archive_tree(&mut lock, &root, &mounts)
+            .and_then(|()| lock.flush().map_err(|e| crate::zerr!("flush stdout: {e}")))
+    };
+    if let Err(e) = result {
+        eprintln!("zerun export: {e}");
+        return 1;
+    }
+    0
+}
+
+/// Mount points below the container root, read from `/proc/<pid>/mountinfo`.
+fn read_mount_points(pid: i32) -> std::io::Result<std::collections::HashSet<PathBuf>> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/mountinfo"))?;
+    Ok(parse_mount_points(&text))
+}
+
+/// Parse `/proc/<pid>/mountinfo` into mount-point paths (field 4 of each
+/// line), excluding the root itself. Paths are stored relative to the
+/// container root (no leading `/`) to match archive entry paths.
+fn parse_mount_points(text: &str) -> std::collections::HashSet<PathBuf> {
+    text.lines()
+        .filter_map(|line| line.split_whitespace().nth(4))
+        .map(|p| p.trim_start_matches('/'))
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Recursively append `root` to the tar, skipping recursion below mount
+/// points. `mounts` holds absolute container paths such as `/proc`.
+fn archive_tree<W: std::io::Write>(
+    builder_out: &mut W,
+    root: &Path,
+    mounts: &std::collections::HashSet<PathBuf>,
+) -> crate::error::ZResult<()> {
+    let mut builder = tar::Builder::new(builder_out);
+    builder.follow_symlinks(false);
+    archive_dir(&mut builder, root, Path::new(""), mounts)?;
+    builder
+        .finish()
+        .map_err(|e| crate::zerr!("finish export tar: {e}"))
+}
+
+/// Append one directory's entries into the archive. `rel` is the archive
+/// path of `dir` ("" for the root, which is not emitted itself).
+fn archive_dir<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
+    dir: &Path,
+    rel: &Path,
+    mounts: &std::collections::HashSet<PathBuf>,
+) -> crate::error::ZResult<()> {
+    let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(dir)
+        .map_err(|e| crate::zerr!("read_dir {}: {e}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
+    // Deterministic archives make diffing exports tractable.
+    names.sort();
+    for name in names {
+        let path = dir.join(&name);
+        let dest = rel.join(&name);
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| crate::zerr!("stat {}: {e}", path.display()))?;
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            let target = std::fs::read_link(&path)?;
+            let mut header = tar::Header::new_gnu();
+            // A bare new_gnu header has NUL-filled numeric fields; set the
+            // basics so append_link can checksum it.
+            header.set_size(0);
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_mode(0o777);
+            builder
+                .append_link(&mut header, &dest, &target)
+                .map_err(|e| crate::zerr!("tar link {}: {e}", path.display()))?;
+        } else if ft.is_dir() {
+            builder
+                .append_dir(&dest, &path)
+                .map_err(|e| crate::zerr!("tar dir {}: {e}", path.display()))?;
+            // Mount points (proc/sys/dev/tmpfs/volumes) are archived as
+            // empty directories; their contents are not container data.
+            if !mounts.contains(&dest) {
+                archive_dir(builder, &path, &dest, mounts)?;
+            }
+        } else if ft.is_file() {
+            builder
+                .append_file(&dest, &mut std::fs::File::open(&path)?)
+                .map_err(|e| crate::zerr!("tar file {}: {e}", path.display()))?;
+        } else {
+            // Char/block/fifo devices keep their metadata but no data.
+            let mut header = tar::Header::new_gnu();
+            header.set_metadata(&meta);
+            header.set_size(0);
+            builder
+                .append(&header, std::io::empty())
+                .map_err(|e| crate::zerr!("tar device {}: {e}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn cmd_exec(args: &[String]) -> i32 {
     let mut env_extra: Vec<String> = Vec::new();
     let mut workdir: Option<String> = None;
@@ -3386,6 +3576,7 @@ USAGE:\n  \
   zerun rename OLD NEW                   rename a container\n  \
   zerun top CONTAINER                    list a container's processes\n  \
   zerun cp SRC DST                       copy files to/from a running container\n  \
+  zerun export [-o FILE] CONTAINER       export a container rootfs as tar\n  \
   zerun exec [-e K=V] [-w DIR] CONTAINER CMD [ARG...]\n  \
                                         run a command in a running container\n  \
   zerun pull [--platform ...] IMAGE...   pull OCI images (Docker Hub, mirrors)\n  \
@@ -3445,6 +3636,62 @@ ENV:\n  \
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_archives_tree_and_skips_mounts() {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-export-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("root/proc/self")).unwrap();
+        std::fs::create_dir_all(dir.join("root/etc/sub")).unwrap();
+        std::fs::write(dir.join("root/etc/hosts"), b"content").unwrap();
+        std::fs::write(dir.join("root/proc/hidden"), b"must-not-appear").unwrap();
+        std::os::unix::fs::symlink("../etc/hosts", dir.join("root/etc/link")).unwrap();
+        let mut mounts = std::collections::HashSet::new();
+        mounts.insert(PathBuf::from("proc"));
+        let mut out = Vec::new();
+        archive_tree(&mut out, &dir.join("root"), &mounts).unwrap();
+        let mut ar = tar::Archive::new(&out[..]);
+        let mut names: Vec<(String, String)> = Vec::new(); // (name, kind)
+        for entry in ar.entries().unwrap() {
+            let e = entry.unwrap();
+            let kind = if e.header().entry_type().is_symlink() {
+                "link".to_string()
+            } else if e.header().entry_type().is_dir() {
+                "dir".to_string()
+            } else {
+                "file".to_string()
+            };
+            names.push((e.path().unwrap().display().to_string(), kind));
+        }
+        assert_eq!(
+            names,
+            vec![
+                ("etc".to_string(), "dir".to_string()),
+                ("etc/hosts".to_string(), "file".to_string()),
+                ("etc/link".to_string(), "link".to_string()),
+                ("etc/sub".to_string(), "dir".to_string()),
+                ("proc".to_string(), "dir".to_string()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_mount_points_reads_field_four() {
+        let text = "36 35 98:0 /mnt1 /proc rw - proc proc\n\
+                    40 35 0:40 / /sys ro,nosuid - sysfs sysfs rw\n\
+                    42 35 0:41 / / rw - overlay overlay rw\n";
+        let mounts = parse_mount_points(text);
+        assert!(mounts.contains(&PathBuf::from("proc")));
+        assert!(mounts.contains(&PathBuf::from("sys")));
+        // The root is not a skip target; everything below it is.
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(parse_mount_points("").len(), 0);
+    }
 
     #[test]
     fn cp_endpoint_parsing_and_safety() {
