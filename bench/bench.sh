@@ -84,19 +84,31 @@ extract_internal_ns() {
   ' <<<"$trace"
 }
 
-bench_zerun() {
-  log "warming up zerun x$WARMUP ..."
-  for ((i=0;i<WARMUP;i++)); do "$ZERUN_BIN" run --rootfs "$ROOTFS" --net none --no-overlay -- /bin/true >/dev/null 2>&1 || true; done
-  log "sampling zerun x$N ..."
+bench_zerun_mode() {
+  local label="$1"
+  shift
+  log "warming up $label x$WARMUP ..."
+  for ((i=0;i<WARMUP;i++)); do "$ZERUN_BIN" run --rootfs "$ROOTFS" "$@" -- /bin/true >/dev/null 2>&1 || true; done
+  log "sampling $label x$N ..."
   for ((i=0;i<N;i++)); do
     local trace_file="$WORK/trace"
     local s e internal ok=1
     s=$(now_ns)
-    trace=$(ZERUN_TRACE=1 "$ZERUN_BIN" run --rootfs "$ROOTFS" --net none --no-overlay -- /bin/true 2>"$trace_file") || ok=0
+    trace=$(ZERUN_TRACE=1 "$ZERUN_BIN" run --rootfs "$ROOTFS" "$@" -- /bin/true 2>"$trace_file") || ok=0
     e=$(now_ns)
     internal=$(extract_internal_ns "$(cat "$trace_file")")
-    echo "zerun,$i,$((e-s)),${internal:-},$ok" >> "$LAT_CSV"
+    echo "$label,$i,$((e-s)),${internal:-},$ok" >> "$LAT_CSV"
   done
+}
+
+bench_zerun() {
+  bench_zerun_mode zerun-t0 --net none --no-overlay
+  bench_zerun_mode zerun-t1 --net none
+  if [[ "$(id -u)" == "0" ]]; then
+    bench_zerun_mode zerun-t2 --net bridge
+  else
+    log "skipping zerun-t2 (bridge networking needs root; re-run with sudo for the complete budget)"
+  fi
 }
 
 # ---- generate a minimal OCI bundle for crun/runc comparison ------------------
@@ -174,10 +186,10 @@ bench_memory_peak() {
   fi
   log "cgroup memory peak test -> $cg"
   echo "runtime,memory_peak_bytes" > "$MEM_CSV"
-  # zerun: place the runner in the cgroup, then read peak after the run
-  # (includes the transient peak of runtime + workload).
-  echo $$ > "$cg/cgroup.procs" 2>/dev/null || true
-  "$ZERUN_BIN" run --rootfs "$ROOTFS" --net none --no-overlay -- /bin/true >/dev/null 2>&1 || true
+  # zerun: exec a helper shell into the cgroup, then read peak after the run
+  # (includes the transient peak of runtime + workload without pinning the
+  # benchmark shell to the same memory ceiling).
+  bash -c 'echo $$ > "$1/cgroup.procs" 2>/dev/null || true; exec "$2" run --rootfs "$3" --net none --no-overlay -- /bin/true >/dev/null 2>&1 || true' _ "$cg" "$ZERUN_BIN" "$ROOTFS"
   echo "zerun,$(cat "$cg/memory.peak" 2>/dev/null || echo NA)" >> "$MEM_CSV"
 
   # Step down memory.max to find the smallest value where /bin/true still runs.
@@ -186,7 +198,7 @@ bench_memory_peak() {
   local min_ok="NA"
   for sz in "${sizes[@]}"; do
     echo "$sz" > "$cg/memory.max" 2>/dev/null || continue
-    if "$ZERUN_BIN" run --rootfs "$ROOTFS" --net none --no-overlay -- /bin/true >/dev/null 2>&1; then
+    if bash -c 'echo $$ > "$1/cgroup.procs" 2>/dev/null || true; exec "$2" run --rootfs "$3" --net none --no-overlay -- /bin/true >/dev/null 2>&1' _ "$cg" "$ZERUN_BIN" "$ROOTFS"; then
       min_ok="$sz"
     else
       break # smaller will certainly fail; stop stepping

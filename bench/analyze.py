@@ -95,7 +95,7 @@ def main():
         baseline = min(stats, key=lambda r: stats[r]["median"])
     base_med = stats[baseline]["median"]
 
-    order = ["zerun", "crun", "runc"]
+    order = ["zerun-t0", "zerun-t1", "zerun-t2", "zerun", "crun", "runc"]
     runtimes = [r for r in order if r in stats] + [r for r in stats if r not in order]
 
     lines = []
@@ -140,20 +140,28 @@ def main():
             )
         lines.append("")
 
-    # Compare against the T0 budget from the design doc.
+    # Compare the layered budgets from the design doc.
     lines.append("## 3. Layered latency budget")
     lines.append("")
-    z = stats.get("zerun")
-    if z:
-        t0_budget_ms = 8.0
+    budgets = [
+        ("zerun-t0", "clone->execve (net=none, unpacked rootfs)", 8.0),
+        ("zerun-t1", "T0 + OverlayFS", 20.0),
+        ("zerun-t2", "T1 + veth/bridge/nft", 40.0),
+    ]
+    saw_budget = False
+    for runtime, description, budget_ms in budgets:
+        z = stats.get(runtime)
+        if not z:
+            continue
+        saw_budget = True
         med = ns2ms(z["median"])
-        if med <= t0_budget_ms:
-            verdict = "PASS"
-        else:
-            verdict = "OVER BUDGET (note: rootless + nested host / unpinned / cold cache all inflate the number)"
-        lines.append(f"- T0 = clone->execve (net=none, unpacked rootfs) budget **<= {t0_budget_ms:.0f} ms**")
-        lines.append(f"- zerun median = **{med:.3f} ms**, p95 = {ns2ms(z['p95']):.3f} ms -> {verdict}")
-        lines.append("- T1 (+OverlayFS <=20ms) and T2 (+veth/bridge/nft <=40ms) will be added once those milestones land")
+        verdict = "PASS" if med <= budget_ms else "OVER BUDGET"
+        lines.append(
+            f"- {runtime} = {description} budget **<= {budget_ms:.0f} ms**; "
+            f"median = **{med:.3f} ms**, p95 = {ns2ms(z['p95']):.3f} ms -> {verdict}"
+        )
+    if not saw_budget:
+        lines.append("- no `zerun-t*` samples found")
     lines.append("")
 
     sec = 4

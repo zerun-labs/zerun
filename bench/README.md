@@ -16,9 +16,9 @@ library` — no numpy/pandas/plotting deps — so they also run on low-end edge 
 
 ### Layered budget (design doc)
 
-- **T0** = clone -> execve (`--net none`, unpacked rootfs): budget **<= 8 ms**
-- **T1** = T0 + OverlayFS mount: budget **<= 20 ms** (extended after M2)
-- **T2** = T1 + veth/bridge/nft: budget **<= 40 ms** (extended after the networking milestone)
+- **T0** = clone -> execve (`--net none --no-overlay`, unpacked rootfs): budget **<= 8 ms**
+- **T1** = T0 + OverlayFS mount (`--net none`): budget **<= 20 ms**
+- **T2** = T1 + veth/bridge/NAT (`--net bridge`, rootful): budget **<= 40 ms**
 
 External anchors (crun official data, 100x /bin/true): crun ~1.69 s (~17 ms
 each), runc ~3.34 s (~33 ms each), crun can start a container inside a 512 KiB
@@ -44,8 +44,11 @@ test -x /tmp/rootfs/bin/true && echo OK
 # Build the binary under test first
 cargo build --release
 
-# Default: warmup 20, sample 100
+# Default: warmup 20, sample 100 for each available budget mode
 ./bench.sh 100 /tmp/rootfs
+
+# Bridge/NAT (T2) needs root; sudo also avoids a per-sample privilege prompt
+sudo ./bench.sh 100 /tmp/rootfs
 
 # Custom warmup count / custom binary
 WARMUP=50 ZERUN_BIN=/path/to/zerun ./bench.sh 200 /tmp/rootfs
@@ -54,13 +57,16 @@ WARMUP=50 ZERUN_BIN=/path/to/zerun ./bench.sh 200 /tmp/rootfs
 Script behavior:
 
 1. `taskset`-pins to the last online core (no pinning without taskset);
-2. warms up then samples each runtime that **exists and runs in the current
-   environment**, writing `results/latency-<ts>.csv` row by row;
+2. warms up then samples `zerun-t0`, `zerun-t1`, and, when running as root,
+   `zerun-t2`; it also samples each OCI runtime that **exists and runs in the
+   current environment**, writing `results/latency-<ts>.csv` row by row;
 3. crun/runc are skipped when missing; installed but unrunnable in a rootless /
    nested host (e.g. proc mounts rejected by LSM) are skipped with a note;
-4. the memory section is skipped when cgroup v2 is not writable (rootless
+4. T2 is skipped when not running as root (bridge networking needs
+   CAP_NET_ADMIN);
+5. the memory section is skipped when cgroup v2 is not writable (rootless
    without delegation);
-5. `analyze.py` summarizes into `results/report-<ts>.md` and updates
+6. `analyze.py` summarizes into `results/report-<ts>.md` and updates
    `results/latest-report.md`.
 
 ## 4. Install comparison runtimes (optional but strongly recommended)
