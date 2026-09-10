@@ -2819,8 +2819,9 @@ fn cmd_logs(args: &[String]) -> i32 {
     let followed_from = shown.len() as u64;
     let shown = logs::filter_log_lines(shown, Some(&filter));
     write_log_output(&shown, timestamps);
-    // A fixed --until is an end boundary; only unbounded logs can follow.
-    if follow && !filter.has_until() {
+    // A fixed --until is an end boundary: future times still follow until the
+    // wall clock reaches them; a past time only shows the historical window.
+    if follow {
         follow_log(&store, &st, &path, followed_from, timestamps, Some(&filter));
     }
     0
@@ -2835,11 +2836,17 @@ fn follow_log(
     timestamps: bool,
     filter: Option<&LogTimeFilter>,
 ) {
-    while container_observable(store, st) {
+    loop {
+        if filter.is_some_and(LogTimeFilter::until_reached) {
+            break;
+        }
+        if !container_observable(store, st) {
+            drain_log(path, pos, timestamps, filter);
+            break;
+        }
         std::thread::sleep(Duration::from_millis(200));
         pos = drain_log(path, pos, timestamps, filter);
     }
-    drain_log(path, pos, timestamps, filter);
 }
 
 fn drain_log(path: &Path, pos: u64, timestamps: bool, filter: Option<&LogTimeFilter>) -> u64 {

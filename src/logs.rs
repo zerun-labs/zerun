@@ -48,9 +48,9 @@ impl LogTimeFilter {
         self.since.is_some() || self.until.is_some()
     }
 
-    /// Whether the selected window has a known end boundary.
-    pub fn has_until(&self) -> bool {
-        self.until.is_some()
+    /// Whether the wall clock has passed a fixed `--until` boundary.
+    pub fn until_reached(&self) -> bool {
+        self.until.is_some_and(|until| now_nanos() >= until)
     }
 
     fn contains(&self, timestamp: i128) -> bool {
@@ -410,6 +410,12 @@ mod tests {
         assert_eq!(parse_duration("-2s"), Some(-2_000_000_000));
         assert_eq!(parse_duration("1d"), None);
         assert_eq!(parse_duration("1"), None);
+    }
+
+    #[test]
+    fn detects_when_follow_until_boundary_has_passed() {
+        assert!(filter(None, Some("2000-01-01T00:00:00Z")).until_reached());
+        assert!(!filter(None, Some("3000-01-01T00:00:00Z")).until_reached());
     }
 
     #[test]
