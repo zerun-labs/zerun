@@ -1776,7 +1776,48 @@ fn cmd_pull(args: &[String]) -> i32 {
     }
 }
 
-fn cmd_images(_args: &[String]) -> i32 {
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ImagesOptions {
+    digests: bool,
+    quiet: bool,
+    json: bool,
+}
+
+fn parse_images_options(args: &[String]) -> Result<ImagesOptions, String> {
+    let mut opts = ImagesOptions::default();
+    for arg in args {
+        match arg.as_str() {
+            "--digests" => opts.digests = true,
+            "-q" | "--quiet" => opts.quiet = true,
+            "--json" => opts.json = true,
+            other => return Err(format!("unknown option {other}")),
+        }
+    }
+    Ok(opts)
+}
+
+fn image_digest(record: &image::store::ImageRecord) -> &str {
+    record.index.as_deref().unwrap_or(&record.manifest)
+}
+
+fn image_id(record: &image::store::ImageRecord) -> String {
+    image::store::digest_hex(&record.manifest)
+        .map(|h| h[..12.min(h.len())].to_string())
+        .unwrap_or_else(|_| "?".to_string())
+}
+
+fn cmd_images(args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("usage: zerun images [--digests] [-q|--quiet] [--json]");
+        return 0;
+    }
+    let opts = match parse_images_options(args) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("zerun images: {e}");
+            return 2;
+        }
+    };
     let store = match Store::detect() {
         Ok(s) => s,
         Err(e) => {
@@ -1799,19 +1840,51 @@ fn cmd_images(_args: &[String]) -> i32 {
         }
     };
     records.sort_by(|a, b| a.name.cmp(&b.name).then(a.tag.cmp(&b.tag)));
-    println!("{:<40} {:<16} {:<14} SIZE", "REPOSITORY", "TAG", "IMAGE ID");
+    if opts.json {
+        match serde_json::to_string_pretty(&records) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                eprintln!("zerun images: serialize JSON: {e}");
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if opts.quiet {
+        for r in &records {
+            println!("{}", image_id(r));
+        }
+        return 0;
+    }
+    if opts.digests {
+        println!(
+            "{:<40} {:<16} {:<14} {:<71} SIZE",
+            "REPOSITORY", "TAG", "IMAGE ID", "DIGEST"
+        );
+    } else {
+        println!("{:<40} {:<16} {:<14} SIZE", "REPOSITORY", "TAG", "IMAGE ID");
+    }
     for r in &records {
         let tag = r.tag.as_deref().unwrap_or("<none>");
-        let id = image::store::digest_hex(&r.manifest)
-            .map(|h| h[..12.min(h.len())].to_string())
-            .unwrap_or_else(|_| "?".to_string());
-        println!(
-            "{:<40} {:<16} {:<14} {}",
-            r.name,
-            tag,
-            id,
-            fsutil::human_size(r.size_bytes)
-        );
+        let id = image_id(r);
+        if opts.digests {
+            println!(
+                "{:<40} {:<16} {:<14} {:<71} {}",
+                r.name,
+                tag,
+                id,
+                image_digest(r),
+                fsutil::human_size(r.size_bytes)
+            );
+        } else {
+            println!(
+                "{:<40} {:<16} {:<14} {}",
+                r.name,
+                tag,
+                id,
+                fsutil::human_size(r.size_bytes)
+            );
+        }
     }
     0
 }
@@ -4759,7 +4832,8 @@ USAGE:\n  \
   zerun login [REGISTRY] [-u USER] [--password-stdin]\n  \
                                         log in to a private registry\n  \
   zerun logout [REGISTRY]               remove stored registry credentials\n  \
-  zerun images                           list local images\n  \
+  zerun images [--digests] [-q] [--json]\n  \
+                                        list local images\n  \
   zerun rmi IMAGE...                     remove local images\n  \
   zerun prune [-f] [--images]            remove exited containers/image garbage\n  \
   zerun system df                        summarize image/container disk usage\n  \
@@ -4819,6 +4893,42 @@ ENV:\n  \
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_images_options_and_rejects_unknown_flags() {
+        let args: Vec<_> = ["--digests", "-q", "--json"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            parse_images_options(&args).unwrap(),
+            ImagesOptions {
+                digests: true,
+                quiet: true,
+                json: true,
+            }
+        );
+        assert!(parse_images_options(&["--all".to_string()])
+            .unwrap_err()
+            .contains("unknown option --all"));
+    }
+
+    #[test]
+    fn image_digest_prefers_the_multi_arch_index() {
+        let mut record = image::store::ImageRecord {
+            name: "docker.io/library/alpine".to_string(),
+            tag: Some("latest".to_string()),
+            manifest: format!("sha256:{}", "1".repeat(64)),
+            index: None,
+            config: format!("sha256:{}", "2".repeat(64)),
+            size_bytes: 0,
+            created_at: 0,
+        };
+        assert_eq!(image_digest(&record), record.manifest);
+        record.index = Some(format!("sha256:{}", "3".repeat(64)));
+        assert_eq!(image_digest(&record), record.index.as_deref().unwrap());
+        assert_eq!(image_id(&record), "111111111111");
+    }
 
     #[test]
     fn export_archives_tree_and_skips_mounts() {

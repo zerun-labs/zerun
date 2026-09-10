@@ -110,8 +110,15 @@ target/release/zerun run --init alpine /bin/sh -c 'echo hi; exit 7'; echo $?
 
 # Image lifecycle
 target/release/zerun images
+target/release/zerun images --digests       # include manifest/index digests
+target/release/zerun images -q              # image IDs only
+target/release/zerun images --json          # machine-readable records
 target/release/zerun rmi alpine
 ```
+
+For multi-architecture images, `--digests` reports the preserved OCI index
+digest rather than the selected platform manifest digest. `--json` exposes
+the complete local image records, including both digests and the image config.
 
 Commit a detached container's current filesystem into a local OCI image
 (`commit` works while running, but a running filesystem may be inconsistent):
