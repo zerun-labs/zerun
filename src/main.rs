@@ -9,6 +9,7 @@
 //!   zerun doctor                          environment diagnostics
 mod cgroup;
 mod error;
+mod events;
 mod execc;
 mod fsutil;
 mod image;
@@ -63,6 +64,7 @@ fn main() {
         Some("cp") => cmd_cp(&args[2..]),
         Some("export") => cmd_export(&args[2..]),
         Some("import") => cmd_import(&args[2..]),
+        Some("events") => cmd_events(&args[2..]),
         Some("exec") => cmd_exec(&args[2..]),
         Some("login") => cmd_login(&args[2..]),
         Some("logout") => cmd_logout(&args[2..]),
@@ -3355,6 +3357,43 @@ fn cmd_import(args: &[String]) -> i32 {
     }
 }
 
+/// `zerun events` — stream container lifecycle events until interrupted.
+///
+/// Read-only polling of the persisted state records (no daemon, no inotify
+/// dependency): transitions are diffed every 200 ms and anchored to the
+/// states' own timestamps. The first snapshot is silent, like
+/// `docker events` live mode.
+fn cmd_events(args: &[String]) -> i32 {
+    if let Some(a) = args.first() {
+        if a == "-h" || a == "--help" {
+            println!("usage: zerun events");
+            return 0;
+        }
+        eprintln!("zerun events: unknown option {a}");
+        return 2;
+    }
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    use std::io::Write as _;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut previous = state::list(&store);
+    loop {
+        std::thread::sleep(Duration::from_millis(200));
+        let current = state::list(&store);
+        for event in events::diff_events(&previous, &current) {
+            let _ = writeln!(out, "{}", events::format_event(&event));
+        }
+        let _ = out.flush();
+        previous = current;
+    }
+}
+
 fn cmd_exec(args: &[String]) -> i32 {
     let mut env_extra: Vec<String> = Vec::new();
     let mut workdir: Option<String> = None;
@@ -3669,6 +3708,7 @@ USAGE:\n  \
   zerun cp SRC DST                       copy files to/from a running container\n  \
   zerun export [-o FILE] CONTAINER       export a container rootfs as tar\n  \
   zerun import [-m MSG] FILE|- TARGET    import a rootfs tar as a local image\n  \
+  zerun events                           stream container lifecycle events\n  \
   zerun exec [-e K=V] [-w DIR] CONTAINER CMD [ARG...]\n  \
                                         run a command in a running container\n  \
   zerun pull [--platform ...] IMAGE...   pull OCI images (Docker Hub, mirrors)\n  \

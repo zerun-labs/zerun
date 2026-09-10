@@ -50,8 +50,8 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   `/proc`/`/sys` paths, and a deny-by-default seccomp allowlist (opt out with
   `--seccomp unconfined`).
 - **Docker-compatible top 20% CLI**: `run / ps / wait / stop / restart / rm / logs / exec / inspect /
-  port / rename / top / cp / export / import / pull / push / tag / save / load / login / logout /
-  images / rmi / commit / generate-service / doctor`.
+  port / rename / top / cp / export / import / events / pull / push / tag / save / load / login /
+  logout / images / rmi / commit / generate-service / doctor`.
 
 ## Install
 
