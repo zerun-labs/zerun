@@ -5,10 +5,9 @@
 //! is killed. The BPF program is tiny (one JEQ per allowed syscall + epilogue),
 //! well under the kernel's 4096-instruction limit.
 //!
-//! Architecture support is incremental: the allowlist table currently covers
-//! x86_64 only. On other targets `SeccompMode::Default` degrades to an explicit
-//! error (use `--seccomp unconfined`); add tables in `default_allowlist()` as
-//! cross targets are brought up.
+//! The shared allowlist covers the release architectures (x86_64, ARM64, ARMv7,
+//! and RISC-V64); unsupported targets intentionally fail to compile rather than
+//! silently claiming seccomp support.
 use crate::error::ZResult;
 use crate::trace;
 
@@ -98,16 +97,7 @@ pub fn apply(mode: SeccompMode) -> ZResult<()> {
 ///   4+n        RET ERRNO|EPERM        (default deny)
 ///   4+n+1      RET ALLOW
 pub fn build_default_program() -> ZResult<Vec<libc::sock_filter>> {
-    let allowed = match default_allowlist() {
-        Some(list) => list,
-        None => {
-            return Err(crate::zerr!(
-                "default seccomp profile is not implemented for target_arch={:?}; \
-                 use --seccomp unconfined",
-                std::env::consts::ARCH
-            ))
-        }
-    };
+    let allowed = default_allowlist();
     let n = allowed.len();
     if n > u8::MAX as usize {
         return Err(crate::zerr!(
@@ -148,26 +138,22 @@ fn bpf_jump(code: u16, jt: u8, jf: u8, k: u32) -> libc::sock_filter {
 
 /// Syscalls allowed by the default profile.
 ///
-/// Curated from the Linux x86_64 table for typical musl/glibc workloads plus
+/// Curated from the Linux syscall tables for typical musl/glibc workloads plus
 /// common language runtimes; everything else is denied with EPERM. Privileged
 /// and dangerous calls (mount, keyctl, bpf, ptrace, userfaultfd, module
 /// loading, reboot, ...) are intentionally absent.
-#[cfg(target_arch = "x86_64")]
-fn default_allowlist() -> Option<Vec<u32>> {
-    // Deliberately unsorted; deduplicated below.
+fn common_allowlist() -> Vec<libc::c_long> {
+    // This subset is available on every release architecture. Modern ABIs
+    // intentionally omit legacy calls; per-architecture extensions below add
+    // the calls those ABIs still provide.
     let raw: &[libc::c_long] = &[
-        libc::SYS_access,
         libc::SYS_accept,
         libc::SYS_accept4,
-        libc::SYS_alarm,
-        libc::SYS_arch_prctl,
         libc::SYS_bind,
         libc::SYS_brk,
         libc::SYS_capget,
         libc::SYS_capset,
         libc::SYS_chdir,
-        libc::SYS_chmod,
-        libc::SYS_chown,
         libc::SYS_clock_getres,
         libc::SYS_clock_gettime,
         libc::SYS_clock_nanosleep,
@@ -177,16 +163,11 @@ fn default_allowlist() -> Option<Vec<u32>> {
         libc::SYS_close_range,
         libc::SYS_connect,
         libc::SYS_copy_file_range,
-        libc::SYS_creat,
         libc::SYS_dup,
-        libc::SYS_dup2,
         libc::SYS_dup3,
-        libc::SYS_epoll_create,
         libc::SYS_epoll_create1,
         libc::SYS_epoll_ctl,
         libc::SYS_epoll_pwait,
-        libc::SYS_epoll_wait,
-        libc::SYS_eventfd,
         libc::SYS_eventfd2,
         libc::SYS_execve,
         libc::SYS_execveat,
@@ -205,7 +186,6 @@ fn default_allowlist() -> Option<Vec<u32>> {
         libc::SYS_fgetxattr,
         libc::SYS_flistxattr,
         libc::SYS_flock,
-        libc::SYS_fork,
         libc::SYS_fremovexattr,
         libc::SYS_fsetxattr,
         libc::SYS_fstat,
@@ -215,7 +195,6 @@ fn default_allowlist() -> Option<Vec<u32>> {
         libc::SYS_futex,
         libc::SYS_getcpu,
         libc::SYS_getcwd,
-        libc::SYS_getdents,
         libc::SYS_getdents64,
         libc::SYS_getegid,
         libc::SYS_geteuid,
@@ -224,14 +203,12 @@ fn default_allowlist() -> Option<Vec<u32>> {
         libc::SYS_getitimer,
         libc::SYS_getpeername,
         libc::SYS_getpgid,
-        libc::SYS_getpgrp,
         libc::SYS_getpid,
         libc::SYS_getppid,
         libc::SYS_getpriority,
         libc::SYS_getrandom,
         libc::SYS_getresgid,
         libc::SYS_getresuid,
-        libc::SYS_getrlimit,
         libc::SYS_getrusage,
         libc::SYS_getsid,
         libc::SYS_getsockname,
@@ -241,14 +218,11 @@ fn default_allowlist() -> Option<Vec<u32>> {
         libc::SYS_getuid,
         libc::SYS_getxattr,
         libc::SYS_inotify_add_watch,
-        libc::SYS_inotify_init,
         libc::SYS_inotify_init1,
         libc::SYS_inotify_rm_watch,
         libc::SYS_ioctl,
         libc::SYS_kill,
-        libc::SYS_lchown,
         libc::SYS_lgetxattr,
-        libc::SYS_link,
         libc::SYS_linkat,
         libc::SYS_listen,
         libc::SYS_listxattr,
@@ -256,18 +230,14 @@ fn default_allowlist() -> Option<Vec<u32>> {
         libc::SYS_lremovexattr,
         libc::SYS_lseek,
         libc::SYS_lsetxattr,
-        libc::SYS_lstat,
         libc::SYS_madvise,
         libc::SYS_memfd_create,
         libc::SYS_mincore,
-        libc::SYS_mkdir,
         libc::SYS_mkdirat,
-        libc::SYS_mknod,
         libc::SYS_mknodat,
         libc::SYS_mlock,
         libc::SYS_mlock2,
         libc::SYS_mlockall,
-        libc::SYS_mmap,
         libc::SYS_mprotect,
         libc::SYS_mq_getsetattr,
         libc::SYS_mq_notify,
@@ -286,15 +256,10 @@ fn default_allowlist() -> Option<Vec<u32>> {
         libc::SYS_munmap,
         libc::SYS_name_to_handle_at,
         libc::SYS_nanosleep,
-        libc::SYS_newfstatat,
-        libc::SYS_open,
         libc::SYS_openat,
         libc::SYS_openat2,
-        libc::SYS_pause,
         libc::SYS_personality,
-        libc::SYS_pipe,
         libc::SYS_pipe2,
-        libc::SYS_poll,
         libc::SYS_ppoll,
         libc::SYS_prctl,
         libc::SYS_pread64,
@@ -304,19 +269,14 @@ fn default_allowlist() -> Option<Vec<u32>> {
         libc::SYS_pwrite64,
         libc::SYS_pwritev,
         libc::SYS_read,
-        libc::SYS_readlink,
         libc::SYS_readlinkat,
         libc::SYS_readv,
         libc::SYS_recvfrom,
         libc::SYS_recvmmsg,
         libc::SYS_recvmsg,
         libc::SYS_removexattr,
-        libc::SYS_rename,
-        libc::SYS_renameat,
         libc::SYS_renameat2,
         libc::SYS_restart_syscall,
-        libc::SYS_rmdir,
-        libc::SYS_rseq,
         libc::SYS_rt_sigaction,
         libc::SYS_rt_sigpending,
         libc::SYS_rt_sigprocmask,
@@ -335,7 +295,6 @@ fn default_allowlist() -> Option<Vec<u32>> {
         libc::SYS_sched_setparam,
         libc::SYS_sched_setscheduler,
         libc::SYS_sched_yield,
-        libc::SYS_select,
         libc::SYS_semctl,
         libc::SYS_semget,
         libc::SYS_semop,
@@ -366,23 +325,18 @@ fn default_allowlist() -> Option<Vec<u32>> {
         libc::SYS_shmget,
         libc::SYS_shutdown,
         libc::SYS_sigaltstack,
-        libc::SYS_signalfd,
         libc::SYS_signalfd4,
         libc::SYS_socket,
         libc::SYS_socketpair,
         libc::SYS_splice,
-        libc::SYS_stat,
         libc::SYS_statfs,
         libc::SYS_statx,
-        libc::SYS_symlink,
         libc::SYS_symlinkat,
         libc::SYS_sync,
-        libc::SYS_sync_file_range,
         libc::SYS_syncfs,
         libc::SYS_sysinfo,
         libc::SYS_tee,
         libc::SYS_tgkill,
-        libc::SYS_time,
         libc::SYS_timer_create,
         libc::SYS_timer_delete,
         libc::SYS_timer_getoverrun,
@@ -396,28 +350,144 @@ fn default_allowlist() -> Option<Vec<u32>> {
         libc::SYS_truncate,
         libc::SYS_umask,
         libc::SYS_uname,
-        libc::SYS_unlink,
         libc::SYS_unlinkat,
         libc::SYS_unshare,
-        libc::SYS_utime,
         libc::SYS_utimensat,
-        libc::SYS_utimes,
-        libc::SYS_vfork,
         libc::SYS_vmsplice,
         libc::SYS_wait4,
         libc::SYS_waitid,
         libc::SYS_write,
         libc::SYS_writev,
     ];
+    raw.to_vec()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn target_allowlist(common: &mut Vec<libc::c_long>) {
+    let raw: &[libc::c_long] = &[
+        libc::SYS_access,
+        libc::SYS_alarm,
+        libc::SYS_arch_prctl,
+        libc::SYS_chmod,
+        libc::SYS_chown,
+        libc::SYS_creat,
+        libc::SYS_dup2,
+        libc::SYS_epoll_create,
+        libc::SYS_epoll_wait,
+        libc::SYS_eventfd,
+        libc::SYS_fork,
+        libc::SYS_getdents,
+        libc::SYS_getpgrp,
+        libc::SYS_getrlimit,
+        libc::SYS_inotify_init,
+        libc::SYS_lchown,
+        libc::SYS_link,
+        libc::SYS_lstat,
+        libc::SYS_mkdir,
+        libc::SYS_mknod,
+        libc::SYS_mmap,
+        libc::SYS_newfstatat,
+        libc::SYS_open,
+        libc::SYS_pause,
+        libc::SYS_pipe,
+        libc::SYS_poll,
+        libc::SYS_readlink,
+        libc::SYS_rename,
+        libc::SYS_renameat,
+        libc::SYS_rmdir,
+        libc::SYS_rseq,
+        libc::SYS_select,
+        libc::SYS_signalfd,
+        libc::SYS_stat,
+        libc::SYS_symlink,
+        libc::SYS_sync_file_range,
+        libc::SYS_time,
+        libc::SYS_unlink,
+        libc::SYS_utime,
+        libc::SYS_utimes,
+        libc::SYS_vfork,
+    ];
+    common.extend_from_slice(raw);
+}
+
+#[cfg(target_arch = "aarch64")]
+fn target_allowlist(common: &mut Vec<libc::c_long>) {
+    let raw: &[libc::c_long] = &[
+        libc::SYS_getrlimit,
+        libc::SYS_mmap,
+        libc::SYS_newfstatat,
+        libc::SYS_renameat,
+        libc::SYS_rseq,
+        libc::SYS_sync_file_range,
+    ];
+    common.extend_from_slice(raw);
+}
+
+#[cfg(target_arch = "arm")]
+fn target_allowlist(common: &mut Vec<libc::c_long>) {
+    let raw: &[libc::c_long] = &[
+        libc::SYS_access,
+        libc::SYS_chmod,
+        libc::SYS_chown,
+        libc::SYS_creat,
+        libc::SYS_dup2,
+        libc::SYS_epoll_create,
+        libc::SYS_epoll_wait,
+        libc::SYS_eventfd,
+        libc::SYS_fork,
+        libc::SYS_getdents,
+        libc::SYS_getpgrp,
+        libc::SYS_inotify_init,
+        libc::SYS_lchown,
+        libc::SYS_link,
+        libc::SYS_lstat,
+        libc::SYS_mkdir,
+        libc::SYS_mknod,
+        libc::SYS_open,
+        libc::SYS_pause,
+        libc::SYS_pipe,
+        libc::SYS_poll,
+        libc::SYS_readlink,
+        libc::SYS_rename,
+        libc::SYS_renameat,
+        libc::SYS_rmdir,
+        libc::SYS_signalfd,
+        libc::SYS_stat,
+        libc::SYS_symlink,
+        libc::SYS_unlink,
+        libc::SYS_utimes,
+        libc::SYS_vfork,
+    ];
+    common.extend_from_slice(raw);
+}
+
+#[cfg(target_arch = "riscv64")]
+fn target_allowlist(common: &mut Vec<libc::c_long>) {
+    let raw: &[libc::c_long] = &[
+        libc::SYS_getrlimit,
+        libc::SYS_mmap,
+        libc::SYS_newfstatat,
+        libc::SYS_rseq,
+        libc::SYS_sync_file_range,
+    ];
+    common.extend_from_slice(raw);
+}
+
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "arm",
+    target_arch = "riscv64"
+)))]
+fn target_allowlist(_common: &mut Vec<libc::c_long>) {}
+
+fn default_allowlist() -> Vec<u32> {
+    let mut raw = common_allowlist();
+    target_allowlist(&mut raw);
     let mut list: Vec<u32> = raw.iter().map(|&nr| nr as u32).collect();
     list.sort_unstable();
     list.dedup();
-    Some(list)
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn default_allowlist() -> Option<Vec<u32>> {
-    None
+    list
 }
 
 #[cfg(test)]
@@ -432,7 +502,6 @@ mod tests {
         i.k
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn program_structure_is_sane() {
         let p = build_default_program().unwrap();
@@ -455,11 +524,10 @@ mod tests {
         assert_eq!(k_of(&p[last - 1]), SECCOMP_RET_ERRNO | EPERM);
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn every_allowed_syscall_is_present_and_jump_lands_on_allow() {
         let p = build_default_program().unwrap();
-        let allowed = default_allowlist().unwrap();
+        let allowed = default_allowlist();
         let allow_idx = (p.len() - 1) as usize;
         // Compare block: p[4 .. 4+n); each must JEQ an allowlisted nr and its
         // jt must land exactly on the ALLOW instruction.
