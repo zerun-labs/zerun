@@ -109,7 +109,18 @@ fn remove_rec(p: &Path) -> std::io::Result<()> {
         Err(_) => {}
     }
     // Non-empty: recurse, then remove the directory itself.
-    let rd = fs::read_dir(p)?;
+    let rd = match fs::read_dir(p) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // OverlayFS creates its internal work/work directory mode 000 even
+            // when the remover owns it. Removal only needs the *parent* to be
+            // writable, but enumerating its children requires reopening it.
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o700));
+            fs::read_dir(p)?
+        }
+        Err(e) => return Err(e),
+    };
     for entry in rd {
         let entry = entry?;
         remove_rec(&entry.path())?;
@@ -154,5 +165,26 @@ mod tests {
         assert_eq!(human_size(1023), "1023 B");
         assert_eq!(human_size(1024), "1.0 KB");
         assert_eq!(human_size(3_700_000), "3.5 MB");
+    }
+
+    #[test]
+    fn removes_non_empty_mode_000_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-fs-mode000-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let locked = dir.join("work");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("child"), b"data").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        remove_dir_all_quiet(&dir);
+        assert!(!dir.exists());
     }
 }
