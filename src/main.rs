@@ -8,6 +8,7 @@
 //!   zerun login / logout / pull / images / rmi   image lifecycle (M3)
 //!   zerun doctor                          environment diagnostics
 mod cgroup;
+mod containerdiff;
 mod error;
 mod events;
 mod execc;
@@ -63,6 +64,7 @@ fn main() {
         Some("port") => cmd_port(&args[2..]),
         Some("rename") => cmd_rename(&args[2..]),
         Some("top") => cmd_top(&args[2..]),
+        Some("diff") => cmd_diff(&args[2..]),
         Some("cp") => cmd_cp(&args[2..]),
         Some("export") => cmd_export(&args[2..]),
         Some("import") => cmd_import(&args[2..]),
@@ -1126,7 +1128,7 @@ fn cmd_commit(args: &[String]) -> i32 {
             Some(overlay) => {
                 let upper = std::path::Path::new(overlay).join("upper");
                 let staging = imgstore.blob_tmp("commit-source");
-                match committable_lower_rootfs(&imgstore, &st) {
+                match lower_rootfs(&store, &st) {
                     Ok(lower) => {
                         let root = match image::commit::rebuild_rootfs(&lower, &upper, &staging) {
                             Ok(p) => p,
@@ -1187,26 +1189,6 @@ fn cmd_commit(args: &[String]) -> i32 {
             1
         }
     }
-}
-
-/// Resolve the lower rootfs backing a detached container's overlay.
-fn committable_lower_rootfs(
-    imgstore: &image::store::ImageStore,
-    st: &state::ContainerState,
-) -> Result<std::path::PathBuf, String> {
-    if let Some(path) = st.image.strip_prefix("rootfs:") {
-        return Ok(std::path::PathBuf::from(path));
-    }
-    let reference = Reference::parse(&st.image).map_err(|e| e.to_string())?;
-    image::local_image(imgstore, &reference)
-        .map_err(|e| e.to_string())?
-        .map(|(rootfs, _)| rootfs)
-        .ok_or_else(|| {
-            format!(
-                "base image '{}' is missing; it is needed to commit this exited container",
-                st.image
-            )
-        })
 }
 
 fn net_label(net: NetMode) -> String {
@@ -3378,6 +3360,97 @@ fn copy_between(src: &Path, dst: &Path) -> crate::error::ZResult<()> {
     }
 }
 
+/// `zerun diff CONTAINER` — show the container's filesystem changes.
+///
+/// The writable OverlayFS upper is compared directly with the image's
+/// materialized lower root. This works for both running and retained exited
+/// containers without needing to inspect mounts inside the container.
+fn cmd_diff(args: &[String]) -> i32 {
+    let mut targets: Vec<&str> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "-h" | "--help" => {
+                println!("usage: zerun diff CONTAINER");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun diff: unknown option {other}");
+                return 2;
+            }
+            other => targets.push(other),
+        }
+    }
+    let [target] = targets.as_slice() else {
+        eprintln!("usage: zerun diff CONTAINER");
+        return 2;
+    };
+
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let st = match state::resolve(&store, target) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun diff: {e}");
+            return 1;
+        }
+    };
+    if st.tmpfs_upper {
+        eprintln!("zerun diff: a --tmpfs-upper container has no persisted writable layer");
+        return 1;
+    }
+    let Some(overlay) = &st.overlay else {
+        eprintln!(
+            "zerun diff: container {} has no writable overlay",
+            display_name(&st)
+        );
+        return 1;
+    };
+    let upper = Path::new(overlay).join("upper");
+    let lower = match lower_rootfs(&store, &st) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("zerun diff: {e}");
+            return 1;
+        }
+    };
+    let changes = match containerdiff::diff_roots(&lower, &upper) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("zerun diff: {e}");
+            return 1;
+        }
+    };
+    for change in changes {
+        println!("{} {}", change.kind.label(), change.path.display());
+    }
+    0
+}
+
+/// Locate the base rootfs for a container. This intentionally shares commit's
+/// semantics: image-backed containers use the materialized lower root, while
+/// legacy `rootfs:` containers use their original unpacked directory.
+fn lower_rootfs(store: &Store, st: &state::ContainerState) -> Result<PathBuf, String> {
+    if let Some(path) = st.image.strip_prefix("rootfs:") {
+        return Ok(PathBuf::from(path));
+    }
+    let reference = Reference::parse(&st.image).map_err(|e| e.to_string())?;
+    let imgstore = image::store::ImageStore::open(store).map_err(|e| e.to_string())?;
+    image::local_image(&imgstore, &reference)
+        .map_err(|e| e.to_string())?
+        .map(|(rootfs, _)| rootfs)
+        .ok_or_else(|| {
+            format!(
+                "base image '{}' is missing; it is needed to diff this container",
+                st.image
+            )
+        })
+}
+
 /// `zerun export [-o FILE] CONTAINER` — stream the live container rootfs
 /// as an uncompressed tar.
 ///
@@ -4148,6 +4221,7 @@ USAGE:\n  \
   zerun port CONTAINER                   list published port mappings\n  \
   zerun rename OLD NEW                   rename a container\n  \
   zerun top CONTAINER                    list a container's processes\n  \
+  zerun diff CONTAINER                   list changed, added, and deleted paths\n  \
   zerun cp SRC DST                       copy files to/from a running container\n  \
   zerun export [-o FILE] CONTAINER       export a container rootfs as tar\n  \
   zerun import [-m MSG] FILE|- TARGET    import a rootfs tar as a local image\n  \
