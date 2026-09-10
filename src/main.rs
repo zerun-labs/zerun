@@ -46,6 +46,7 @@ use namespace::{NetMode, RunSpec};
 use psfilter::PsFilter;
 use seccomp::SeccompMode;
 use state::ContainerState;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -146,6 +147,7 @@ struct RunArgs {
     ports: Vec<network::PublishedPort>,
     volumes: Vec<mounts::BindMount>,
     dns: Vec<String>,
+    labels: BTreeMap<String, String>,
     argv: Vec<String>,
     /// `-i/--interactive`: keep stdin attached (foreground runs).
     interactive: bool,
@@ -298,6 +300,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 v.parse::<std::net::IpAddr>()
                     .map_err(|_| format!("invalid --dns address '{v}'"))?;
                 a.dns.push(v);
+            }
+            "--label" => {
+                let (k, v) = parse_label(&next_value(args, &mut i, "--label")?)?;
+                a.labels.insert(k, v);
             }
             "--detach" | "-d" => {
                 a.detach = true;
@@ -515,7 +521,7 @@ fn cmd_run(args: &[String]) -> i32 {
 
     // Resolve the container root filesystem and, for image mode, the process
     // environment / working directory / default command from the OCI config.
-    let (rootfs, env, cwd, user, argv) = if let Some(rootfs_str) = &a.rootfs {
+    let (rootfs, env, cwd, user, argv, labels) = if let Some(rootfs_str) = &a.rootfs {
         if !a.env.is_empty() {
             eprintln!("zerun run: -e/--env requires image mode (drop --rootfs)");
             return 2;
@@ -532,7 +538,7 @@ fn cmd_run(args: &[String]) -> i32 {
         if argv.is_empty() {
             argv = vec!["/bin/sh".to_string()];
         }
-        (rootfs, None, None, None, argv)
+        (rootfs, None, None, None, argv, a.labels.clone())
     } else {
         let image = a.image.as_deref().expect("image required");
         let reference = match Reference::parse(image) {
@@ -547,6 +553,8 @@ fn cmd_run(args: &[String]) -> i32 {
                 let env =
                     build_image_env(&cfg.config.env, &a.env, a.hostname.as_deref(), &id, a.tty);
                 let argv = resolve_image_argv(&cfg, &a.argv);
+                let mut labels = cfg.config.labels.clone();
+                labels.extend(a.labels.clone());
                 let cwd = if cfg.config.working_dir.is_empty() {
                     None
                 } else {
@@ -563,7 +571,7 @@ fn cmd_run(args: &[String]) -> i32 {
                 if let Some(w) = &user_warning {
                     eprintln!("{w}");
                 }
-                (rootfs, Some(env), cwd, user, argv)
+                (rootfs, Some(env), cwd, user, argv, labels)
             }
             Err(e) => {
                 eprintln!("zerun: {e}");
@@ -664,6 +672,7 @@ fn cmd_run(args: &[String]) -> i32 {
                 launch_args,
                 name: a.name,
                 rm: a.rm,
+                labels,
             },
         );
     }
@@ -692,6 +701,7 @@ struct DetachedInfo {
     launch_args: Vec<String>,
     name: Option<String>,
     rm: bool,
+    labels: BTreeMap<String, String>,
 }
 
 fn run_detached(
@@ -772,6 +782,7 @@ fn run_detached(
         env,
         cwd: spec.cwd.clone(),
         user: spec.user.clone(),
+        labels: info.labels,
         log: log_path.display().to_string(),
         rootfs: state_rootfs.to_string(),
         overlay: container_fs
@@ -971,6 +982,9 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     }
     for v in &a.dns {
         args.extend(["--dns".to_string(), v.clone()]);
+    }
+    for (k, v) in &a.labels {
+        args.extend(["--label".to_string(), format!("{k}={v}")]);
     }
     if a.rm {
         args.push("--rm".to_string());
@@ -1217,6 +1231,7 @@ fn cmd_commit(args: &[String]) -> i32 {
         cmd: st.cmd.clone(),
         working_dir: st.cwd.clone().unwrap_or_else(|| "/".to_string()),
         user: st.user.clone(),
+        labels: st.labels.clone(),
         comment: message,
         author,
     };
@@ -1434,6 +1449,16 @@ fn build_image_env(
         env.push(("TERM".to_string(), "xterm".to_string()));
     }
     env
+}
+
+fn parse_label(raw: &str) -> Result<(String, String), String> {
+    let Some((key, value)) = raw.split_once('=') else {
+        return Err(format!("invalid --label '{raw}' (expected KEY=VALUE)"));
+    };
+    if key.is_empty() {
+        return Err(format!("invalid --label '{raw}' (empty KEY)"));
+    }
+    Ok((key.to_string(), value.to_string()))
 }
 
 fn upsert_env(env: &mut Vec<(String, String)>, key: String, value: String) {
@@ -4619,6 +4644,7 @@ mod tests {
             container: 80,
             protocol: network::PortProtocol::Tcp,
         });
+        a.labels.insert("tier".to_string(), "prod".to_string());
         let args = detached_launch_args(&a, Path::new("/tmp/rootfs"));
         assert_eq!(
             args,
@@ -4632,6 +4658,8 @@ mod tests {
                 "bridge",
                 "--publish",
                 "0.0.0.0:8080:80",
+                "--label",
+                "tier=prod",
                 "alpine",
                 "--",
                 "sleep",
@@ -4794,6 +4822,27 @@ mod tests {
             ports_label(&ports, None, None),
             "0.0.0.0:53->53/tcp, 0.0.0.0:8080->80/tcp"
         );
+    }
+
+    #[test]
+    fn parses_and_overrides_labels() {
+        let args: Vec<_> = [
+            "--label",
+            "tier=prod",
+            "--label",
+            "tier=dev",
+            "--label",
+            "only=",
+            "alpine",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_run_args(&args).expect("valid labels");
+        assert_eq!(a.labels.get("tier").map(String::as_str), Some("dev"));
+        assert_eq!(a.labels.get("only").map(String::as_str), Some(""));
+        assert!(parse_label("novalue").is_err());
+        assert!(parse_label("=value").is_err());
     }
 
     #[test]

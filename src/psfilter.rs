@@ -15,6 +15,7 @@ pub struct PsFilter {
     image: Option<String>,
     exit_code: Option<i32>,
     net: Option<String>,
+    labels: Vec<(String, Option<String>)>,
 }
 
 impl PsFilter {
@@ -51,6 +52,18 @@ impl PsFilter {
                 }
                 Err(_) => invalid("exit code"),
             },
+            "label" => {
+                let (name, wanted) = match value.split_once('=') {
+                    Some((name, value)) => (name, Some(value)),
+                    None => (value, None),
+                };
+                if name.is_empty() {
+                    return invalid("label");
+                }
+                self.labels
+                    .push((name.to_string(), wanted.map(String::from)));
+                Ok(())
+            }
             _ => Err(format!("unknown ps filter {key:?}")),
         }
     }
@@ -78,7 +91,13 @@ impl PsFilter {
         let exit_ok = self
             .exit_code
             .is_none_or(|want| state.exit_code == Some(want));
-        status_ok && id_ok && name_ok && image_ok && net_ok && exit_ok
+        let labels_ok = self.labels.iter().all(|(name, wanted)| {
+            state
+                .labels
+                .get(name)
+                .is_some_and(|found| wanted.as_ref().is_none_or(|value| found == value))
+        });
+        status_ok && id_ok && name_ok && image_ok && net_ok && exit_ok && labels_ok
     }
 }
 
@@ -86,6 +105,7 @@ impl PsFilter {
 mod tests {
     use super::*;
     use crate::state::Status;
+    use std::collections::BTreeMap;
 
     fn state(status: Status, exit_code: Option<i32>) -> ContainerState {
         ContainerState {
@@ -109,6 +129,7 @@ mod tests {
             env: vec![],
             cwd: None,
             user: None,
+            labels: BTreeMap::new(),
             log: String::new(),
             rootfs: String::new(),
             overlay: None,
@@ -138,6 +159,19 @@ mod tests {
     }
 
     #[test]
+    fn label_selectors_match_key_and_key_value() {
+        let mut st = state(Status::Running, None);
+        st.labels.insert("env".to_string(), "prod".to_string());
+        let any_env = filter("label", "env");
+        let prod_env = filter("label", "env=prod");
+        let dev_env = filter("label", "env=dev");
+        assert!(any_env.matches(&st));
+        assert!(prod_env.matches(&st));
+        assert!(!dev_env.matches(&st));
+        assert!(PsFilter::default().set("label", "=value").is_err());
+    }
+
+    #[test]
     fn combines_name_id_image_and_net_selectors() {
         let running = state(Status::Running, None);
         let mut combined = filter("id", "0123").combined_with("name", "web");
@@ -162,7 +196,6 @@ mod tests {
 
     #[test]
     fn rejects_unknown_and_empty_selectors() {
-        assert!(PsFilter::default().set("label", "x").is_err());
         assert!(PsFilter::default().set("name", "").is_err());
         assert!(PsFilter::default().set("image", "").is_err());
         assert!(PsFilter::default().set("net", "").is_err());

@@ -242,6 +242,7 @@ pub fn diff_events(previous: &[ContainerState], current: &[ContainerState]) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn state(id: &str, name: Option<&str>, status: Status, exit: Option<i32>) -> ContainerState {
         ContainerState {
@@ -265,6 +266,7 @@ mod tests {
             env: vec![],
             cwd: None,
             user: None,
+            labels: BTreeMap::new(),
             log: String::new(),
             rootfs: String::new(),
             overlay: None,

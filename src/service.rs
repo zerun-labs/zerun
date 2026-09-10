@@ -146,6 +146,10 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--dns".into());
         run_args.push(v.clone());
     }
+    for (k, v) in &a.labels {
+        run_args.push("--label".into());
+        run_args.push(format!("{k}={v}"));
+    }
     if let Some(image) = &a.image {
         run_args.push(image.clone());
     }
@@ -367,6 +371,7 @@ fn quote_environment(value: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn args(values: &[&str]) -> RunArgs {
         let owned: Vec<String> = values.iter().map(|s| s.to_string()).collect();
@@ -389,6 +394,20 @@ mod tests {
         assert!(unit.contains("alpine -- echo hello\n"));
         assert!(unit.contains("--publish 8080:80"));
         assert!(unit.contains("WantedBy=multi-user.target"));
+    }
+
+    #[test]
+    fn renders_labels_in_run_options() {
+        let mut a = RunArgs {
+            image: Some("alpine".to_string()),
+            labels: BTreeMap::from([("tier".to_string(), "prod".to_string())]),
+            ..Default::default()
+        };
+        a.argv = vec!["/bin/sh".to_string()];
+        let mut out = Vec::new();
+        generate(&a, &mut out).unwrap();
+        let unit = String::from_utf8(out).unwrap();
+        assert!(unit.contains("--label tier=prod"));
     }
 
     #[test]

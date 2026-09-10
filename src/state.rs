@@ -14,6 +14,7 @@ use crate::error::ZResult;
 use crate::fsutil;
 use crate::store::Store;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -189,6 +190,9 @@ pub struct ContainerState {
     /// True when the writable layer was ephemeral tmpfs (`--tmpfs-upper`).
     #[serde(default)]
     pub tmpfs_upper: bool,
+    /// Operator/image labels (KEY=VALUE). Older records have none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     /// Canonical `zerun run` arguments (without the leading `run`) captured
     /// for detached containers. Older v1 records have no value and cannot be
     /// restarted directly.
@@ -482,6 +486,7 @@ mod tests {
             rootfs: String::new(),
             overlay: None,
             tmpfs_upper: false,
+            labels: BTreeMap::new(),
             launch_args: None,
             table: None,
             veth: None,
@@ -495,9 +500,10 @@ mod tests {
         a.log = dir.join("console.log").display().to_string();
         a.save().unwrap();
         assert!(dir.join("state.json").exists());
-        let loaded: ContainerState =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("state.json")).unwrap())
-                .unwrap();
+        let loaded: ContainerState = serde_json::from_str::<ContainerState>(
+            &std::fs::read_to_string(dir.join("state.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(loaded.id, a.id);
         assert_eq!(loaded.name.as_deref(), Some("web"));
         assert_eq!(loaded.status, Status::Exited);

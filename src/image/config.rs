@@ -3,6 +3,7 @@
 //! document is ignored.
 use crate::error::ZResult;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ImageConfig {
@@ -30,6 +31,9 @@ pub struct ConfigSection {
     /// Image user (`USER` in a Dockerfile), e.g. "nginx" or "1000:1000".
     #[serde(default, rename = "User")]
     pub user: String,
+    /// OCI/Docker image labels, inherited by containers.
+    #[serde(default, rename = "Labels")]
+    pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -60,7 +64,8 @@ mod tests {
                     "Env": ["PATH=/usr/local/sbin:/usr/bin:/bin"],
                     "WorkingDir": "/app",
                     "User": "nginx:nginx",
-                    "Cmd": ["/bin/sh"]
+                    "Cmd": ["/bin/sh"],
+                    "Labels": {"org.opencontainers.image.title": "nginx"}
                 },
                 "rootfs": {
                     "type": "layers",
@@ -73,6 +78,13 @@ mod tests {
         assert_eq!(cfg.config.env.len(), 1);
         assert_eq!(cfg.config.working_dir, "/app");
         assert_eq!(cfg.config.user, "nginx:nginx");
+        assert_eq!(
+            cfg.config
+                .labels
+                .get("org.opencontainers.image.title")
+                .map(String::as_str),
+            Some("nginx")
+        );
         assert_eq!(cfg.config.cmd, vec!["/bin/sh"]);
         assert_eq!(cfg.rootfs.diff_ids.len(), 1);
     }

@@ -159,6 +159,7 @@ Run options (current subset):
 --seccomp default|unconfined   seccomp policy (default: deny-by-default allowlist)
 --platform os/arch[/variant]   pull/run a specific platform
 -e, --env NAME[=VALUE]         set a container environment variable (image mode)
+--label KEY=VALUE             add container metadata (repeatable; overrides image labels)
 -v, --volume HOST:CONTAINER[:ro]
                      bind-mount an existing host file/directory into the container
 --no-overlay        pivot directly into the rootfs (no writable upper layer)
@@ -232,6 +233,7 @@ sudo target/release/zerun ps                          # running containers
 sudo target/release/zerun ps -a --filter name=web     # inspect one container's records
 sudo target/release/zerun ps --filter status=exited   # exited detached containers
 sudo target/release/zerun ps --filter exitCode=0      # successful detached exits
+sudo target/release/zerun ps --filter label=tier=prod # containers with a label key/value
 sudo target/release/zerun ps -q                       # container IDs only
 sudo target/release/zerun ps --format json -a         # machine-readable full state
 sudo target/release/zerun wait web                    # block until exit; prints the exit code

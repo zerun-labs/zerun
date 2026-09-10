@@ -383,6 +383,7 @@ struct ArchiveDescriptor {
 mod tests {
     use super::*;
     use crate::image::commit::{commit_image, CommitOptions};
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -415,6 +416,7 @@ mod tests {
                 cmd: vec!["/bin/archived-marker".to_string()],
                 working_dir: "/".to_string(),
                 user: None,
+                labels: BTreeMap::new(),
                 comment: Some("archive round-trip".to_string()),
                 author: None,
             },

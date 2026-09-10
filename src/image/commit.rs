@@ -14,6 +14,7 @@ use crate::image::unpack::unpack_layer;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -34,6 +35,8 @@ pub struct CommitOptions {
     pub working_dir: String,
     /// Container user (`config.User` in the committed image).
     pub user: Option<String>,
+    /// Container labels written to the committed image config.
+    pub labels: BTreeMap<String, String>,
     pub comment: Option<String>,
     pub author: Option<String>,
 }
@@ -300,6 +303,9 @@ fn build_config_json(options: &CommitOptions, diff_id: &str) -> serde_json::Valu
     if let Some(user) = &options.user {
         config["config"]["User"] = serde_json::Value::String(user.clone());
     }
+    if !options.labels.is_empty() {
+        config["config"]["Labels"] = serde_json::json!(options.labels);
+    }
     if let Some(comment) = &options.comment {
         config["history"][0]["comment"] = serde_json::Value::String(comment.clone());
     }
@@ -381,6 +387,7 @@ mod tests {
             cmd: vec!["/bin/committed-marker".to_string()],
             working_dir: "/".to_string(),
             user: Some("1000:1000".to_string()),
+            labels: BTreeMap::from([("tier".to_string(), "prod".to_string())]),
             comment: Some("test snapshot".to_string()),
             author: Some("TheSkyC <0x4fe6@gmail.com>".to_string()),
         };
@@ -400,6 +407,7 @@ mod tests {
         assert_eq!(config["config"]["Env"][0], "PATH=/usr/bin");
         assert_eq!(config["config"]["Cmd"][0], "/bin/committed-marker");
         assert_eq!(config["config"]["User"], "1000:1000");
+        assert_eq!(config["config"]["Labels"]["tier"], "prod");
         assert_eq!(config["author"], "TheSkyC <0x4fe6@gmail.com>");
         assert_eq!(config["history"][0]["comment"], "test snapshot");
 
