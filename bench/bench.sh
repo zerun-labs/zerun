@@ -41,7 +41,16 @@ TS="$(date +%Y%m%d-%H%M%S)"
 LAT_CSV="$OUT_DIR/latency-$TS.csv"
 MEM_CSV="$OUT_DIR/mem-$TS.csv"
 WORK="$(mktemp -d -t zerun-bench.XXXXXX)"
-trap 'find "$WORK" -depth -delete' EXIT
+BUNDLE_MOUNTS=()
+cleanup() {
+  if ((${#BUNDLE_MOUNTS[@]})); then
+    for mountpoint in "${BUNDLE_MOUNTS[@]}"; do
+      umount "$mountpoint" 2>/dev/null || umount -l "$mountpoint" 2>/dev/null || true
+    done
+  fi
+  find "$WORK" -depth -delete
+}
+trap cleanup EXIT
 mkdir -p "$OUT_DIR"
 
 # ---- CPU pinning: pick the last online core to avoid CPU0 noise ----------------
@@ -116,9 +125,11 @@ make_oci_bundle() {
   local dir="$1" rootless="$2"
   mkdir -p "$dir/rootfs"
   # Reuse the same rootfs via a read-only bind (no copy; the mount is read-only).
-  mountpoint -q "$dir/rootfs" 2>/dev/null || mount --bind "$ROOTFS" "$dir/rootfs" 2>/dev/null || {
+  if mountpoint -q "$dir/rootfs" 2>/dev/null || mount --bind "$ROOTFS" "$dir/rootfs" 2>/dev/null; then
+    BUNDLE_MOUNTS+=("$dir/rootfs")
+  else
     cp -a "$ROOTFS/." "$dir/rootfs/" 2>/dev/null || true
-  }
+  fi
   local userns_block=""
   if [[ "$rootless" == "1" ]]; then
     userns_block='"user"'
