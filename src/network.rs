@@ -79,6 +79,11 @@ pub const SUBNET_PREFIX: u8 = 24;
 /// What the parent created for one container; torn down after the run exits.
 pub struct HostNet {
     veth_name: String,
+    /// ifindex captured when the host end was created. Keeping it avoids a
+    /// full rtnetlink link dump on the teardown path.
+    veth_index: u32,
+    /// rtnetlink connection used for setup and reused for teardown.
+    netlink: Netlink,
     /// Legacy per-container nft table, when this run created one.
     table: Option<String>,
 }
@@ -388,6 +393,8 @@ pub fn setup_host_side(id: &str, child_pid: i32) -> ZResult<HostNet> {
 
     Ok(HostNet {
         veth_name: host,
+        veth_index: host_index,
+        netlink: nl,
         table: None,
     })
 }
@@ -421,7 +428,33 @@ pub fn setup_container_side(id: &str, ip: Ipv4Addr) -> ZResult<()> {
 /// (e.g. after an unclean kill). Both steps are best-effort and never fail the
 /// caller.
 pub fn teardown_host_side(net: &HostNet) {
-    teardown_named(&net.veth_name, net.table.as_deref());
+    trace::mark("teardown:begin");
+    if let Some(table) = net.table.as_deref() {
+        if let Ok(nft) = Nftables::new() {
+            nft.remove_table(table);
+        }
+    }
+    trace::mark("teardown:nft");
+    // The veth peer lives in the container netns, so the kernel removes both
+    // ends once that netns is gone. The sysfs probe avoids deleting a reused
+    // ifindex in the small window between netns teardown and this call.
+    if read_ifindex(&net.veth_name) != Some(net.veth_index) {
+        return;
+    }
+    if let Err(e) = net.netlink.delete_link(net.veth_index) {
+        eprintln!(
+            "zerun: warn: failed to remove veth {} ({}): {e}",
+            net.veth_name, net.veth_index
+        );
+    }
+}
+
+fn read_ifindex(name: &str) -> Option<u32> {
+    std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Best-effort removal of a container's host-side leftovers by name. Used by
