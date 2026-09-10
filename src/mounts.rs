@@ -45,11 +45,16 @@ pub struct OverlayPaths {
 /// A host path bind-mounted into the container rootfs before pivot_root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindMount {
-    /// Canonicalized host path. It must already exist.
+    /// Canonicalized host path. Empty until a named volume is resolved.
     pub source: PathBuf,
     /// Absolute path inside the container (without `..` components).
     pub target: PathBuf,
     pub readonly: bool,
+    /// Named-volume source when `HOST` was not an absolute host path.
+    pub named: Option<String>,
+    /// Operator's original argument, used to rebuild restart/service commands
+    /// without replacing a volume name with a store-local path.
+    pub raw: String,
 }
 
 /// Parse Docker-style simple bind syntax: `HOST:CONTAINER[:ro|rw]`. Named
@@ -75,9 +80,6 @@ pub fn parse_bind(value: &str) -> Result<BindMount, String> {
         "ro" => true,
         other => return Err(format!("-v: unsupported mode '{other}' (rw|ro)")),
     };
-    if !host.starts_with('/') {
-        return Err(format!("-v: host path '{host}' must be absolute"));
-    }
     if !container.starts_with('/') {
         return Err(format!("-v: container path '{container}' must be absolute"));
     }
@@ -93,20 +95,51 @@ pub fn parse_bind(value: &str) -> Result<BindMount, String> {
             "-v: container path '{container}' must be absolute without '.' or '..'"
         ));
     }
-    let source = std::fs::canonicalize(host)
-        .map_err(|e| format!("-v: host path '{host}' does not exist: {e}"))?;
-    let meta = std::fs::metadata(&source)
-        .map_err(|e| format!("-v: host path '{host}' is not accessible: {e}"))?;
-    if !meta.is_dir() && !meta.is_file() {
-        return Err(format!(
-            "-v: host path '{host}' must be a regular file or directory"
-        ));
-    }
+
+    // Docker accepts either an absolute bind source or a named volume. Named
+    // sources are resolved by the caller against the active data root because
+    // `parse_run_args` is also used by commands that must not create storage.
+    let (source, named) = if host.starts_with('/') {
+        let source = std::fs::canonicalize(host)
+            .map_err(|e| format!("-v: host path '{host}' does not exist: {e}"))?;
+        let meta = std::fs::metadata(&source)
+            .map_err(|e| format!("-v: host path '{host}' is not accessible: {e}"))?;
+        if !meta.is_dir() && !meta.is_file() {
+            return Err(format!(
+                "-v: host path '{host}' must be a regular file or directory"
+            ));
+        }
+        (source, None)
+    } else {
+        validate_volume_name(host)?;
+        (PathBuf::new(), Some(host.to_string()))
+    };
+
     Ok(BindMount {
         source,
         target: PathBuf::from(container),
         readonly,
+        named,
+        raw: value.to_string(),
     })
+}
+
+/// Validate Docker-style volume names. Unlike host paths, these become one
+/// directory component under the data root, so traversal and separator tricks
+/// are rejected before they can escape the managed volume tree.
+pub fn validate_volume_name(name: &str) -> Result<(), String> {
+    let valid = (1..=128).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+        && !matches!(name, "." | "..");
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "-v: invalid volume name '{name}' (use 1-128 letters, digits, '_', '.' or '-')"
+        ))
+    }
 }
 
 /// A per-container tmpfs mount requested with `--tmpfs PATH[:opts]`.
@@ -680,11 +713,24 @@ mod bind_tests {
 
     #[test]
     fn parse_bind_rejects_ambiguous_or_unsafe_paths() {
-        assert!(parse_bind("data:/mnt").is_err());
+        assert!(parse_bind("data:/mnt").is_ok());
         assert!(parse_bind("/tmp:mnt").is_err());
         assert!(parse_bind("/tmp:/../etc").is_err());
         assert!(parse_bind("/tmp:/tmp:ro:extra").is_err());
         assert!(parse_bind("/tmp:/tmp:bad").is_err());
+    }
+
+    #[test]
+    fn parse_bind_accepts_named_volumes_without_touching_storage() {
+        let bind = parse_bind("app-data:/var/lib/app:ro").unwrap();
+        assert!(bind.source.as_os_str().is_empty());
+        assert_eq!(bind.named.as_deref(), Some("app-data"));
+        assert_eq!(bind.target, PathBuf::from("/var/lib/app"));
+        assert!(bind.readonly);
+        assert_eq!(bind.raw, "app-data:/var/lib/app:ro");
+        assert!(validate_volume_name("app_data.v2").is_ok());
+        assert!(validate_volume_name("..").is_err());
+        assert!(validate_volume_name("bad/name").is_err());
     }
 
     #[test]

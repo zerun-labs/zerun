@@ -65,6 +65,7 @@ impl Store {
     pub fn ensure_dirs(&self) -> ZResult<()> {
         for d in [
             self.data_root.join("overlays"),
+            self.data_root.join("volumes"),
             self.data_root.join("tmp"),
             self.run_root.join("containers"),
             self.run_root.join("net"), // file-based IPAM (M5)
@@ -72,6 +73,11 @@ impl Store {
             fsutil::mkdir_p(&d)?;
         }
         Ok(())
+    }
+
+    /// Managed named-volume directory (`<data>/volumes/<name>`).
+    pub fn volume_dir(&self, name: &str) -> PathBuf {
+        self.data_root.join("volumes").join(name)
     }
 
     /// Prepare a per-run writable container filesystem (overlay dirs).

@@ -483,6 +483,23 @@ fn default_net(euid: u32) -> NetMode {
     }
 }
 
+/// Materialize named-volume bind sources under the active data root.
+///
+/// Parsing deliberately does not create storage: `generate-service` and
+/// validation-only callers reuse the same parser, while `run` owns creation.
+fn resolve_named_volumes(store: &Store, volumes: &mut [mounts::BindMount]) -> Result<(), String> {
+    for volume in volumes {
+        let Some(name) = &volume.named else {
+            continue;
+        };
+        mounts::validate_volume_name(name)?;
+        let dir = store.volume_dir(name);
+        fsutil::mkdir_p(&dir).map_err(|e| format!("-v: create volume '{name}': {e}"))?;
+        volume.source = dir;
+    }
+    Ok(())
+}
+
 fn cmd_run(args: &[String]) -> i32 {
     if args.iter().any(|a| a == "--help") {
         print_run_usage();
@@ -532,6 +549,10 @@ fn cmd_run(args: &[String]) -> i32 {
     if let Err(e) = store.ensure_dirs() {
         eprintln!("zerun: {e}");
         return 1;
+    }
+    if let Err(e) = resolve_named_volumes(&store, &mut a.volumes) {
+        eprintln!("zerun run: {e}");
+        return 2;
     }
 
     // One id per run: used for the HOSTNAME default, the per-run overlay, the
@@ -1010,11 +1031,7 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
         args.extend(["--publish".to_string(), publish]);
     }
     for v in &a.volumes {
-        let mode = if v.readonly { "ro" } else { "rw" };
-        args.extend([
-            "--volume".to_string(),
-            format!("{}:{}:{}", v.source.display(), v.target.display(), mode),
-        ]);
+        args.extend(["--volume".to_string(), v.raw.clone()]);
     }
     for v in &a.dns {
         args.extend(["--dns".to_string(), v.clone()]);
@@ -2723,6 +2740,16 @@ fn cmd_system_df(args: &[String]) -> i32 {
     };
     let image_bytes = fsutil::dir_size(&store.data_root().join("blobs"))
         + fsutil::dir_size(&store.data_root().join("rootfs"));
+    let volumes_root = store.data_root().join("volumes");
+    let volume_count = std::fs::read_dir(&volumes_root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .count()
+        })
+        .unwrap_or(0);
+    let volume_bytes = fsutil::dir_size(&volumes_root);
 
     let mut containers = 0;
     let mut container_bytes = 0;
@@ -2762,6 +2789,13 @@ fn cmd_system_df(args: &[String]) -> i32 {
         containers,
         fsutil::human_size(container_bytes),
         fsutil::human_size(reclaimable_bytes)
+    );
+    println!(
+        "{:<12} {:>7} {:>14} {:>14}",
+        "Volumes",
+        volume_count,
+        fsutil::human_size(volume_bytes),
+        "0 B"
     );
     0
 }
@@ -4720,7 +4754,8 @@ RUN OPTIONS:\n  \
   -t, --tty              allocate a PTY (foreground runs; combine with -i)\n  \
   -p, --publish [ADDR:]HOST[:CONTAINER][/proto]\n  \
                                       publish a TCP/UDP port (requires --net bridge)\n  \
-  -v, --volume HOST:CONTAINER[:ro]  bind-mount a host file or directory\n  \
+  -v, --volume HOST|NAME:CONTAINER[:ro]
+                                        bind-mount a host path or managed named volume\n  \
   --dns IP            container DNS server (repeatable; bridge mode; defaults to the host's)\n  \
   --init              run the built-in mini-init (reap orphans + forward signals)\n  \
   --seccomp default|unconfined\n  \
