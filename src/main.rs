@@ -2116,6 +2116,8 @@ fn cmd_doctor() -> i32 {
 
 fn cmd_ps(args: &[String]) -> i32 {
     let mut all = false;
+    let mut quiet = false;
+    let mut format = "table";
     let mut filter = PsFilter::default();
     let mut i = 0;
     while i < args.len() {
@@ -2141,8 +2143,31 @@ fn cmd_ps(args: &[String]) -> i32 {
                     return 2;
                 }
             }
+            "-q" | "--quiet" => {
+                quiet = true;
+                i += 1;
+            }
+            "--format" => {
+                let value = match next_value(args, &mut i, "--format") {
+                    Ok(value) => value,
+                    Err(e) => {
+                        eprintln!("zerun ps: {e}");
+                        return 2;
+                    }
+                };
+                format = match value.as_str() {
+                    "table" => "table",
+                    "json" => "json",
+                    other => {
+                        eprintln!("zerun ps: invalid --format '{other}' (expected table or json)");
+                        return 2;
+                    }
+                };
+            }
             "-h" | "--help" => {
-                println!("usage: zerun ps [-a] [-f|--filter KEY=VALUE]...");
+                println!(
+                    "usage: zerun ps [-a] [-q] [--format table|json] [-f|--filter KEY=VALUE]..."
+                );
                 return 0;
             }
             other if other.starts_with('-') && other.len() > 1 => {
@@ -2162,7 +2187,12 @@ fn cmd_ps(args: &[String]) -> i32 {
             return 1;
         }
     };
+    if quiet && format != "table" {
+        eprintln!("zerun ps: --quiet cannot be combined with --format");
+        return 2;
+    }
     let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut json: Vec<ContainerState> = Vec::new();
     for mut st in state::list(&store) {
         // Crash reconcile: a record that says Running for a dead PID belongs
         // to a reaper that never got to clean up; mark it exited and reclaim
@@ -2176,7 +2206,23 @@ fn cmd_ps(args: &[String]) -> i32 {
         if !filter.matches(&st) {
             continue;
         }
-        rows.push(ps_row(&st));
+        if quiet {
+            println!("{}", st.id);
+        } else if format == "json" {
+            json.push(st.clone());
+        } else {
+            rows.push(ps_row(&st));
+        }
+    }
+    if format == "json" {
+        match serde_json::to_string_pretty(&json) {
+            Ok(text) => println!("{text}"),
+            Err(e) => {
+                eprintln!("zerun ps: render JSON: {e}");
+                return 1;
+            }
+        }
+        return 0;
     }
     if rows.is_empty() {
         return 0;
@@ -4401,7 +4447,7 @@ USAGE:\n  \
   zerun run [opts] IMAGE [CMD...]        run a container from an OCI image\n  \
   zerun run -d [--name N] [opts] IMAGE [CMD...]\n  \
                                         run detached (logs/ps/stop/rm/exec)\n  \
-  zerun ps [-a] [-f KEY=VALUE]...       list filtered containers (detached)\n  \
+  zerun ps [-a] [-q] [-f KEY=VALUE]...  list filtered containers (detached)\n  \
   zerun wait CONTAINER...               block for detached containers to exit\n  \
   zerun stop [--time S] CONTAINER...    SIGTERM, then SIGKILL after the timeout\n  \
   zerun kill [--signal SIG] CONTAINER... signal detached containers (default KILL)\n  \

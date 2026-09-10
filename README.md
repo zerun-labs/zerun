@@ -34,7 +34,8 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   (pure netlink), `-p [ADDR:]HOST[:CONTAINER][/tcp|/udp]` publishing through a built-in userland
   proxy (Docker's docker-proxy in-binary), and `--dns` / host resolv.conf inheritance.
 - **M5 — detached lifecycle (done)**: `run -d` forks a tiny per-container reaper that
-  redirects stdio to `console.log` and persists state to disk; `ps [-a] [--filter KEY=VALUE]`, `stop`, `restart`,
+  redirects stdio to `console.log` and persists state to disk;
+  `ps [-a] [-q] [--format table|json] [--filter KEY=VALUE]`, `stop`, `restart`,
   `rm`, `prune [-f]`, `logs [--since/--until/-f]`, `stats`, `exec`, `attach`, and `commit` address containers by id/name with crash reconcile
   of stale records; file-based IPAM; `--rm` for auto-removal (see AGENTS.md).
 
@@ -231,6 +232,8 @@ sudo target/release/zerun ps                          # running containers
 sudo target/release/zerun ps -a --filter name=web     # inspect one container's records
 sudo target/release/zerun ps --filter status=exited   # exited detached containers
 sudo target/release/zerun ps --filter exitCode=0      # successful detached exits
+sudo target/release/zerun ps -q                       # container IDs only
+sudo target/release/zerun ps --format json -a         # machine-readable full state
 sudo target/release/zerun wait web                    # block until exit; prints the exit code
 sudo target/release/zerun logs --tail 20 web          # container console.log
 sudo target/release/zerun logs --since 10m web        # last ten minutes
@@ -281,6 +284,8 @@ containers retain their writable layer until `rm`; `--rm` still removes it on ex
 `status=created|running|exited`, `name=NAME`, `id=PREFIX`, `image=IMAGE`, `net=MODE`, and
 `exitCode=CODE`. An explicit non-running status or an exit-code filter also surfaces those
 records without `-a`; other filters narrow the normal running-only view unless `-a` is set.
+`ps -q` prints IDs for scripts; `--format json` serializes the matching full container state
+records (use `-a` to include exited and created records).
 `events` follows lifecycle changes without a daemon. Repeated `--filter action=die`,
 `--filter container=web`, `--filter image=alpine`, and `--filter exitCode=0` selectors are
 ANDed; `--since`/`--until` accept RFC3339 UTC times and first replay matching history.
