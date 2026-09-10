@@ -1477,9 +1477,35 @@ fn resolve_run_image(
     pull: PullPolicy,
 ) -> Result<(PathBuf, image::config::ImageConfig), error::ZError> {
     let imgstore = image::store::ImageStore::open(store)?;
+    let requested = platform
+        .map(image::manifest::Platform::parse)
+        .transpose()?
+        .unwrap_or_else(image::manifest::host_platform);
+    let mut refreshing = pull == PullPolicy::Always;
     if pull != PullPolicy::Always {
-        if let Some(found) = image::local_image(&imgstore, reference)? {
-            return Ok(found);
+        if let Some((rootfs, config)) = image::local_image(&imgstore, reference)? {
+            if local_image_matches_platform(&config, &requested) {
+                return Ok((rootfs, config));
+            }
+            if pull == PullPolicy::Never {
+                return Err(crate::zerr!(
+                    "local image {} is {}/{} but requested {}/{} and --pull=never was set",
+                    reference.canonical(),
+                    config.os,
+                    config.architecture,
+                    requested.os,
+                    requested.architecture
+                ));
+            }
+            refreshing = true;
+            eprintln!(
+                "zerun: local image {} is {}/{}, refreshing for requested {}/{}...",
+                reference.canonical(),
+                config.os,
+                config.architecture,
+                requested.os,
+                requested.architecture
+            );
         }
     }
     if pull == PullPolicy::Never {
@@ -1490,7 +1516,7 @@ fn resolve_run_image(
     }
     if pull == PullPolicy::Always {
         eprintln!("zerun: refreshing image {}...", reference.canonical());
-    } else {
+    } else if !refreshing {
         eprintln!(
             "zerun: image {} not found locally, pulling...",
             reference.canonical()
@@ -1507,6 +1533,16 @@ fn resolve_run_image(
         fsutil::human_size(pulled.size_bytes)
     );
     Ok((pulled.rootfs, pulled.config))
+}
+
+/// Whether a local image config can satisfy the requested platform. Empty
+/// config fields are tolerated for foreign/older images.
+fn local_image_matches_platform(
+    config: &image::config::ImageConfig,
+    requested: &image::manifest::Platform,
+) -> bool {
+    (config.os.is_empty() || config.os == requested.os)
+        && (config.architecture.is_empty() || config.architecture == requested.architecture)
 }
 
 /// Build the container environment from the image config + `-e` overrides.
@@ -5208,6 +5244,31 @@ mod tests {
             resolve_image_argv(&cfg, Some("/override"), &[]),
             vec!["/override", "default-cmd"]
         );
+    }
+
+    #[test]
+    fn local_image_platform_must_match_requested() {
+        let mut cfg = image::config::ImageConfig {
+            os: "linux".to_string(),
+            architecture: "amd64".to_string(),
+            ..Default::default()
+        };
+        let host = image::manifest::Platform {
+            os: "linux".to_string(),
+            architecture: "amd64".to_string(),
+            variant: None,
+        };
+        let arm = image::manifest::Platform {
+            os: "linux".to_string(),
+            architecture: "arm64".to_string(),
+            variant: None,
+        };
+        assert!(local_image_matches_platform(&cfg, &host));
+        assert!(!local_image_matches_platform(&cfg, &arm));
+
+        cfg.architecture.clear();
+        cfg.os.clear();
+        assert!(local_image_matches_platform(&cfg, &arm));
     }
 
     #[test]
