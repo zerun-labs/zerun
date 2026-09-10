@@ -53,6 +53,7 @@ fn main() {
         Some("ps") => cmd_ps(&args[2..]),
         Some("wait") => cmd_wait(&args[2..]),
         Some("stop") => cmd_stop(&args[2..]),
+        Some("kill") => cmd_kill(&args[2..]),
         Some("restart") => cmd_restart(&args[2..]),
         Some("rm") => cmd_rm(&args[2..]),
         Some("logs") => cmd_logs(&args[2..]),
@@ -2319,6 +2320,147 @@ fn cmd_stop(args: &[String]) -> i32 {
     }
 }
 
+fn cmd_kill(args: &[String]) -> i32 {
+    let mut signal: libc::c_int = libc::SIGKILL;
+    let mut targets: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "-s" | "--signal" => match next_value(args, &mut i, a) {
+                Ok(v) => match signal_number(&v) {
+                    Some(sig) => signal = sig,
+                    None => {
+                        eprintln!("zerun kill: invalid signal '{v}'");
+                        return 2;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("zerun kill: {e}");
+                    return 2;
+                }
+            },
+            "-h" | "--help" => {
+                println!("usage: zerun kill [--signal SIGNAL] CONTAINER...");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun kill: unknown option {other}");
+                return 2;
+            }
+            _ => {
+                targets.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    if targets.is_empty() {
+        eprintln!("zerun kill: at least one CONTAINER is required");
+        return 2;
+    }
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let mut failed = false;
+    for target in targets {
+        match kill_one(&store, &target, signal) {
+            Ok(name) => println!("{name}"),
+            Err(e) => {
+                eprintln!("zerun kill: {e}");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        1
+    } else {
+        0
+    }
+}
+
+/// Accept Docker's signal names (with or without the `SIG` prefix) and numeric
+/// Linux signal numbers. Signal 0 is deliberately not exposed because `kill`
+/// is a lifecycle command, not a PID liveness probe.
+fn signal_number(input: &str) -> Option<libc::c_int> {
+    if let Ok(value) = input.parse::<libc::c_int>() {
+        return (1..=64).contains(&value).then_some(value);
+    }
+    let upper = input.to_ascii_uppercase();
+    let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+    let name = name.strip_prefix('-').unwrap_or(name);
+    let signal = match name {
+        "HUP" => libc::SIGHUP,
+        "INT" => libc::SIGINT,
+        "QUIT" => libc::SIGQUIT,
+        "ILL" => libc::SIGILL,
+        "TRAP" => libc::SIGTRAP,
+        "ABRT" => libc::SIGABRT,
+        "BUS" => libc::SIGBUS,
+        "FPE" => libc::SIGFPE,
+        "KILL" => libc::SIGKILL,
+        "USR1" => libc::SIGUSR1,
+        "SEGV" => libc::SIGSEGV,
+        "USR2" => libc::SIGUSR2,
+        "PIPE" => libc::SIGPIPE,
+        "ALRM" => libc::SIGALRM,
+        "TERM" => libc::SIGTERM,
+        "STKFLT" => libc::SIGSTKFLT,
+        "CHLD" => libc::SIGCHLD,
+        "CONT" => libc::SIGCONT,
+        "STOP" => libc::SIGSTOP,
+        "TSTP" => libc::SIGTSTP,
+        "TTIN" => libc::SIGTTIN,
+        "TTOU" => libc::SIGTTOU,
+        "URG" => libc::SIGURG,
+        "XCPU" => libc::SIGXCPU,
+        "XFSZ" => libc::SIGXFSZ,
+        "VTALRM" => libc::SIGVTALRM,
+        "PROF" => libc::SIGPROF,
+        "WINCH" => libc::SIGWINCH,
+        "IO" => libc::SIGIO,
+        "PWR" => libc::SIGPWR,
+        "SYS" => libc::SIGSYS,
+        _ => return None,
+    };
+    Some(signal)
+}
+
+/// Send one signal to a detached container's PID 1. Unlike `stop`, this does
+/// not impose a grace period; if the signal terminates the container, wait
+/// briefly for the reaper to persist its final state.
+fn kill_one(store: &Store, target: &str, signal: libc::c_int) -> Result<String, String> {
+    let mut st = state::resolve(store, target)?;
+    let name = display_name(&st);
+    match st.status {
+        state::Status::Exited | state::Status::Created => return Ok(name),
+        state::Status::Running => {}
+    }
+    if !st.pid_alive() {
+        if lifecycle::reconcile_stale(store, &mut st) {
+            let _ = st.save();
+        }
+        return Ok(name);
+    }
+    let pid = st
+        .pid
+        .ok_or_else(|| format!("container {} has no PID", st.id))?;
+    let rc = unsafe { libc::kill(pid, signal) };
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(format!("signal container {name}: {e}"));
+    }
+    // Give a terminating signal a brief chance to take effect, without making
+    // control signals such as STOP/CONT feel like `stop`.
+    if wait_pid_gone(pid, Duration::from_millis(500)) {
+        lifecycle::settle_exit(store, &st.id);
+    }
+    Ok(name)
+}
+
 /// Docker semantics: SIGTERM, wait up to `--time`, then SIGKILL. The per-run
 /// reaper observes the death and persists the exit itself; when it is gone
 /// (crash) the stale record is reconciled instead.
@@ -3996,6 +4138,7 @@ USAGE:\n  \
   zerun ps [-a]                         list containers (detached)\n  \
   zerun wait CONTAINER...               block for detached containers to exit\n  \
   zerun stop [--time S] CONTAINER...    SIGTERM, then SIGKILL after the timeout\n  \
+  zerun kill [--signal SIG] CONTAINER... signal detached containers (default KILL)\n  \
   zerun restart [--time S] CONTAINER... restart detached containers\n  \
   zerun rm [-f] CONTAINER...            remove stopped containers (-f: kill first)\n  \
   zerun logs [--tail N] [-f] [-t] CONTAINER  show a container's console.log\n  \
@@ -4377,5 +4520,15 @@ mod tests {
             timestamp_prefix(&RAW[..first_line_end]),
             Some(&b"hello\n"[..])
         );
+    }
+
+    #[test]
+    fn kill_signal_input_accepts_names_and_numbers() {
+        assert_eq!(signal_number("KILL"), Some(libc::SIGKILL));
+        assert_eq!(signal_number("sig-term"), Some(libc::SIGTERM));
+        assert_eq!(signal_number("15"), Some(15));
+        assert_eq!(signal_number("65"), None);
+        assert_eq!(signal_number("0"), None);
+        assert_eq!(signal_number("not-a-signal"), None);
     }
 }

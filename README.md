@@ -50,7 +50,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   `/proc`/`/sys` paths, and a deny-by-default seccomp allowlist (opt out with
   `--seccomp unconfined`).
 - **Docker-compatible top 20% CLI**: `run / ps / wait / stop / restart / rm / logs / exec / inspect /
-  port / rename / top / cp / export / import / events / update / attach / pull / push / tag / save / load /
+  port / rename / top / cp / export / import / events / update / attach / kill / pull / push / tag / save / load /
   login / logout / images / rmi / commit / generate-service / doctor`.
 
 ## Install
@@ -234,6 +234,7 @@ sudo target/release/zerun attach web                  # stream live container ou
 sudo target/release/zerun stats web                   # one-shot resource metrics
 sudo target/release/zerun exec web /bin/sh            # join the container
 sudo target/release/zerun stop --time 3 web           # SIGTERM, then SIGKILL
+sudo target/release/zerun kill --signal TERM web      # send any Linux signal
 sudo target/release/zerun restart --time 3 web        # stop, then recreate from saved options
 sudo target/release/zerun commit -m snapshot web web:snapshot
 sudo target/release/zerun rm web                      # remove the stopped container
