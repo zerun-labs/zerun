@@ -154,6 +154,10 @@ struct RunArgs {
     workdir: Option<String>,
     /// Whether `run IMAGE` may use a local image or must contact the registry.
     pull: PullPolicy,
+    /// Detached console-log rotation policy.
+    log: logs::LogOptions,
+    /// True when either log rotation flag was explicitly supplied.
+    log_options_set: bool,
     env: Vec<String>,
     ports: Vec<network::PublishedPort>,
     volumes: Vec<mounts::BindMount>,
@@ -325,6 +329,18 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             "--pull" => {
                 let v = next_value(args, &mut i, "--pull")?;
                 a.pull = PullPolicy::parse(&v)?;
+            }
+            "--log-max-size" => {
+                let v = next_value(args, &mut i, "--log-max-size")?;
+                a.log.max_size =
+                    logs::parse_size(&v).map_err(|e| format!("invalid --log-max-size: {e}"))?;
+                a.log_options_set = true;
+            }
+            "--log-max-file" => {
+                let v = next_value(args, &mut i, "--log-max-file")?;
+                a.log.max_files = logs::parse_max_files(&v)
+                    .map_err(|e| format!("invalid --log-max-file: {e}"))?;
+                a.log_options_set = true;
             }
             "--env" | "-e" => {
                 a.env.push(next_value(args, &mut i, s)?);
@@ -602,6 +618,11 @@ fn cmd_run(args: &[String]) -> i32 {
         eprintln!("zerun run: --workdir cannot be empty");
         return 2;
     }
+    if a.log_options_set && !a.detach {
+        eprintln!(
+            "zerun: warning: log rotation options only apply to detached containers; ignoring"
+        );
+    }
 
     let store = match Store::detect() {
         Ok(s) => s,
@@ -785,6 +806,7 @@ fn cmd_run(args: &[String]) -> i32 {
                 name: a.name,
                 rm: a.rm,
                 labels,
+                log: a.log,
             },
         );
     }
@@ -814,6 +836,7 @@ struct DetachedInfo {
     name: Option<String>,
     rm: bool,
     labels: BTreeMap<String, String>,
+    log: logs::LogOptions,
 }
 
 fn run_detached(
@@ -896,6 +919,8 @@ fn run_detached(
         user: spec.user.clone(),
         labels: info.labels,
         log: log_path.display().to_string(),
+        log_max_size: Some(info.log.max_size),
+        log_max_file: Some(info.log.max_files),
         rootfs: state_rootfs.to_string(),
         overlay: container_fs
             .as_ref()
@@ -940,8 +965,11 @@ fn run_detached(
                 container_fs,
                 info.rm,
                 started_w,
-                &log_path,
-                log_fd.as_raw_fd(),
+                lifecycle::LogTarget {
+                    path: &log_path,
+                    previous_fd: log_fd.as_raw_fd(),
+                    options: info.log,
+                },
             );
             unsafe { libc::_exit(code) }
         }
@@ -1091,6 +1119,10 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     }
     if a.pull != PullPolicy::Missing {
         args.extend(["--pull".to_string(), a.pull.label().to_string()]);
+    }
+    if a.log_options_set {
+        args.extend(["--log-max-size".to_string(), a.log.max_size.to_string()]);
+        args.extend(["--log-max-file".to_string(), a.log.max_files.to_string()]);
     }
     for v in &a.env {
         args.extend(["--env".to_string(), v.clone()]);
@@ -3309,17 +3341,24 @@ fn cmd_logs(args: &[String]) -> i32 {
         }
     };
     let path = PathBuf::from(&st.log);
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
+    let max_files = st.log_max_file.unwrap_or(1).clamp(1, logs::MAX_FILES);
+    let (bytes, cursor, read_any) = match read_log_snapshot(&path, max_files) {
+        Ok(snapshot) => snapshot,
         Err(e) => {
             eprintln!(
-                "zerun logs: cannot read {} for container {}: {e}",
-                path.display(),
+                "zerun logs: cannot read log files for container {}: {e}",
                 display_name(&st)
             );
             return 1;
         }
     };
+    if !read_any {
+        eprintln!(
+            "zerun logs: no log files for container {}",
+            display_name(&st)
+        );
+        return 1;
+    }
     let filter = match LogTimeFilter::parse(since.as_deref(), until.as_deref()) {
         Ok(filter) => filter,
         Err(e) => {
@@ -3332,13 +3371,20 @@ fn cmd_logs(args: &[String]) -> i32 {
     let shown = tail_bytes(&bytes, tail.unwrap_or(usize::MAX));
     // Follow resumes at the raw byte consumed by this snapshot. Filtered
     // output can be shorter than that tail when old lines are omitted.
-    let followed_from = shown.len() as u64;
     let shown = logs::filter_log_lines(shown, Some(&filter));
     write_log_output(&shown, timestamps);
     // A fixed --until is an end boundary: future times still follow until the
     // wall clock reaches them; a past time only shows the historical window.
     if follow {
-        follow_log(&store, &st, &path, followed_from, timestamps, Some(&filter));
+        follow_log(
+            &store,
+            &st,
+            &path,
+            max_files,
+            cursor,
+            timestamps,
+            Some(&filter),
+        );
     }
     0
 }
@@ -3348,7 +3394,8 @@ fn follow_log(
     store: &Store,
     st: &ContainerState,
     path: &Path,
-    mut pos: u64,
+    max_files: usize,
+    mut seen: LogCursor,
     timestamps: bool,
     filter: Option<&LogTimeFilter>,
 ) {
@@ -3357,34 +3404,86 @@ fn follow_log(
             break;
         }
         if !container_observable(store, st) {
-            drain_log(path, pos, timestamps, filter);
+            drain_rotated_logs(path, max_files, &mut seen, timestamps, filter);
             break;
         }
         std::thread::sleep(Duration::from_millis(200));
-        pos = drain_log(path, pos, timestamps, filter);
+        drain_rotated_logs(path, max_files, &mut seen, timestamps, filter);
     }
 }
 
-fn drain_log(path: &Path, pos: u64, timestamps: bool, filter: Option<&LogTimeFilter>) -> u64 {
+type LogCursor = std::collections::HashMap<(u64, u64), u64>;
+
+/// Read the retained logs in chronological order while recording the exact
+/// inode position consumed from each one. Rotation may rename any path between
+/// opens; using the open file descriptor plus its inode identity keeps the
+/// snapshot and follow cursor consistent across that race.
+fn read_log_snapshot(path: &Path, max_files: usize) -> std::io::Result<(Vec<u8>, LogCursor, bool)> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    let mut bytes = Vec::new();
+    let mut cursor = LogCursor::new();
+    let mut read_any = false;
+    for log_path in logs::log_paths(path, max_files) {
+        let mut file = match std::fs::File::open(&log_path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("{}: {e}", log_path.display()),
+                ));
+            }
+        };
+        let meta = file.metadata()?;
+        let id = (meta.dev(), meta.ino());
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)?;
+        bytes.extend_from_slice(&data);
+        cursor.insert(id, data.len() as u64);
+        read_any = true;
+    }
+    Ok((bytes, cursor, read_any))
+}
+
+fn drain_rotated_logs(
+    path: &Path,
+    max_files: usize,
+    seen: &mut LogCursor,
+    timestamps: bool,
+    filter: Option<&LogTimeFilter>,
+) {
     use std::io::{Read, Seek};
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return pos;
-    };
-    let Ok(len) = f.metadata().map(|m| m.len()) else {
-        return pos;
-    };
-    if len <= pos {
-        return pos;
+    use std::os::unix::fs::MetadataExt;
+
+    let paths = logs::log_paths(path, max_files);
+    let mut present = std::collections::HashSet::with_capacity(paths.len());
+    for log_path in &paths {
+        let Ok(meta) = std::fs::metadata(log_path) else {
+            continue;
+        };
+        let id = (meta.dev(), meta.ino());
+        present.insert(id);
+        let pos = seen.get(&id).copied().unwrap_or(0);
+        let len = meta.len();
+        if len <= pos {
+            continue;
+        }
+        let Ok(mut file) = std::fs::File::open(log_path) else {
+            continue;
+        };
+        if file.seek(std::io::SeekFrom::Start(pos)).is_err() {
+            continue;
+        }
+        let mut buf = Vec::new();
+        if file.read_to_end(&mut buf).is_ok() {
+            let shown = logs::filter_log_lines(&buf, filter);
+            write_log_output(&shown, timestamps);
+            seen.insert(id, pos.saturating_add(buf.len() as u64));
+        }
     }
-    if f.seek(std::io::SeekFrom::Start(pos)).is_err() {
-        return pos;
-    }
-    let mut buf = Vec::new();
-    if f.read_to_end(&mut buf).is_ok() {
-        let shown = logs::filter_log_lines(&buf, filter);
-        write_log_output(&shown, timestamps);
-    }
-    len
+    seen.retain(|id, _| present.contains(id));
 }
 
 fn container_observable(store: &Store, st: &ContainerState) -> bool {
@@ -5019,6 +5118,8 @@ RUN OPTIONS:\n  \
   -w, --workdir DIR   override the image WorkingDir\n  \
   --pull POLICY       missing|always|never (default: missing)\n  \
   -e, --env NAME[=VALUE]  set a container environment variable (image mode)\n  \
+  --log-max-size SIZE  detached console.log rotation size (default: 10m; 0 disables)\n  \
+  --log-max-file N     retained detached log files including active (default: 3; max: 1024)\n  \
   --no-overlay        pivot directly into the rootfs (no writable upper layer)\n  \
   --tmpfs-upper       keep the overlay writable layer in tmpfs (not committable)\n  \
   --read-only         remount the container root read-only before exec\n  \
@@ -5217,6 +5318,64 @@ mod tests {
             .collect();
         assert_eq!(parse_run_args(&args).unwrap().pull, PullPolicy::Never);
         assert!(PullPolicy::parse("sometimes").is_err());
+    }
+
+    #[test]
+    fn parses_and_captures_log_rotation() {
+        let args: Vec<_> = [
+            "-d",
+            "--log-max-size",
+            "16m",
+            "--log-max-file",
+            "4",
+            "alpine",
+            "true",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_run_args(&args).expect("valid log rotation");
+        assert_eq!(a.log.max_size, 16 * 1024 * 1024);
+        assert_eq!(a.log.max_files, 4);
+        assert!(a.log_options_set);
+        let launch = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--log-max-size", "16777216"]));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--log-max-file", "4"]));
+
+        let args: Vec<_> = ["--log-max-file", "0", "alpine"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(parse_run_args(&args).is_err());
+
+        let args: Vec<_> = ["--log-max-file", "1025", "alpine"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(parse_run_args(&args).is_err());
+    }
+
+    #[test]
+    fn log_snapshot_reads_archives_in_order_and_tracks_positions() {
+        let dir = std::env::temp_dir().join(format!("zerun-log-snapshot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let active = dir.join("console.log");
+        std::fs::write(&active, b"newest").unwrap();
+        std::fs::write(dir.join("console.log.1"), b"middle").unwrap();
+        std::fs::write(dir.join("console.log.2"), b"oldest").unwrap();
+
+        let (bytes, cursor, read_any) = read_log_snapshot(&active, 3).unwrap();
+        assert!(read_any);
+        assert_eq!(bytes, b"oldestmiddlenewest");
+        assert_eq!(cursor.len(), 3);
+        assert!(cursor.values().all(|position| *position > 0));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

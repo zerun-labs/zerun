@@ -181,6 +181,12 @@ pub struct ContainerState {
     pub user: Option<String>,
     /// Absolute path to this container's console.log.
     pub log: String,
+    /// Rotation threshold for the console log. None = legacy/unbounded record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_max_size: Option<u64>,
+    /// Total retained console files, including the active one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_max_file: Option<usize>,
     /// Container root the process pivoted into (overlay merged dir, or the
     /// legacy `--rootfs` dir); `ze exec` chroots here.
     pub rootfs: String,
@@ -483,6 +489,8 @@ mod tests {
             cwd: None,
             user: None,
             log: format!("{}/x/console.log", std::env::temp_dir().display()),
+            log_max_size: None,
+            log_max_file: None,
             rootfs: String::new(),
             overlay: None,
             tmpfs_upper: false,

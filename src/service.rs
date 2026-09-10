@@ -298,6 +298,12 @@ fn validate(a: &RunArgs) -> Result<(), String> {
     if a.workdir.as_deref() == Some("") {
         return Err("--workdir cannot be empty".into());
     }
+    if a.log_options_set {
+        return Err(
+            "log rotation options are not supported with generate-service; systemd journald owns service logs"
+                .into(),
+        );
+    }
     if a.rootfs.is_none() && a.image.is_none() {
         return Err("an IMAGE (or --rootfs DIR for legacy mode) is required".into());
     }
@@ -476,6 +482,13 @@ mod tests {
         assert!(unit.contains(" --entrypoint /bin/sh "));
         assert!(unit.contains(" --workdir /srv/app "));
         assert!(unit.contains(" --pull never "));
+    }
+
+    #[test]
+    fn rejects_detached_log_rotation_for_services() {
+        let a = args(&["--log-max-size", "1m", "--name", "web", "alpine"]);
+        let err = render(Path::new("/bin/zerun"), &a, true).unwrap_err();
+        assert!(err.contains("journald"));
     }
 
     #[test]

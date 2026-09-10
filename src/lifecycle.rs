@@ -17,6 +17,7 @@
 //! so the leftover nft table / veth / cgroup / IPAM record are reclaimed.
 use crate::error::ZResult;
 use crate::fsutil;
+use crate::logs::LogOptions;
 use crate::namespace::{run_container_with_report, RunSpec};
 use crate::state::{self, ContainerState, Status};
 use crate::store::{ContainerFs, Store};
@@ -34,19 +35,24 @@ use std::time::{Duration, Instant};
 /// returns the exit code (the caller `_exit`s). `overlay_dir` (if any) is
 /// removed after the container exits; `started_w` carries the "0" (started)
 /// or "1:<error>" signal back to the `run -d` CLI.
+pub struct LogTarget<'a> {
+    pub path: &'a Path,
+    pub previous_fd: RawFd,
+    pub options: LogOptions,
+}
+
 pub fn run_detached(
     store: Store,
     spec: RunSpec,
     container_fs: Option<ContainerFs>,
     remove_state: bool,
     started_w: RawFd,
-    log_path: &Path,
-    previous_log_fd: RawFd,
+    log: LogTarget<'_>,
 ) -> i32 {
     let id = spec.id.clone();
     // Replace inherited stdio with a timestamping collector before clone so
     // the container's real stdout/stderr are the collector's write ends.
-    let mut captured_log = match CapturedLog::install(log_path, previous_log_fd) {
+    let mut captured_log = match CapturedLog::install(log.path, log.previous_fd, log.options) {
         Ok(log) => log,
         Err(e) => {
             eprintln!("zerun: install log collector: {e}");
@@ -140,8 +146,8 @@ struct CapturedLog {
 }
 
 impl CapturedLog {
-    fn install(log_path: &Path, previous_log_fd: RawFd) -> ZResult<Self> {
-        let log_file = OpenOptions::new().append(true).open(log_path)?;
+    fn install(log_path: &Path, previous_log_fd: RawFd, log_options: LogOptions) -> ZResult<Self> {
+        let log_file = RotatingLog::open(log_path, log_options)?;
         let (read_fd, write_fd) = crate::syscalls::pipe2_cloexec()?;
 
         // Detached stdin has no terminal. stdout/stderr become the pipe read by
@@ -191,6 +197,87 @@ impl CapturedLog {
             hub.close_all(code);
         }
     }
+}
+
+/// Bounded writer for the active console log.
+///
+/// Rotation is performed by the collector thread, so there is no cross-process
+/// file lock. `max_files` counts the active file and all numbered archives.
+struct RotatingLog {
+    active: std::path::PathBuf,
+    file: File,
+    written: u64,
+    options: LogOptions,
+}
+
+impl RotatingLog {
+    fn open(active: &Path, options: LogOptions) -> std::io::Result<Self> {
+        let file = OpenOptions::new().append(true).open(active)?;
+        let written = file.metadata()?.len();
+        Ok(Self {
+            active: active.to_path_buf(),
+            file,
+            written,
+            options,
+        })
+    }
+
+    fn write_record(&mut self, timestamp: &[u8], line: &[u8]) -> std::io::Result<()> {
+        let mut record =
+            Vec::with_capacity(timestamp.len().saturating_add(1).saturating_add(line.len()));
+        record.extend_from_slice(timestamp);
+        record.push(b'\t');
+        record.extend_from_slice(line);
+        let record_len = record.len() as u64;
+        if self.options.max_size > 0
+            && self.written > 0
+            && self.written.saturating_add(record_len) > self.options.max_size
+        {
+            self.rotate()?;
+        }
+        self.file.write_all(&record)?;
+        self.written = self.written.saturating_add(record_len);
+        Ok(())
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        // `rotate` holds `&mut self`, so no writes can race the renames. The
+        // old descriptor is replaced below, after it has been renamed into the
+        // archive set; until then it remains the only handle to that inode.
+        let max_files = self.options.max_files.max(1);
+        if max_files > 1 {
+            for index in (1..max_files - 1).rev() {
+                let from = numbered_path(&self.active, index);
+                let to = numbered_path(&self.active, index + 1);
+                match std::fs::rename(&from, &to) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            match std::fs::rename(&self.active, numbered_path(&self.active, 1)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        } else {
+            let _ = std::fs::remove_file(&self.active);
+        }
+        let replacement = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&self.active)?;
+        drop(std::mem::replace(&mut self.file, replacement));
+        self.written = 0;
+        Ok(())
+    }
+}
+
+fn numbered_path(active: &Path, index: usize) -> std::path::PathBuf {
+    let mut name = active.as_os_str().to_os_string();
+    name.push(format!(".{index}"));
+    std::path::PathBuf::from(name)
 }
 
 /// Fan-out hub for `zerun attach` clients over a per-container unix socket.
@@ -290,7 +377,7 @@ pub fn read_attach_frame(stream: &mut UnixStream) -> std::io::Result<Option<Vec<
 
 fn collect_timestamped(
     read_fd: RawFd,
-    mut output: File,
+    mut output: RotatingLog,
     attach: Option<Arc<Mutex<Vec<UnixStream>>>>,
 ) {
     let mut pending: Vec<u8> = Vec::new();
@@ -321,10 +408,9 @@ fn collect_timestamped(
     crate::syscalls::close(read_fd);
 }
 
-fn write_timestamped_line(output: &mut File, line: &[u8]) -> std::io::Result<()> {
-    output.write_all(state::now_rfc3339_nanos().as_bytes())?;
-    output.write_all(b"\t")?;
-    output.write_all(line)
+fn write_timestamped_line(output: &mut RotatingLog, line: &[u8]) -> std::io::Result<()> {
+    let timestamp = state::now_rfc3339_nanos();
+    output.write_record(timestamp.as_bytes(), line)
 }
 
 /// Reconcile one stale "running" record (reaper died): mark it exited and
@@ -420,6 +506,25 @@ fn write_all(fd: RawFd, buf: &[u8]) -> ZResult<()> {
 mod attach_tests {
     use super::*;
 
+    fn temp_log_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn read_logs(active: &Path, max_files: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for path in crate::logs::log_paths(active, max_files) {
+            bytes.extend_from_slice(&std::fs::read(path).unwrap_or_default());
+        }
+        bytes
+    }
+
     #[test]
     fn attach_data_frames_preserve_arbitrary_workload_bytes() {
         let (server, mut client) = UnixStream::pair().unwrap();
@@ -457,5 +562,86 @@ mod attach_tests {
             read_attach_frame(&mut client).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn rotating_log_keeps_the_configured_number_of_files() {
+        let dir = temp_log_dir("rotate-log");
+        let active = dir.join("console.log");
+        std::fs::write(&active, b"").unwrap();
+        let options = LogOptions {
+            max_size: 24,
+            max_files: 3,
+        };
+        let mut log = RotatingLog::open(&active, options).unwrap();
+        for line in [b"first\n".as_slice(), b"second\n", b"third\n", b"fourth\n"] {
+            log.write_record(b"2026-01-01T00:00:00.000000000Z", line)
+                .unwrap();
+        }
+        drop(log);
+
+        assert!(active.exists());
+        assert!(dir.join("console.log.1").exists());
+        assert!(dir.join("console.log.2").exists());
+        assert!(!dir.join("console.log.3").exists());
+
+        let retained = read_logs(&active, 3);
+        assert!(!retained.windows(b"first".len()).any(|w| w == b"first"));
+        assert!(retained.windows(b"second".len()).any(|w| w == b"second"));
+        assert!(retained.windows(b"third".len()).any(|w| w == b"third"));
+        assert!(retained.windows(b"fourth".len()).any(|w| w == b"fourth"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotating_log_can_disable_rotation() {
+        let dir = temp_log_dir("rotate-disabled");
+        let active = dir.join("console.log");
+        std::fs::write(&active, b"").unwrap();
+        let mut log = RotatingLog::open(
+            &active,
+            LogOptions {
+                max_size: 0,
+                max_files: 1,
+            },
+        )
+        .unwrap();
+        for line in [b"first\n".as_slice(), b"second\n", b"third\n"] {
+            log.write_record(b"2026-01-01T00:00:00.000000000Z", line)
+                .unwrap();
+        }
+        drop(log);
+
+        let bytes = std::fs::read(&active).unwrap();
+        assert!(bytes.windows(b"first".len()).any(|w| w == b"first"));
+        assert!(bytes.windows(b"third".len()).any(|w| w == b"third"));
+        assert!(!dir.join("console.log.1").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotating_log_with_one_file_keeps_only_the_active_file() {
+        let dir = temp_log_dir("rotate-one");
+        let active = dir.join("console.log");
+        std::fs::write(&active, b"").unwrap();
+        let mut log = RotatingLog::open(
+            &active,
+            LogOptions {
+                max_size: 12,
+                max_files: 1,
+            },
+        )
+        .unwrap();
+        for line in [b"first\n".as_slice(), b"second\n", b"third\n"] {
+            log.write_record(b"2026-01-01T00:00:00.000000000Z", line)
+                .unwrap();
+        }
+        drop(log);
+
+        let bytes = std::fs::read(&active).unwrap();
+        assert!(bytes.windows(b"third".len()).any(|w| w == b"third"));
+        assert!(!bytes.windows(b"second".len()).any(|w| w == b"second"));
+        assert!(!dir.join("console.log.1").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -174,6 +174,8 @@ Run options (current subset):
 -w, --workdir DIR              override the image WorkingDir
 --pull missing|always|never    image refresh policy (default: missing)
 -e, --env NAME[=VALUE]         set a container environment variable (image mode)
+--log-max-size SIZE            rotate detached console.log at SIZE (default 10m; 0 disables)
+--log-max-file N               retain N detached log files including active (default 3; max 1024)
 --label KEY=VALUE             add container metadata (repeatable; overrides image labels)
 -v, --volume HOST|NAME:CONTAINER[:ro]
                      bind-mount an existing host path, or auto-create/use a managed

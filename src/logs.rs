@@ -9,7 +9,97 @@
 //! cannot participate in `--since`/`--until` selection because there is no
 //! trustworthy capture-time anchor.
 
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Default detached-console rotation budget. Rotating by default keeps a
+/// chatty workload from exhausting a small VPS disk; `--log-max-size 0`
+/// explicitly disables rotation.
+pub const DEFAULT_MAX_SIZE: u64 = 10 * 1024 * 1024;
+/// Total files retained by default, including the active `console.log`.
+pub const DEFAULT_MAX_FILES: usize = 3;
+/// Upper bound accepted for `--log-max-file`.
+///
+/// The value is user-controlled persisted state and is used to construct
+/// numbered paths for `logs`; keeping it bounded prevents a malformed record
+/// from turning a read-only command into an allocation / filesystem scan bomb.
+pub const MAX_FILES: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogOptions {
+    pub max_size: u64,
+    pub max_files: usize,
+}
+
+impl Default for LogOptions {
+    fn default() -> Self {
+        Self {
+            max_size: DEFAULT_MAX_SIZE,
+            max_files: DEFAULT_MAX_FILES,
+        }
+    }
+}
+
+/// Parse a log size (`10m`, `10mb`, `1024`) and allow `0` to disable rotation.
+pub fn parse_size(value: &str) -> Result<u64, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("size cannot be empty".to_string());
+    }
+    let value = value
+        .strip_suffix(['b', 'B'])
+        .filter(|value| !value.is_empty())
+        .unwrap_or(value);
+    let (number, multiplier) = match value.chars().last() {
+        Some('k' | 'K') => (&value[..value.len() - 1], 1024_u64),
+        Some('m' | 'M') => (&value[..value.len() - 1], 1024_u64 * 1024),
+        Some('g' | 'G') => (&value[..value.len() - 1], 1024_u64 * 1024 * 1024),
+        _ => (value, 1_u64),
+    };
+    let number = number.trim();
+    if number.is_empty() {
+        return Err("size is missing a number".to_string());
+    }
+    let parsed = number
+        .parse::<f64>()
+        .map_err(|_| "size is not a number".to_string())?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err("size must be finite and non-negative".to_string());
+    }
+    let bytes = parsed * multiplier as f64;
+    if bytes > u64::MAX as f64 {
+        return Err("size is too large".to_string());
+    }
+    Ok(bytes as u64)
+}
+
+/// Parse the retained-file count accepted by `--log-max-file`.
+pub fn parse_max_files(value: &str) -> Result<usize, String> {
+    let count = value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| format!("invalid value '{value}'"))?;
+    if count == 0 {
+        return Err("must be greater than zero".to_string());
+    }
+    if count > MAX_FILES {
+        return Err(format!("must not exceed {MAX_FILES}"));
+    }
+    Ok(count)
+}
+
+/// Paths in chronological order: oldest archive first, active file last.
+pub fn log_paths(active: &Path, max_files: usize) -> Vec<PathBuf> {
+    let max_files = max_files.max(1);
+    let mut paths = Vec::with_capacity(max_files);
+    for index in (1..max_files).rev() {
+        let mut name = active.as_os_str().to_os_string();
+        name.push(format!(".{index}"));
+        paths.push(PathBuf::from(name));
+    }
+    paths.push(active.to_path_buf());
+    paths
+}
 
 /// Inclusive nanosecond range used by `zerun logs --since/--until`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -435,6 +525,35 @@ mod tests {
         assert_eq!(
             timestamp_prefix(&RAW[..first_line_end]),
             Some(&b"hello\n"[..])
+        );
+    }
+
+    #[test]
+    fn parses_log_sizes_and_builds_rotation_order() {
+        assert_eq!(parse_size("0").unwrap(), 0);
+        assert_eq!(parse_size("512").unwrap(), 512);
+        assert_eq!(parse_size("10m").unwrap(), 10 * 1024 * 1024);
+        assert_eq!(parse_size("1.5M").unwrap(), 1_572_864);
+        assert_eq!(parse_size("2gb").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert!(parse_size("-1").is_err());
+        assert!(parse_size("nope").is_err());
+        assert_eq!(parse_max_files("1").unwrap(), 1);
+        assert_eq!(parse_max_files("1024").unwrap(), 1024);
+        assert!(parse_max_files("0").is_err());
+        assert!(parse_max_files("1025").is_err());
+        assert!(parse_max_files("many").is_err());
+
+        assert_eq!(
+            log_paths(Path::new("/tmp/console.log"), 1),
+            vec![PathBuf::from("/tmp/console.log")]
+        );
+        assert_eq!(
+            log_paths(Path::new("/tmp/console.log"), 3),
+            vec![
+                PathBuf::from("/tmp/console.log.2"),
+                PathBuf::from("/tmp/console.log.1"),
+                PathBuf::from("/tmp/console.log"),
+            ]
         );
     }
 }

@@ -131,6 +131,8 @@ mod tests {
             user: None,
             labels: BTreeMap::new(),
             log: String::new(),
+            log_max_size: None,
+            log_max_file: None,
             rootfs: String::new(),
             overlay: None,
             tmpfs_upper: false,
