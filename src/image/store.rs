@@ -361,11 +361,12 @@ impl ImageStore {
         Ok(Some(rec))
     }
 
-    /// Best-effort byte size that `gc()` would reclaim.
+    /// Best-effort byte size that garbage collection would reclaim, excluding
+    /// the supplied protected rootfs paths.
     ///
     /// This stays a read-only dry run so `system df` can report stale pull
     /// artifacts without mutating the store or requiring a privileged caller.
-    pub fn reclaimable_bytes(&self) -> u64 {
+    pub fn reclaimable_bytes_with_protected(&self, protected_rootfs: &BTreeSet<PathBuf>) -> u64 {
         let Ok(_lock) = self.lock_index() else {
             return 0;
         };
@@ -395,7 +396,8 @@ impl ImageStore {
             for entry in rd.flatten() {
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else { continue };
-                if name.starts_with(".tmp-") || !keep_blobs.contains(name) {
+                let key = format!("sha256:{name}");
+                if name.starts_with(".tmp-") || !keep_blobs.contains(&key) {
                     total += fsutil::dir_size(&entry.path());
                 }
             }
@@ -405,7 +407,9 @@ impl ImageStore {
             for entry in rd.flatten() {
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else { continue };
-                if name.starts_with(".tmp-") || !keep_rootfs.contains(name) {
+                if name.starts_with(".tmp-")
+                    || (!keep_rootfs.contains(name) && !protected_rootfs.contains(&entry.path()))
+                {
                     total += fsutil::dir_size(&entry.path());
                 }
             }
@@ -415,7 +419,10 @@ impl ImageStore {
 
     /// Delete blobs and rootfs dirs no longer reachable from the tag index.
     /// Best-effort per entry: a broken record must not wedge `rmi`.
-    pub fn gc(&self) -> ZResult<()> {
+    ///
+    /// Materialized rootfs directories supplied in `protected_rootfs` are kept
+    /// even when their image tag is no longer present.
+    pub fn gc_with_protected(&self, protected_rootfs: &BTreeSet<PathBuf>) -> ZResult<()> {
         let _lock = self.lock_index()?;
         let records = self.records()?;
         let mut keep_blobs: BTreeSet<String> = BTreeSet::new(); // "sha256:<hex>"
@@ -461,7 +468,10 @@ impl ImageStore {
             for entry in rd.flatten() {
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else { continue };
-                if name.starts_with(".tmp-") || keep_rootfs.contains(name) {
+                if name.starts_with(".tmp-")
+                    || keep_rootfs.contains(name)
+                    || protected_rootfs.contains(&entry.path())
+                {
                     continue;
                 }
                 fsutil::remove_dir_all_quiet(&entry.path());
@@ -630,6 +640,18 @@ mod tests {
     #[test]
     fn reclaimable_dry_run_matches_gc_scope() {
         let s = test_store();
+        let kept = b"kept blob";
+        let kept_digest = format!("sha256:{}", sha256_hex(kept));
+        s.write_blob(&kept_digest, kept).unwrap();
+        s.add_image(
+            "docker.io/example/kept",
+            Some("latest"),
+            &kept_digest,
+            &format!("sha256:{}", "0".repeat(64)),
+            0,
+        )
+        .unwrap();
+
         let orphan = b"orphan blob";
         let orphan_digest = format!("sha256:{}", sha256_hex(orphan));
         s.write_blob(&orphan_digest, orphan).unwrap();
@@ -637,12 +659,37 @@ mod tests {
         std::fs::create_dir_all(&orphan_rootfs).unwrap();
         std::fs::write(orphan_rootfs.join("marker"), b"orphan rootfs").unwrap();
         let expected = orphan.len() as u64 + b"orphan rootfs".len() as u64;
-        assert_eq!(s.reclaimable_bytes(), expected);
+        assert_eq!(
+            s.reclaimable_bytes_with_protected(&BTreeSet::new()),
+            expected
+        );
 
-        s.gc().unwrap();
+        s.gc_with_protected(&BTreeSet::new()).unwrap();
+        assert!(s.has_blob(&kept_digest));
         assert!(!s.has_blob(&orphan_digest));
         assert!(!orphan_rootfs.exists());
-        assert_eq!(s.reclaimable_bytes(), 0);
+        assert_eq!(s.reclaimable_bytes_with_protected(&BTreeSet::new()), 0);
+    }
+
+    #[test]
+    fn gc_preserves_rootfs_referenced_by_a_container() {
+        let s = test_store();
+        let protected = s.rootfs_dir().join("container-root");
+        let orphan = s.rootfs_dir().join("orphan-root");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(protected.join("marker"), b"keep me").unwrap();
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("marker"), b"remove me").unwrap();
+
+        let protected_set = BTreeSet::from([protected.clone()]);
+        assert_eq!(
+            s.reclaimable_bytes_with_protected(&protected_set),
+            b"remove me".len() as u64
+        );
+        s.gc_with_protected(&protected_set).unwrap();
+        assert!(protected.join("marker").is_file());
+        assert!(!orphan.exists());
+        let _ = fs::remove_dir_all(&s.data_root);
     }
 
     #[test]

@@ -272,6 +272,7 @@ mod tests {
             log: String::new(),
             log_max_size: None,
             log_max_file: None,
+            lower: Some("/tmp/zerun-events/lower".to_string()),
             rootfs: String::new(),
             overlay: None,
             tmpfs_upper: false,

@@ -16,6 +16,7 @@ use crate::seccomp::SeccompMode;
 use crate::store::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,6 +28,47 @@ pub enum Status {
     Created,
     Running,
     Exited,
+}
+
+/// Cross-process lock covering one container's lifecycle mutations.
+///
+/// The lock lives outside the state directory so `rm` can safely unlink the
+/// record without allowing a concurrent command to lock a replacement inode.
+/// It is released explicitly rather than only on drop because `run_detached`
+/// forks a long-lived reaper that inherits the descriptor.
+pub struct ContainerOperationLock {
+    file: File,
+}
+
+impl ContainerOperationLock {
+    /// Try to reserve a container for a lifecycle mutation without waiting.
+    ///
+    /// Commands that mutate lifecycle state should fail fast when another
+    /// command owns the container; silently queueing behind a long-running
+    /// `start` can make the caller operate on stale state.
+    pub fn try_acquire(store: &Store, id: &str) -> Result<Self, String> {
+        let dir = store.run_root().join("locks");
+        fsutil::mkdir_p(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join(format!("{id}.lock"));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| format!("open container lock {}: {e}", path.display()))?;
+        file.try_lock()
+            .map_err(|e| format!("container {id} is busy with another lifecycle operation: {e}"))?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for ContainerOperationLock {
+    fn drop(&mut self) {
+        // Explicit unlock avoids leaving the inherited reaper descriptor
+        // holding the lock after the foreground CLI returns.
+        let _ = self.file.unlock();
+    }
 }
 
 /// Final cgroup metrics captured by the reaper before cleanup.
@@ -196,6 +238,11 @@ pub struct ContainerState {
     /// Total retained console files, including the active one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_max_file: Option<usize>,
+    /// Read-only lower rootfs used by this container (including direct
+    /// `--no-overlay` runs). `None` for legacy records. Required to resume a
+    /// stopped container without resolving or pulling the image again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lower: Option<String>,
     /// Container root the process pivoted into (overlay merged dir, or the
     /// legacy `--rootfs` dir); `ze exec` chroots here.
     pub rootfs: String,
@@ -502,6 +549,7 @@ mod tests {
             log: format!("{}/x/console.log", std::env::temp_dir().display()),
             log_max_size: None,
             log_max_file: None,
+            lower: Some("/tmp/lower".to_string()),
             rootfs: String::new(),
             overlay: None,
             tmpfs_upper: false,
@@ -531,6 +579,25 @@ mod tests {
             Some(&["CAP_NET_RAW".to_string()][..])
         );
         assert_eq!(loaded.seccomp, Some(SeccompMode::Unconfined));
+        assert_eq!(loaded.lower.as_deref(), Some("/tmp/lower"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn container_operation_lock_is_exclusive_until_dropped() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-state-lock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.join("data"), root.join("run"));
+        store.ensure_dirs().unwrap();
+
+        let first = ContainerOperationLock::try_acquire(&store, "abc123").unwrap();
+        assert!(ContainerOperationLock::try_acquire(&store, "abc123").is_err());
+        drop(first);
+        assert!(ContainerOperationLock::try_acquire(&store, "abc123").is_ok());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

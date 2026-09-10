@@ -35,6 +35,14 @@ pub struct ContainerFs {
 }
 
 impl Store {
+    #[cfg(test)]
+    pub(crate) fn at(data_root: PathBuf, run_root: PathBuf) -> Self {
+        Self {
+            data_root,
+            run_root,
+        }
+    }
+
     /// Resolve the store roots for this process (env override > uid-based default).
     pub fn detect() -> ZResult<Self> {
         let data_root = match std::env::var_os("ZERUN_DATA_ROOT") {
@@ -68,6 +76,7 @@ impl Store {
             self.data_root.join("volumes"),
             self.data_root.join("tmp"),
             self.run_root.join("containers"),
+            self.run_root.join("locks"),
             self.run_root.join("net"), // file-based IPAM (M5)
         ] {
             fsutil::mkdir_p(&d)?;
@@ -95,6 +104,46 @@ impl Store {
             fsutil::mkdir_p(d)?;
         }
         let lower_abs = absolute(lower)?;
+        Ok(ContainerFs {
+            lower: lower_abs,
+            upper,
+            work,
+            merged,
+            tmpfs_upper,
+            dir,
+        })
+    }
+
+    /// Reopen the persistent host-side paths for a stopped container.
+    ///
+    /// Unlike [`Self::prepare_container_fs`], this never creates `upper` or
+    /// `work`: a missing writable layer means the container cannot be resumed
+    /// safely without silently discarding its filesystem changes.
+    pub fn reopen_container_fs(
+        &self,
+        id: &str,
+        lower: &Path,
+        tmpfs_upper: bool,
+    ) -> ZResult<ContainerFs> {
+        let dir = self.data_root.join("overlays").join(id);
+        let upper = dir.join("upper");
+        let work = dir.join("work");
+        let merged = dir.join("merged");
+        if !upper.is_dir() || !work.is_dir() {
+            return Err(crate::zerr!(
+                "container {} writable layer is missing; recreate the container",
+                id
+            ));
+        }
+        fsutil::mkdir_p(&merged)?;
+        let lower_abs = absolute(lower)?;
+        if !lower_abs.is_dir() {
+            return Err(crate::zerr!(
+                "container {} lower rootfs is missing at {}",
+                id,
+                lower_abs.display()
+            ));
+        }
         Ok(ContainerFs {
             lower: lower_abs,
             upper,
@@ -166,5 +215,30 @@ mod tests {
         assert_eq!(s.run_root(), Path::new("/tmp/zerun-test-run"));
         std::env::remove_var("ZERUN_DATA_ROOT");
         std::env::remove_var("ZERUN_RUNTIME_ROOT");
+    }
+
+    #[test]
+    fn reopen_container_fs_requires_the_persisted_writable_layer() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-store-reopen-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store {
+            data_root: root.join("data"),
+            run_root: root.join("run"),
+        };
+        let lower = root.join("lower");
+        std::fs::create_dir_all(&lower).unwrap();
+        assert!(store.reopen_container_fs("abc123", &lower, false).is_err());
+
+        let overlay = store.data_root.join("overlays/abc123");
+        std::fs::create_dir_all(overlay.join("upper")).unwrap();
+        std::fs::create_dir_all(overlay.join("work")).unwrap();
+        let fs = store.reopen_container_fs("abc123", &lower, false).unwrap();
+        assert_eq!(fs.lower, lower);
+        assert!(fs.merged.is_dir());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

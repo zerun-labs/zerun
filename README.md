@@ -37,7 +37,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   proxy (Docker's docker-proxy in-binary), and `--dns` / host resolv.conf inheritance.
 - **M5 — detached lifecycle (done)**: `run -d` forks a tiny per-container reaper that
   redirects stdio to `console.log` and persists state to disk;
-  `ps [-a] [-q] [--format table|json] [--filter KEY=VALUE]`, `stop`, `restart`,
+  `ps [-a] [-q] [--format table|json] [--filter KEY=VALUE]`, `start`, `stop`, `restart`,
   `rm`, `prune [-f] [--images]`, `logs [--since/--until/-f]`, `stats`, `exec`, `attach`, and `commit` address containers by id/name with crash reconcile
   of stale records; file-based IPAM; `--rm` for auto-removal (see AGENTS.md).
 
@@ -53,7 +53,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   `CAP_NET_RAW`/`CAP_SYS_ADMIN` removed, masked `/proc`/`/sys` paths, and a
   deny-by-default seccomp allowlist (capabilities can be tuned with
   `--cap-add`/`--cap-drop`; seccomp can be opted out with `--seccomp unconfined`).
-- **Docker-compatible top 20% CLI**: `run / ps / wait / stop / restart / rm / prune / logs / exec / inspect /
+- **Docker-compatible top 20% CLI**: `run / ps / wait / start / stop / restart / rm / prune / logs / exec / inspect /
   port / rename / top / diff / cp / export / import / events / update / attach / kill / pull / push / tag / save / load /
   login / logout / images / rmi / commit / generate-service / system df / doctor`.
 
@@ -280,15 +280,14 @@ sudo target/release/zerun exec web /bin/sh            # join the container
 sudo target/release/zerun diff web                    # changed/added/deleted paths
 sudo target/release/zerun stop --time 3 web           # SIGTERM, then SIGKILL
 sudo target/release/zerun kill --signal TERM web      # send any Linux signal
-sudo target/release/zerun restart --time 3 web        # stop, then recreate from saved options
+sudo target/release/zerun start web                   # resume with the same id/writable layer
+sudo target/release/zerun restart --time 3 web        # stop, then resume from saved options
 sudo target/release/zerun commit -m snapshot web web:snapshot
 sudo target/release/zerun rm web                      # remove the stopped container
 sudo target/release/zerun prune -f                    # remove all exited containers
 sudo target/release/zerun prune -f --images           # also remove unreachable image blobs/rootfs
 sudo target/release/zerun system df                   # image and container disk usage
 ```
-
-Detached containers keep no daemon: the per-container reaper is a tiny process that
 
 Detached containers keep no daemon: the per-container reaper is a tiny process that
 disappears when the container exits. If the host crashes (or the reaper is killed), the
@@ -309,8 +308,14 @@ blobs/rootfs left by interrupted pulls or removed records; tagged images are ret
 It reads live control files while a container runs and persists a final snapshot
 when it exits. Metrics are `n/a` when the cgroup was unavailable or the command
 cannot read it.
-`restart` recreates a detached container from the canonical launch options saved in
-`state.json`; containers created before this metadata was added are not restartable.
+`start` resumes an exited container without replacing its id, console history, or writable
+overlay. `restart` first applies the normal stop sequence and then resumes it from the
+canonical launch options saved in `state.json`. Containers created before resumable state
+was added are not startable; recreate them with `run`. A container created with `--rm`
+cannot be restarted after it stops because its state is intentionally removed.
+Stopped containers retain both their writable layer and read-only lower rootfs; image
+garbage collection keeps that lower reachable even after the image tag is removed, until
+the container itself is removed.
 `attach` streams a running detached container's live output over an owner-only Unix socket.
 When the workload exits, a final control frame closes the stream and the attach command
 returns the container's exit code without mixing runtime metadata into output.
