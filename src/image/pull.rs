@@ -82,7 +82,7 @@ pub fn pull_image(
 
     // 1. Resolve the tag/digest to a single-architecture manifest on the first
     //    endpoint that answers (mirrors first, official last).
-    let (manifest_digest, manifest_bytes) = resolve_single_manifest(
+    let (manifest_digest, manifest_bytes, index_digest) = resolve_single_manifest(
         store,
         client,
         &endpoints,
@@ -149,12 +149,13 @@ pub fn pull_image(
                 .unwrap_or_else(|| "latest".to_string()),
         )
     };
-    store.add_image(
+    store.add_index_image(
         &name,
         tag.as_deref(),
         &manifest_digest,
         &manifest.config.digest,
         size_bytes,
+        index_digest.as_deref(),
     )?;
 
     Ok(PulledImage {
@@ -166,7 +167,8 @@ pub fn pull_image(
 
 /// Fetch the manifest for `req_ref` (tag or digest), following a multi-arch
 /// index to the child manifest matching `want`. Returns the *single* manifest's
-/// bytes and digest, stored into the blob store.
+/// bytes and digest, stored into the blob store. When resolution followed an
+/// index, also return that index's digest so the pull can preserve it locally.
 fn resolve_single_manifest(
     store: &ImageStore,
     client: &mut RegistryClient,
@@ -175,11 +177,11 @@ fn resolve_single_manifest(
     repo: &str,
     req_ref: &str,
     want: &Platform,
-) -> ZResult<(String, Vec<u8>)> {
+) -> ZResult<(String, Vec<u8>, Option<String>)> {
     let mut last_err: Option<ZError> = None;
     for base in endpoints {
         let top_url = format!("{base}/v2/{repo}/manifests/{req_ref}");
-        let res = (|| -> ZResult<(String, Vec<u8>)> {
+        let res = (|| -> ZResult<(String, Vec<u8>, Option<String>)> {
             let resp = client.get(&top_url, Some(manifest::ACCEPT_MANIFEST), registry, repo)?;
             let digest_hdr = resp.header("docker-content-digest").map(str::to_string);
             let bytes = resp
@@ -189,9 +191,13 @@ fn resolve_single_manifest(
             match manifest::classify(&bytes)? {
                 ImageDoc::Manifest(_) => {
                     let digest = store_manifest(store, digest_hdr.as_deref(), &bytes)?;
-                    Ok((digest, bytes))
+                    Ok((digest, bytes, None))
                 }
                 ImageDoc::Index(index) => {
+                    // Preserve the complete index before selecting the child.
+                    // Without it, a later `push` of the local tag could only
+                    // upload the host platform instead of the whole image.
+                    let index_digest = store_manifest(store, digest_hdr.as_deref(), &bytes)?;
                     let doc = ImageDoc::Index(index);
                     let child = doc.select(want)?.ok_or_else(|| {
                         crate::zerr!("index resolution returned no child manifest")
@@ -205,7 +211,7 @@ fn resolve_single_manifest(
                         .map_err(|e| crate::zerr!("read child manifest body: {e}"))?
                         .into_bytes();
                     let digest = store_manifest(store, Some(&child_digest), &child_bytes)?;
-                    Ok((digest, child_bytes))
+                    Ok((digest, child_bytes, Some(index_digest)))
                 }
             }
         })();
@@ -455,7 +461,178 @@ fn short_digest(digest: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::io::Read;
+    use std::io::Write as IoWrite;
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc::{channel, Sender};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn test_store() -> ImageStore {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-pull-store-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        ImageStore::at(&dir).unwrap()
+    }
+
+    fn gzip_empty_layer(source: &Path) -> (Vec<u8>, String) {
+        let mut tar = tar::Builder::new(Vec::new());
+        tar.append_dir_all(Path::new(""), source).unwrap();
+        let uncompressed = tar.into_inner().unwrap();
+        let diff = format!("sha256:{:x}", Sha256::digest(&uncompressed));
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(&uncompressed).unwrap();
+        (gzip.finish().unwrap(), diff)
+    }
+
+    fn serve_pull_registry(
+        listener: TcpListener,
+        layer_digest: String,
+        index: Vec<u8>,
+        child: Vec<u8>,
+        config: Vec<u8>,
+        layer: Vec<u8>,
+        done: Sender<()>,
+    ) {
+        use std::io::BufRead;
+        for stream in listener.incoming().take(4) {
+            let mut reader = std::io::BufReader::new(stream.unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let path = request_line.split_whitespace().nth(1).unwrap().to_string();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+
+            let (body, content_type) = if path.ends_with("/manifests/v1") {
+                (
+                    index.clone(),
+                    "application/vnd.docker.distribution.manifest.list.v2+json",
+                )
+            } else if path.contains("/manifests/") {
+                (
+                    child.clone(),
+                    "application/vnd.docker.distribution.manifest.v2+json",
+                )
+            } else if path.contains("/blobs/") {
+                if path.ends_with(&format!("/blobs/{layer_digest}")) {
+                    (layer.clone(), "application/octet-stream")
+                } else {
+                    (config.clone(), "application/octet-stream")
+                }
+            } else {
+                unreachable!("unexpected registry request: {path}");
+            };
+
+            let mut stream = reader.into_inner();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+            if path.ends_with(&format!("/blobs/{layer_digest}")) {
+                let _ = done.send(());
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn pull_preserves_multi_arch_index() {
+        let store = test_store();
+        let store_root = std::env::temp_dir().join(format!(
+            "zerun-pull-store-{}-{}",
+            std::process::id(),
+            SEQ.load(Ordering::Relaxed) - 1
+        ));
+        let source = std::env::temp_dir().join(format!(
+            "zerun-pull-rootfs-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&source).unwrap();
+        let (layer, layer_diff) = gzip_empty_layer(&source);
+
+        let config = serde_json::to_vec(&serde_json::json!({
+            "architecture": "amd64",
+            "os": "linux",
+            "rootfs": {"type": "layers", "diff_ids": [layer_diff]},
+        }))
+        .unwrap();
+        let config_digest = format!("sha256:{}", sha256_hex(&config));
+        let layer_digest = format!("sha256:{}", sha256_hex(&layer));
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": config.len(),
+                "digest": config_digest,
+            },
+            "layers": [{
+                "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                "size": layer.len(),
+                "digest": layer_digest,
+            }],
+        }))
+        .unwrap();
+        let manifest_digest = format!("sha256:{}", sha256_hex(&manifest));
+        let index = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+            "manifests": [{
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "size": manifest.len(),
+                "digest": manifest_digest,
+                "platform": {"architecture": "amd64", "os": "linux"},
+            }],
+        }))
+        .unwrap();
+        let index_digest = format!("sha256:{}", sha256_hex(&index));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (done_tx, done_rx) = channel();
+        let server = std::thread::spawn(move || {
+            serve_pull_registry(
+                listener,
+                layer_digest,
+                index,
+                manifest,
+                config,
+                layer,
+                done_tx,
+            )
+        });
+
+        let reference = Reference::parse(&format!("localhost:{port}/org/app:v1")).unwrap();
+        let mut client = RegistryClient::new();
+        pull_image(&store, &mut client, &reference, &PullOptions::default()).unwrap();
+        server.join().unwrap();
+        done_rx.recv().unwrap();
+
+        let record = store
+            .find_record(&format!("localhost:{port}/org/app"), Some("v1"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.manifest, manifest_digest);
+        assert_eq!(record.index.as_deref(), Some(index_digest.as_str()));
+        assert!(store.has_blob(&index_digest));
+        assert!(store.has_blob(&manifest_digest));
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(store_root);
+    }
 
     fn temp_blob(name: &str, bytes: &[u8]) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!(

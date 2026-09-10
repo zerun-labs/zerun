@@ -27,7 +27,8 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   pull with Bearer token auth, private-registry credentials, multi-arch platform selection (`--platform`), compressed-blob and
   diff_id double verification, zstd layer decode + magic sniffing, transient request retries,
   mirror inheritance
-  (env, zerun `config.toml`, `/etc/docker/daemon.json`), and per-layer pull progress;
+  (env, zerun `config.toml`, `/etc/docker/daemon.json`), and per-layer pull progress. Pulls
+  preserve the complete multi-architecture index, so a later `push` can upload every platform;
   `zerun run IMAGE` auto-pulls and applies image env/entrypoint/cmd/working-dir.
 - **M4 — kernel networking (done)**: `--net bridge` (rootful) creates the `zerun0` bridge
   (10.88.0.1/24) and a per-container veth pair with container-side `eth0` and a default
