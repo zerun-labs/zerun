@@ -179,6 +179,16 @@ pub fn diff_events(previous: &[ContainerState], current: &[ContainerState]) -> V
                         detail: Some(format!("exitCode={}", st.exit_code.unwrap_or(-1))),
                     });
                 }
+                if st.status == Status::Running && st.paused {
+                    events.push(Event {
+                        at: now.clone(),
+                        action: "pause",
+                        id: st.id.clone(),
+                        name: name.clone(),
+                        image: st.image.clone(),
+                        detail: None,
+                    });
+                }
             }
             Some(old) => {
                 if old.name != st.name {
@@ -201,7 +211,7 @@ pub fn diff_events(previous: &[ContainerState], current: &[ContainerState]) -> V
                             at: st.started.clone().unwrap_or_else(|| now.clone()),
                             action: "start",
                             id: st.id.clone(),
-                            name,
+                            name: name.clone(),
                             image: st.image.clone(),
                             detail: None,
                         }),
@@ -209,13 +219,26 @@ pub fn diff_events(previous: &[ContainerState], current: &[ContainerState]) -> V
                             at: st.finished.clone().unwrap_or_else(|| now.clone()),
                             action: "die",
                             id: st.id.clone(),
-                            name,
+                            name: name.clone(),
                             image: st.image.clone(),
                             detail: Some(format!("exitCode={}", st.exit_code.unwrap_or(-1))),
                         }),
                         // Running -> Created never happens; ignore it.
                         Status::Created => {}
                     }
+                }
+                if old.status == Status::Running
+                    && st.status == Status::Running
+                    && old.paused != st.paused
+                {
+                    events.push(Event {
+                        at: now.clone(),
+                        action: if st.paused { "pause" } else { "unpause" },
+                        id: st.id.clone(),
+                        name: name.clone(),
+                        image: st.image.clone(),
+                        detail: None,
+                    });
                 }
             }
         }
@@ -252,6 +275,7 @@ mod tests {
             image: "alpine".to_string(),
             pid: None,
             status,
+            paused: false,
             exit_code: exit,
             created: "2026-09-10T00:00:00Z".to_string(),
             started: Some("2026-09-10T00:00:01Z".to_string()),
@@ -326,6 +350,21 @@ mod tests {
         let events = diff_events(&[old], &[]);
         let actions: Vec<&str> = events.iter().map(|e| e.action).collect();
         assert_eq!(actions, vec!["destroy"]);
+    }
+
+    #[test]
+    fn pause_and_unpause_transitions_are_detected() {
+        let running = state("abc123", Some("web"), Status::Running, None);
+        let mut paused = state("abc123", Some("web"), Status::Running, None);
+        paused.paused = true;
+        let paused_events = diff_events(
+            std::slice::from_ref(&running),
+            std::slice::from_ref(&paused),
+        );
+        assert_eq!(paused_events[0].action, "pause");
+
+        let resumed = diff_events(&[paused], &[running]);
+        assert_eq!(resumed[0].action, "unpause");
     }
 
     #[test]

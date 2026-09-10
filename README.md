@@ -37,7 +37,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   proxy (Docker's docker-proxy in-binary), and `--dns` / host resolv.conf inheritance.
 - **M5 — detached lifecycle (done)**: `run -d` forks a tiny per-container reaper that
   redirects stdio to `console.log` and persists state to disk;
-  `ps [-a] [-q] [--format table|json] [--filter KEY=VALUE]`, `start`, `stop`, `restart`,
+  `ps [-a] [-q] [--format table|json] [--filter KEY=VALUE]`, `start`, `pause`, `unpause`, `stop`, `restart`,
   `rm`, `prune [-f] [--images]`, `logs [--since/--until/-f]`, `stats`, `exec`, `attach`, and `commit` address containers by id/name with crash reconcile
   of stale records; file-based IPAM; `--rm` for auto-removal (see AGENTS.md).
 
@@ -53,7 +53,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   `CAP_NET_RAW`/`CAP_SYS_ADMIN` removed, masked `/proc`/`/sys` paths, and a
   deny-by-default seccomp allowlist (capabilities can be tuned with
   `--cap-add`/`--cap-drop`; seccomp can be opted out with `--seccomp unconfined`).
-- **Docker-compatible top 20% CLI**: `run / ps / wait / start / stop / restart / rm / prune / logs / exec / inspect /
+- **Docker-compatible top 20% CLI**: `run / ps / wait / start / pause / unpause / stop / restart / rm / prune / logs / exec / inspect /
   port / rename / top / diff / cp / export / import / events / update / attach / kill / pull / push / tag / save / load /
   login / logout / images / rmi / commit / generate-service / system df / doctor`.
 
@@ -281,6 +281,8 @@ sudo target/release/zerun diff web                    # changed/added/deleted pa
 sudo target/release/zerun stop --time 3 web           # SIGTERM, then SIGKILL
 sudo target/release/zerun kill --signal TERM web      # send any Linux signal
 sudo target/release/zerun start web                   # resume with the same id/writable layer
+sudo target/release/zerun pause web                   # freeze the complete process tree
+sudo target/release/zerun unpause web                 # thaw it and continue execution
 sudo target/release/zerun restart --time 3 web        # stop, then resume from saved options
 sudo target/release/zerun commit -m snapshot web web:snapshot
 sudo target/release/zerun rm web                      # remove the stopped container
@@ -313,6 +315,11 @@ overlay. `restart` first applies the normal stop sequence and then resumes it fr
 canonical launch options saved in `state.json`. Containers created before resumable state
 was added are not startable; recreate them with `run`. A container created with `--rm`
 cannot be restarted after it stops because its state is intentionally removed.
+`pause` freezes every process in a detached container through the cgroup v2 freezer;
+`unpause` thaws it without replacing its identity or writable state. `ps` displays
+`Up ... (Paused)`, and `ps --filter status=paused` selects those containers. Rootless
+hosts need a delegated cgroup v2 hierarchy; otherwise pause/unpause reports that no
+lifecycle cgroup is available.
 Stopped containers retain both their writable layer and read-only lower rootfs; image
 garbage collection keeps that lower reachable even after the image tag is removed, until
 the container itself is removed.

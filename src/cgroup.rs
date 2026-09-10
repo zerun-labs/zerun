@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Default, Clone)]
 pub struct ResourceLimits {
@@ -170,6 +171,33 @@ impl CgroupV2 {
         }
     }
 
+    /// Freeze or thaw every task in this cgroup (cgroups v2 freezer).
+    ///
+    /// The kernel reports completion through `cgroup.events`; wait for the
+    /// requested state so `pause` does not return while a workload is still
+    /// consuming CPU.
+    pub fn freeze(&self, frozen: bool) -> ZResult<()> {
+        self.set_freeze(frozen)?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if read_frozen(&self.path) == Some(frozen) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(crate::zerr!(
+                    "timed out waiting for cgroup {} to {}",
+                    self.path.display(),
+                    if frozen { "freeze" } else { "thaw" }
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn set_freeze(&self, frozen: bool) -> ZResult<()> {
+        self.write("cgroup.freeze", if frozen { "1" } else { "0" }.to_string())
+    }
+
     /// Benchmark helper: read peak memory usage (used by the bench harness).
     #[allow(dead_code)]
     pub fn read_peak(&self) -> ZResult<String> {
@@ -182,6 +210,14 @@ impl CgroupV2 {
         let _ = fs::remove_dir(&self.path);
         let _ = fs::remove_dir(self.path.parent().unwrap_or(Path::new("/sys/fs/cgroup")));
     }
+}
+
+fn read_frozen(path: &Path) -> Option<bool> {
+    let events = fs::read_to_string(path.join("cgroup.events")).ok()?;
+    events.lines().find_map(|line| {
+        let (key, value) = line.split_once(' ')?;
+        (key == "frozen").then(|| value.trim() == "1")
+    })
 }
 
 /// Turn Docker-style device limits into one compact `io.max` value.
@@ -512,5 +548,28 @@ mod tests {
         assert_eq!(parse_size("1k").unwrap(), 1024);
         assert_eq!(parse_size("4096").unwrap(), 4096);
         assert!(parse_size("abc").is_err());
+    }
+
+    #[test]
+    fn writes_cgroup_freeze_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-cgroup-freeze-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cg = CgroupV2 { path: dir.clone() };
+        cg.set_freeze(true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("cgroup.freeze")).unwrap(),
+            "1"
+        );
+        cg.set_freeze(false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("cgroup.freeze")).unwrap(),
+            "0"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

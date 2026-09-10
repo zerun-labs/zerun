@@ -59,6 +59,8 @@ fn main() {
         Some("ps") => cmd_ps(&args[2..]),
         Some("wait") => cmd_wait(&args[2..]),
         Some("start") => cmd_start(&args[2..]),
+        Some("pause") => cmd_pause(&args[2..]),
+        Some("unpause") => cmd_unpause(&args[2..]),
         Some("stop") => cmd_stop(&args[2..]),
         Some("kill") => cmd_kill(&args[2..]),
         Some("restart") => cmd_restart(&args[2..]),
@@ -962,6 +964,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         // Allocated from the file IPAM inside run_container (bridge mode).
         bridge_ip: None,
         run_root: store.run_root().to_path_buf(),
+        lifecycle_cgroup: a.detach,
     };
 
     let lower = container_fs
@@ -1005,6 +1008,99 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
             1
         }
     }
+}
+
+fn cmd_pause(args: &[String]) -> i32 {
+    cmd_set_paused(args, true)
+}
+
+fn cmd_unpause(args: &[String]) -> i32 {
+    cmd_set_paused(args, false)
+}
+
+/// Pause or resume detached containers through the cgroup v2 freezer.
+fn cmd_set_paused(args: &[String], paused: bool) -> i32 {
+    let command = if paused { "pause" } else { "unpause" };
+    let mut targets: Vec<String> = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!("usage: zerun {command} CONTAINER...");
+                return 0;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("zerun {command}: unknown option {other}");
+                return 2;
+            }
+            _ => targets.push(arg.clone()),
+        }
+    }
+    if targets.is_empty() {
+        eprintln!("zerun {command}: at least one CONTAINER is required");
+        return 2;
+    }
+    let store = match Store::detect() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zerun: {e}");
+            return 1;
+        }
+    };
+    let mut failed = false;
+    for target in targets {
+        match set_container_paused(&store, &target, paused) {
+            Ok(name) => println!("{name}"),
+            Err(e) => {
+                eprintln!("zerun {command}: {e}");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        1
+    } else {
+        0
+    }
+}
+
+/// Apply the cgroup freezer state and persist it without replacing the
+/// container identity or writable layer.
+fn set_container_paused(store: &Store, target: &str, paused: bool) -> Result<String, String> {
+    let initial = state::resolve(store, target)?;
+    let _lock = state::ContainerOperationLock::try_acquire(store, &initial.id)?;
+    let mut st = state::ContainerState::load(store, &initial.id).ok_or_else(|| {
+        format!(
+            "container {} disappeared before {}",
+            display_name(&initial),
+            if paused { "pause" } else { "unpause" }
+        )
+    })?;
+    if lifecycle::reconcile_stale(store, &mut st) {
+        st.save().map_err(|e| e.to_string())?;
+    }
+    let name = display_name(&st);
+    if st.status != state::Status::Running || !st.pid_alive() {
+        return Err(format!(
+            "container {name} is not running (status {})",
+            st.status_label()
+        ));
+    }
+    let cgroup_path = st.cgroup.as_deref().ok_or_else(|| {
+        format!(
+            "container {name} has no lifecycle cgroup; pause/unpause requires a delegated \
+             cgroup v2 hierarchy"
+        )
+    })?;
+    let cgroup = cgroup::CgroupV2::open(Path::new(cgroup_path)).map_err(|e| e.to_string())?;
+    cgroup.freeze(paused).map_err(|e| e.to_string())?;
+    st.paused = paused;
+    if let Err(e) = st.save() {
+        // Keep the persisted state and the kernel freezer consistent when the
+        // state write itself fails.
+        let _ = cgroup.freeze(!paused);
+        return Err(e.to_string());
+    }
+    Ok(name)
 }
 
 fn cmd_start(args: &[String]) -> i32 {
@@ -1077,6 +1173,10 @@ fn start_one(store: &Store, target: &str) -> Result<String, String> {
         }
         state::Status::Created | state::Status::Exited => {}
     }
+    // A paused marker is only meaningful while the PID/cgroup are alive. Clear
+    // it before launching the resumed workload so stale/corrupt records cannot
+    // make a fresh process look paused.
+    st.paused = false;
     let launch_args = st.launch_args.clone().ok_or_else(|| {
         format!("container {name} predates restart metadata and cannot be started")
     })?;
@@ -1187,6 +1287,7 @@ fn run_detached(
         image: image_desc.to_string(),
         pid: None,
         status: state::Status::Created,
+        paused: false,
         exit_code: None,
         created: state::now_rfc3339(),
         started: None,
@@ -1219,6 +1320,7 @@ fn run_detached(
     });
     st.status = state::Status::Created;
     st.pid = None;
+    st.paused = false;
     st.exit_code = None;
     st.started = None;
     st.finished = None;
@@ -2979,10 +3081,17 @@ fn ps_row(st: &ContainerState) -> Vec<String> {
 
 fn ps_status(st: &ContainerState) -> String {
     match st.status {
-        state::Status::Running => match &st.started {
-            Some(t) => format!("Up {}", elapsed_str(t)),
-            None => "Up".to_string(),
-        },
+        state::Status::Running => {
+            let status = match &st.started {
+                Some(t) => format!("Up {}", elapsed_str(t)),
+                None => "Up".to_string(),
+            };
+            if st.paused {
+                format!("{status} (Paused)")
+            } else {
+                status
+            }
+        }
         state::Status::Exited => {
             let code = st.exit_code.unwrap_or(-1);
             match &st.finished {
@@ -3289,6 +3398,9 @@ fn kill_one(store: &Store, target: &str, signal: libc::c_int) -> Result<String, 
         }
         return Ok(name);
     }
+    if st.paused && signal_requires_thaw(signal) {
+        thaw_paused_container(&mut st)?;
+    }
     let pid = st
         .pid
         .ok_or_else(|| format!("container {} has no PID", st.id))?;
@@ -3305,13 +3417,63 @@ fn kill_one(store: &Store, target: &str, signal: libc::c_int) -> Result<String, 
     Ok(name)
 }
 
+/// Signals whose normal purpose is to terminate the workload must be
+/// deliverable even while the cgroup freezer is active. STOP/CONT and
+/// non-terminating notification signals leave the pause state untouched.
+fn signal_requires_thaw(signal: libc::c_int) -> bool {
+    matches!(
+        signal,
+        libc::SIGHUP
+            | libc::SIGINT
+            | libc::SIGQUIT
+            | libc::SIGILL
+            | libc::SIGTRAP
+            | libc::SIGABRT
+            | libc::SIGBUS
+            | libc::SIGFPE
+            | libc::SIGKILL
+            | libc::SIGUSR1
+            | libc::SIGSEGV
+            | libc::SIGUSR2
+            | libc::SIGPIPE
+            | libc::SIGALRM
+            | libc::SIGTERM
+            | libc::SIGSTKFLT
+            | libc::SIGXCPU
+            | libc::SIGXFSZ
+            | libc::SIGVTALRM
+            | libc::SIGPROF
+            | libc::SIGIO
+            | libc::SIGPWR
+            | libc::SIGSYS
+    )
+}
+
+/// Thaw a paused container before a terminating lifecycle action and persist
+/// the new state immediately so a crash cannot leave a frozen process marked
+/// as unpaused.
+fn thaw_paused_container(st: &mut state::ContainerState) -> Result<(), String> {
+    if !st.paused {
+        return Ok(());
+    }
+    let name = display_name(st);
+    let cgroup_path = st
+        .cgroup
+        .as_deref()
+        .ok_or_else(|| format!("container {name} is marked paused but has no lifecycle cgroup"))?;
+    let cgroup = cgroup::CgroupV2::open(Path::new(cgroup_path)).map_err(|e| e.to_string())?;
+    cgroup.freeze(false).map_err(|e| e.to_string())?;
+    st.paused = false;
+    st.save().map_err(|e| e.to_string())
+}
+
 /// Docker semantics: SIGTERM, wait up to `--time`, then SIGKILL. The per-run
 /// reaper observes the death and persists the exit itself; when it is gone
 /// (crash) the stale record is reconciled instead.
 fn stop_one(store: &Store, target: &str, timeout_secs: u64) -> Result<String, String> {
     let initial = state::resolve(store, target)?;
     let _lock = state::ContainerOperationLock::try_acquire(store, &initial.id)?;
-    let st = state::ContainerState::load(store, &initial.id).ok_or_else(|| {
+    let mut st = state::ContainerState::load(store, &initial.id).ok_or_else(|| {
         format!(
             "container {} disappeared before stop",
             display_name(&initial)
@@ -3329,6 +3491,9 @@ fn stop_one(store: &Store, target: &str, timeout_secs: u64) -> Result<String, St
         }
         return Ok(name);
     }
+    // A frozen task cannot service SIGTERM; thaw first so the grace period is
+    // meaningful instead of always ending in SIGKILL.
+    thaw_paused_container(&mut st)?;
     let pid = st
         .pid
         .ok_or_else(|| format!("container {} has no PID", st.id))?;
@@ -3654,6 +3819,7 @@ fn rm_one(store: &Store, target: &str, force: bool) -> Result<String, String> {
                 "cannot remove a running container {name} - stop it first or use -f"
             ));
         }
+        thaw_paused_container(&mut st)?;
         if let Some(pid) = st.pid.filter(|p| *p > 0) {
             if pid_alive(pid) {
                 unsafe {
@@ -5488,6 +5654,8 @@ USAGE:\n  \
   zerun ps [-a] [-q] [-f KEY=VALUE]...  list filtered containers (detached)\n  \
   zerun wait CONTAINER...               block for detached containers to exit\n  \
   zerun start CONTAINER...              resume stopped containers in place\n  \
+  zerun pause CONTAINER...              freeze all processes in detached containers\n  \
+  zerun unpause CONTAINER...            resume frozen detached containers\n  \
   zerun stop [--time S] CONTAINER...    SIGTERM, then SIGKILL after the timeout\n  \
   zerun kill [--signal SIG] CONTAINER... signal detached containers (default KILL)\n  \
   zerun restart [--time S] CONTAINER... restart detached containers\n  \
@@ -6271,5 +6439,14 @@ mod tests {
         assert_eq!(signal_number("65"), None);
         assert_eq!(signal_number("0"), None);
         assert_eq!(signal_number("not-a-signal"), None);
+    }
+
+    #[test]
+    fn terminating_signals_thaw_paused_containers() {
+        assert!(signal_requires_thaw(libc::SIGTERM));
+        assert!(signal_requires_thaw(libc::SIGKILL));
+        assert!(!signal_requires_thaw(libc::SIGSTOP));
+        assert!(!signal_requires_thaw(libc::SIGCONT));
+        assert!(!signal_requires_thaw(libc::SIGWINCH));
     }
 }

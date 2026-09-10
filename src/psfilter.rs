@@ -10,6 +10,7 @@ use crate::state::{ContainerState, Status};
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PsFilter {
     status: Option<Status>,
+    paused: Option<bool>,
     name: Option<String>,
     id: Option<String>,
     image: Option<String>,
@@ -24,13 +25,15 @@ impl PsFilter {
         let invalid = |what: &str| Err(format!("invalid {what}: {value:?}"));
         match key {
             "status" => {
-                let status = match value {
-                    "created" => Status::Created,
-                    "running" => Status::Running,
-                    "exited" => Status::Exited,
+                let (status, paused) = match value {
+                    "created" => (Status::Created, None),
+                    "running" => (Status::Running, Some(false)),
+                    "paused" => (Status::Running, Some(true)),
+                    "exited" => (Status::Exited, None),
                     _ => return invalid("status"),
                 };
                 self.status = Some(status);
+                self.paused = paused;
                 Ok(())
             }
             "name" | "id" | "image" | "net" => {
@@ -76,6 +79,7 @@ impl PsFilter {
     /// Whether a record satisfies every configured selector.
     pub fn matches(&self, state: &ContainerState) -> bool {
         let status_ok = self.status.is_none_or(|want| state.status == want);
+        let paused_ok = self.paused.is_none_or(|want| state.paused == want);
         let id_ok = self
             .id
             .as_ref()
@@ -97,7 +101,7 @@ impl PsFilter {
                 .get(name)
                 .is_some_and(|found| wanted.as_ref().is_none_or(|value| found == value))
         });
-        status_ok && id_ok && name_ok && image_ok && net_ok && exit_ok && labels_ok
+        status_ok && paused_ok && id_ok && name_ok && image_ok && net_ok && exit_ok && labels_ok
     }
 }
 
@@ -115,6 +119,7 @@ mod tests {
             image: "alpine:latest".to_string(),
             pid: None,
             status,
+            paused: false,
             exit_code,
             created: "2026-01-01T00:00:00Z".to_string(),
             started: None,
@@ -161,6 +166,15 @@ mod tests {
         assert!(filter("exitCode", "7").matches(&state(Status::Exited, Some(7))));
         assert!(!filter("exitCode", "0").matches(&state(Status::Exited, Some(7))));
         assert!(PsFilter::default().set("exitCode", "x").is_err());
+    }
+
+    #[test]
+    fn paused_status_is_distinct_from_running() {
+        let mut paused = state(Status::Running, None);
+        paused.paused = true;
+        assert!(filter("status", "paused").matches(&paused));
+        assert!(!filter("status", "running").matches(&paused));
+        assert!(!filter("status", "paused").matches(&state(Status::Running, None)));
     }
 
     #[test]

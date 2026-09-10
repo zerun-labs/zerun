@@ -51,6 +51,13 @@ pub fn run(
             state.id
         ));
     }
+    if state.paused {
+        return Err(crate::zerr!(
+            "container {} is paused; run `zerun unpause {}` before exec",
+            state.id,
+            state.id
+        ));
+    }
     if argv.is_empty() {
         return Err(crate::zerr!("exec: a command is required"));
     }

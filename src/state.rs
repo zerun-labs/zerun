@@ -194,6 +194,9 @@ pub struct ContainerState {
     /// Host-side PID of the container's PID 1 while running.
     pub pid: Option<i32>,
     pub status: Status,
+    /// True while the detached container's cgroup freezer is active.
+    #[serde(default)]
+    pub paused: bool,
     pub exit_code: Option<i32>,
     /// RFC3339 timestamps.
     pub created: String,
@@ -310,6 +313,7 @@ impl ContainerState {
     /// Human-friendly status line for `ze ps`.
     pub fn status_label(&self) -> String {
         match self.status {
+            Status::Running if self.paused => "Up (Paused)".to_string(),
             Status::Running => "Up".to_string(),
             Status::Exited => format!("Exited ({})", self.exit_code.unwrap_or(-1)),
             Status::Created => "Created".to_string(),
@@ -530,6 +534,7 @@ mod tests {
             image: "alpine:latest".to_string(),
             pid: None,
             status: Status::Exited,
+            paused: false,
             exit_code: Some(0),
             created: now_rfc3339(),
             started: None,

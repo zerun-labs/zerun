@@ -86,6 +86,9 @@ pub struct RunSpec {
     /// Runtime root of the active store (`/run/zerun` etc.), used by the
     /// parent for IPAM bookkeeping.
     pub run_root: PathBuf,
+    /// Keep a cgroup for a detached container even when it has no resource
+    /// limits, enabling lifecycle operations such as pause/unpause.
+    pub lifecycle_cgroup: bool,
 }
 
 static TARGET_CHILD: AtomicI32 = AtomicI32::new(0);
@@ -134,8 +137,11 @@ where
     trace::init();
     trace::mark("parent:begin");
 
+    let rootless = unsafe { libc::geteuid() } != 0;
+
     // Create the cgroup on the parent side first (attach right after clone).
-    // Skipped when no limits are set (typical rootless without delegation).
+    // Detached containers keep one even without limits so pause/unpause can
+    // freeze the whole process tree. Rootless hosts without delegation skip it.
     let has_limits = spec.limits.memory.is_some()
         || spec.limits.memory_reservation.is_some()
         || spec.limits.memory_swap.is_some()
@@ -147,6 +153,20 @@ where
         || !spec.limits.io.is_empty();
     let cg = if has_limits {
         Some(CgroupV2::create(&spec.id, &spec.limits)?)
+    } else if spec.lifecycle_cgroup {
+        match CgroupV2::create(&spec.id, &spec.limits) {
+            Ok(cg) => Some(cg),
+            Err(_) if rootless => {
+                trace::mark("parent:cgroup:unavailable");
+                None
+            }
+            Err(e) => {
+                eprintln!(
+                    "zerun: warning: lifecycle cgroup unavailable; pause/unpause disabled: {e}"
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -169,7 +189,6 @@ where
     // clone flags: PID/MNT/UTS/IPC/CGROUP on by default; NEWNET additionally
     // for --net none and --net bridge. Non-root automatically adds NEWUSER (the
     // kernel guarantees the user namespace is created first).
-    let rootless = unsafe { libc::geteuid() } != 0;
     if rootless && matches!(spec.net, NetMode::Bridge) {
         return Err(crate::zerr!(
             "--net bridge needs CAP_NET_ADMIN in the host network namespace; \

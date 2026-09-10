@@ -69,6 +69,7 @@ pub fn run_detached(
         // Created-but-alive container.
         if let Some(mut st) = ContainerState::load(&store, &id) {
             st.status = Status::Running;
+            st.paused = false;
             st.pid = Some(info.pid);
             st.started = Some(state::now_rfc3339());
             st.ip = info.ip;
@@ -115,6 +116,7 @@ pub fn run_detached(
     if let Some(mut st) = ContainerState::load(&store, &id) {
         st.metrics = metrics.or(st.metrics);
         st.status = Status::Exited;
+        st.paused = false;
         st.exit_code = Some(code);
         st.finished = Some(state::now_rfc3339());
         let _ = st.save();
@@ -437,6 +439,7 @@ pub fn reconcile_stale(store: &Store, st: &mut ContainerState) -> bool {
         crate::network::release_ip(store.run_root(), &st.id);
     }
     st.status = Status::Exited;
+    st.paused = false;
     st.exit_code = st.exit_code.or(Some(137)); // SIGKILL-ish default
     st.finished = Some(state::now_rfc3339());
     st.table = None;
