@@ -3464,7 +3464,14 @@ fn thaw_paused_container(st: &mut state::ContainerState) -> Result<(), String> {
     let cgroup = cgroup::CgroupV2::open(Path::new(cgroup_path)).map_err(|e| e.to_string())?;
     cgroup.freeze(false).map_err(|e| e.to_string())?;
     st.paused = false;
-    st.save().map_err(|e| e.to_string())
+    if let Err(error) = st.save() {
+        // A failed state write must not leave the persisted record claiming the
+        // container is paused while its cgroup is already thawed.
+        let _ = cgroup.freeze(true);
+        st.paused = true;
+        return Err(error.to_string());
+    }
+    Ok(())
 }
 
 /// Docker semantics: SIGTERM, wait up to `--time`, then SIGKILL. The per-run
