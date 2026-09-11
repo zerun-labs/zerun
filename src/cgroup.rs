@@ -18,9 +18,9 @@ pub struct ResourceLimits {
     pub memory: Option<String>,
     /// Soft memory reservation written to cgroups v2 `memory.high`.
     pub memory_reservation: Option<String>,
-    /// Total memory+swap ceiling for cgroups v2 `memory.swap.max`; `-1` is
-    /// unlimited. When `memory.max` is set without this field, swap is capped
-    /// at the same value so a memory limit cannot be bypassed.
+    /// Total memory+swap ceiling. It is converted to the swap-only cgroup v2
+    /// `memory.swap.max` value; `-1` means unlimited. When `memory.max` is set
+    /// without this field, swap is capped at the memory limit.
     pub memory_swap: Option<i64>,
     /// CPU cores (fractional), e.g. 0.5 -> cpu.max "50000 100000".
     pub cpus: Option<f64>,
@@ -89,27 +89,16 @@ impl CgroupV2 {
     pub fn apply_limits(&self, parent: &Path, limits: &ResourceLimits) -> ZResult<()> {
         if let Some(mem) = &limits.memory {
             let bytes = parse_size(mem)?;
+            // Docker's --memory-swap is a total memory+swap ceiling, while
+            // cgroup v2's memory.swap.max contains only the swap portion.
+            // Validate before writing memory.max so an invalid pair cannot
+            // leave a partially-applied resource configuration behind.
+            let swap_limit = match limits.memory_swap {
+                Some(swap) => swap_limit_for_total(bytes, swap)?,
+                None => bytes.to_string(),
+            };
             self.write("memory.max", bytes.to_string())?;
-            // Docker's --memory-swap is a total memory+swap ceiling. Without
-            // it, lock swap to the memory ceiling so a memory limit cannot be
-            // bypassed by swapping.
-            match limits.memory_swap {
-                Some(swap) if swap < 0 => {
-                    self.write("memory.swap.max", "max".to_string())?;
-                }
-                Some(swap) => {
-                    if (swap as u64) < bytes {
-                        return Err(crate::zerr!(
-                            "memory-swap {swap} must be >= memory {}",
-                            bytes
-                        ));
-                    }
-                    self.write("memory.swap.max", swap.to_string())?;
-                }
-                None => {
-                    self.write("memory.swap.max", bytes.to_string())?;
-                }
-            }
+            self.write("memory.swap.max", swap_limit)?;
         } else if let Some(swap) = limits.memory_swap {
             if swap < 0 {
                 self.write("memory.swap.max", "max".to_string())?;
@@ -436,7 +425,22 @@ fn enable_controllers(parent: &Path, want: &[&str]) -> ZResult<()> {
     })
 }
 
-/// Parse K/M/G size suffixes into bytes.
+/// Convert Docker's total memory+swap ceiling to cgroup v2's swap-only limit.
+/// A negative total means unlimited swap; otherwise the total must include the
+/// memory ceiling and only the remainder belongs in `memory.swap.max`.
+fn swap_limit_for_total(memory: u64, total: i64) -> ZResult<String> {
+    if total < 0 {
+        return Ok("max".to_string());
+    }
+    let total = u64::try_from(total).map_err(|_| crate::zerr!("memory-swap is invalid"))?;
+    if total < memory {
+        return Err(crate::zerr!(
+            "memory-swap {total} must be >= memory {memory}"
+        ));
+    }
+    Ok((total - memory).to_string())
+}
+
 /// Parse Docker-style memory+swap ceilings. `-1`/`unlimited` means no swap
 /// ceiling; otherwise values use the same size suffixes as memory.
 pub fn parse_memory_swap(value: &str) -> ZResult<i64> {
@@ -478,6 +482,20 @@ mod tests {
             std::env::temp_dir().join(format!("zerun-cgroup-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&missing);
         assert!(CgroupV2::open(&missing).is_err());
+    }
+
+    #[test]
+    fn converts_total_memory_swap_to_swap_only_limit() {
+        assert_eq!(
+            swap_limit_for_total(64 * 1024 * 1024, 128 * 1024 * 1024).unwrap(),
+            "67108864"
+        );
+        assert_eq!(
+            swap_limit_for_total(64 * 1024 * 1024, 64 * 1024 * 1024).unwrap(),
+            "0"
+        );
+        assert_eq!(swap_limit_for_total(64 * 1024 * 1024, -1).unwrap(), "max");
+        assert!(swap_limit_for_total(128, 127).is_err());
     }
 
     #[test]
