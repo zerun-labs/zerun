@@ -58,6 +58,11 @@ impl CgroupV2 {
     /// subtree_control before the leaf gets the corresponding control files, so
     /// the intermediate <cgroup2>/zerun level enables cpu/memory/pids on demand.
     pub fn create(id: &str, limits: &ResourceLimits) -> ZResult<Self> {
+        if limits.memory.is_none() && limits.memory_swap.is_some_and(|swap| swap >= 0) {
+            return Err(crate::zerr!(
+                "a finite memory-swap ceiling requires --memory"
+            ));
+        }
         let root = detect_cgroup2_root()?;
         let parent = root.join("zerun");
         let path = parent.join(id);
@@ -103,7 +108,14 @@ impl CgroupV2 {
             if swap < 0 {
                 self.write("memory.swap.max", "max".to_string())?;
             } else {
-                self.write("memory.swap.max", swap.to_string())?;
+                // `update --memory-swap` changes the total ceiling while the
+                // existing memory.max supplies the memory portion.
+                let memory = fs::read_to_string(self.path.join("memory.max"))
+                    .map_err(|e| crate::zerr!("read current memory.max failed: {e}"))?;
+                let memory = memory.trim().parse::<u64>().map_err(|_| {
+                    crate::zerr!("finite memory-swap requires a finite current memory.max")
+                })?;
+                self.write("memory.swap.max", swap_limit_for_total(memory, swap)?)?;
             }
         }
         if let Some(high) = &limits.memory_reservation {
@@ -458,6 +470,7 @@ pub fn parse_memory_swap(value: &str) -> ZResult<i64> {
     i64::try_from(bytes).map_err(|_| crate::zerr!("memory-swap size is too large"))
 }
 
+/// Parse K/M/G size suffixes into bytes.
 fn parse_size(s: &str) -> ZResult<u64> {
     let s = s.trim();
     let (num, mult) = match s.chars().last() {
