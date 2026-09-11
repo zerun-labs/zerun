@@ -1094,11 +1094,16 @@ fn set_container_paused(store: &Store, target: &str, paused: bool) -> Result<Str
     let cgroup = cgroup::CgroupV2::open(Path::new(cgroup_path)).map_err(|e| e.to_string())?;
     cgroup.freeze(paused).map_err(|e| e.to_string())?;
     st.paused = paused;
-    if let Err(e) = st.save() {
+    if let Err(error) = st.save() {
         // Keep the persisted state and the kernel freezer consistent when the
-        // state write itself fails.
-        let _ = cgroup.freeze(!paused);
-        return Err(e.to_string());
+        // state write itself fails. Report a failed rollback because the
+        // caller must not assume the requested state was restored.
+        if let Err(rollback) = cgroup.freeze(!paused) {
+            return Err(format!(
+                "{error}; failed to roll back cgroup freezer state: {rollback}"
+            ));
+        }
+        return Err(error.to_string());
     }
     Ok(name)
 }
@@ -3467,7 +3472,11 @@ fn thaw_paused_container(st: &mut state::ContainerState) -> Result<(), String> {
     if let Err(error) = st.save() {
         // A failed state write must not leave the persisted record claiming the
         // container is paused while its cgroup is already thawed.
-        let _ = cgroup.freeze(true);
+        if let Err(rollback) = cgroup.freeze(true) {
+            return Err(format!(
+                "{error}; failed to restore cgroup freezer state: {rollback}"
+            ));
+        }
         st.paused = true;
         return Err(error.to_string());
     }
