@@ -333,17 +333,22 @@ impl Nftables {
     /// positive errno of the first failure.
     fn drain_errors(&self) -> std::result::Result<(), i32> {
         let mut storage = vec![0u8; 16384];
+        let mut first_error = None;
         loop {
             let mut buf = &mut storage[..];
             match self.sock.recv(&mut buf, 0) {
                 Ok(n) => {
-                    if let Some(err) = parse_nlmsg_error(&storage[..n]) {
-                        return Err(err);
+                    if first_error.is_none() {
+                        first_error = parse_nlmsg_error(&storage[..n]);
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return first_error.map_or(Ok(()), Err);
+                }
                 Err(e) => {
-                    return Err(e.raw_os_error().unwrap_or(libc::EIO));
+                    return Err(
+                        first_error.unwrap_or_else(|| e.raw_os_error().unwrap_or(libc::EIO))
+                    );
                 }
             }
         }
