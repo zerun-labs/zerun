@@ -543,3 +543,15 @@ pub fn cstr_to_string(p: *const libc::c_char) -> String {
     }
     unsafe { CStr::from_ptr(p).to_string_lossy().into_owned() }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pidfd_can_open_and_probe_current_process() {
+        let pid = std::process::id() as libc::pid_t;
+        let pidfd = pidfd_open(pid).expect("pidfd_open should be available on supported Linux");
+        pidfd_send_signal(pidfd.as_raw_fd(), 0).expect("pidfd signal 0 should probe the process");
+    }
+}
