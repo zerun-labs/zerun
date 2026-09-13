@@ -273,6 +273,7 @@ sudo target/release/zerun ps --filter label=tier=prod # containers with a label 
 sudo target/release/zerun ps -q                       # container IDs only
 sudo target/release/zerun ps --format json -a         # machine-readable full state
 sudo target/release/zerun wait web                    # block until exit; prints the exit code
+# `wait` exits successfully when it retrieved the code, even if that code is non-zero.
 sudo target/release/zerun logs --tail 20 web          # container console.log
 sudo target/release/zerun logs --since 10m web        # last ten minutes
 sudo target/release/zerun logs --until 2026-01-01T12:00:00Z web
