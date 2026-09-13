@@ -502,7 +502,7 @@ pub fn parse_memory_swap(value: &str) -> ZResult<i64> {
     i64::try_from(bytes).map_err(|_| crate::zerr!("memory-swap size is too large"))
 }
 
-/// Parse K/M/G size suffixes into bytes.
+/// Parse K/M/G/T size suffixes (optionally followed by B) into bytes.
 ///
 /// This deliberately avoids floating-point parsing. Resource limits are
 /// security-sensitive, and `f64` accepts values such as `NaN` and `inf`; the
@@ -511,12 +511,7 @@ pub fn parse_memory_swap(value: &str) -> ZResult<i64> {
 /// the previous behavior for inputs such as `1.5M`.
 fn parse_size(s: &str) -> ZResult<u64> {
     let s = s.trim();
-    let (number, multiplier) = match s.as_bytes().last().copied() {
-        Some(b'k' | b'K') => (&s[..s.len() - 1], 1024u64),
-        Some(b'm' | b'M') => (&s[..s.len() - 1], 1024u64 * 1024),
-        Some(b'g' | b'G') => (&s[..s.len() - 1], 1024u64 * 1024 * 1024),
-        _ => (s, 1u64),
-    };
+    let (number, multiplier) = split_size_suffix(s);
     let number = number.trim();
     let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
     if whole.is_empty() && fraction.is_empty()
@@ -555,6 +550,22 @@ fn parse_size(s: &str) -> ZResult<u64> {
             .ok_or_else(|| crate::zerr!("memory size is too large: {s}"))?,
     )
     .map_err(|_| crate::zerr!("memory size is too large: {s}"))
+}
+
+/// Split a size into its numeric portion and binary unit multiplier. Docker
+/// accepts both compact units (`64M`) and their byte-suffixed forms (`64MB`).
+fn split_size_suffix(s: &str) -> (&str, u64) {
+    let s = match s.as_bytes().last().copied() {
+        Some(b'b' | b'B') => &s[..s.len() - 1],
+        _ => s,
+    };
+    match s.as_bytes().last().copied() {
+        Some(b'k' | b'K') => (&s[..s.len() - 1], 1024u64),
+        Some(b'm' | b'M') => (&s[..s.len() - 1], 1024u64 * 1024),
+        Some(b'g' | b'G') => (&s[..s.len() - 1], 1024u64 * 1024 * 1024),
+        Some(b't' | b'T') => (&s[..s.len() - 1], 1024u64 * 1024 * 1024 * 1024),
+        _ => (s, 1u64),
+    }
 }
 
 /// Parse and validate a fractional CPU count before a cgroup is created or
@@ -679,6 +690,10 @@ mod tests {
         assert_eq!(parse_size("4096").unwrap(), 4096);
         assert_eq!(parse_size("1.5M").unwrap(), 1_572_864);
         assert_eq!(parse_size(".5K").unwrap(), 512);
+        assert_eq!(parse_size("1MB").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size("1GB").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_size("1B").unwrap(), 1);
+        assert_eq!(parse_size("1T").unwrap(), 1024 * 1024 * 1024 * 1024);
         assert!(parse_size("abc").is_err());
         assert!(parse_size("NaN").is_err());
         assert!(parse_size("inf").is_err());
