@@ -1,6 +1,6 @@
 //! Filesystem helpers used by the store and the rootfs layer.
 use crate::error::ZResult;
-use std::fs;
+use std::fs::{self, File};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -62,8 +62,13 @@ fn set_mode(p: &Path, mode: u32) -> ZResult<()> {
         .map_err(|e| crate::zerr!("chmod {}: {e}", p.display()))
 }
 
-/// Atomic file write: write to a temp file in the same directory, then rename.
-/// Crash-safe for the file-based state this project relies on.
+/// Atomic and durable file write: write to a temp file in the same directory,
+/// flush its contents, rename it into place, then flush the directory entry.
+///
+/// The rename prevents readers from observing a partial JSON document; the
+/// file and directory syncs make the replacement survive a sudden reboot on
+/// filesystems that honor fsync. This is the durability boundary for the
+/// daemonless state and image indexes.
 #[allow(dead_code)] // used by the image store milestone
 pub fn atomic_write(path: &Path, data: &[u8]) -> ZResult<()> {
     let dir = path
@@ -76,10 +81,19 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> ZResult<()> {
         path.file_name().and_then(|n| n.to_str()).unwrap_or("state")
     ));
     fs::write(&tmp, data).map_err(|e| crate::zerr!("write {}: {e}", tmp.display()))?;
+    File::open(&tmp)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            crate::zerr!("sync {}: {e}", tmp.display())
+        })?;
     fs::rename(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         crate::zerr!("rename {} -> {}: {e}", tmp.display(), path.display())
     })?;
+    File::open(dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| crate::zerr!("sync directory {}: {e}", dir.display()))?;
     Ok(())
 }
 
@@ -195,6 +209,23 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("missing"), dir.join("broken")).unwrap();
 
         assert_eq!(dir_size(&dir), 25);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_replaces_data_without_leaving_a_temp_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-atomic-write-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        atomic_write(&path, b"first").unwrap();
+        atomic_write(&path, b"second").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 
