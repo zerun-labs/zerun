@@ -29,11 +29,10 @@ pub fn unpack_layer<R: Read>(reader: R, root: &Path, media_hint: &str) -> ZResul
             .path()
             .map_err(|e| crate::zerr!("bad tar entry path ({media_hint}): {e}"))?;
         let Some(rel) = sanitize_rel_path(&raw_path) else {
-            eprintln!(
-                "zerun: warn: skipping unsafe tar path {:?} (traversal/absolute)",
+            return Err(crate::zerr!(
+                "unsafe tar path {:?} (traversal/absolute)",
                 raw_path.as_os_str()
-            );
-            continue;
+            ));
         };
         if rel.as_os_str().is_empty() {
             continue; // the archive root itself
@@ -420,8 +419,8 @@ mod tests {
 
     #[test]
     fn traversal_paths_are_rejected() {
-        // `unpack_layer` sanitizes every path before touching the filesystem;
-        // the tar writer itself refuses `..`, so exercise the sanitizer.
+        // The tar writer itself refuses `..`, so exercise the sanitizer used
+        // by unpack_layer before it touches the filesystem.
         assert!(sanitize_rel_path(Path::new("../evil")).is_none());
         assert!(sanitize_rel_path(Path::new("/etc/passwd")).is_none());
         assert!(sanitize_rel_path(Path::new("a/../../b")).is_none());
