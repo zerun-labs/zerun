@@ -233,12 +233,22 @@ fn worker(
         pairs.extend(std::env::vars());
     } else {
         for kv in &state.env {
-            if let Some((k, v)) = kv.split_once('=') {
-                pairs.push((k.to_string(), v.to_string()));
+            let Some((k, v)) = kv.split_once('=') else {
+                eprintln!("zerun exec: invalid environment entry in state: '{kv}'");
+                return 1;
+            };
+            if let Err(e) = workload::validate_env_pair(k, v) {
+                eprintln!("zerun exec: invalid environment entry in state: '{kv}': {e}");
+                return 1;
             }
+            pairs.push((k.to_string(), v.to_string()));
         }
     }
     for kv in env_extra {
+        if let Err(e) = workload::validate_env_spec(kv) {
+            eprintln!("zerun exec: invalid environment entry '{kv}': {e}");
+            return 1;
+        }
         match kv.split_once('=') {
             Some((k, v)) => upsert(&mut pairs, k, v),
             None => {

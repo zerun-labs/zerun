@@ -4,9 +4,44 @@
 //! (`config.Env` + defaults + `-e` overrides). When that environment is set, the
 //! process environment is cleared and replaced, so any bare argv[0] (for example
 //! `nginx`) must be resolved against the container `PATH` before exec.
+use crate::error::ZResult;
 
 /// Container-conventional default PATH when an image config does not set one.
 pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Validate an environment variable name before passing it to `Command`.
+/// Empty names, `=` and NUL are rejected because they cannot represent a
+/// portable `NAME=VALUE` entry and Rust cannot pass NUL through execve.
+pub fn validate_env_key(key: &str) -> ZResult<()> {
+    if key.is_empty() {
+        return Err(crate::zerr!("environment variable name cannot be empty"));
+    }
+    if key.contains('=') {
+        return Err(crate::zerr!("environment variable name cannot contain '='"));
+    }
+    if key.contains('\0') {
+        return Err(crate::zerr!("environment variable name cannot contain NUL"));
+    }
+    Ok(())
+}
+
+/// Validate a complete `NAME=VALUE` pair.
+pub fn validate_env_pair(key: &str, value: &str) -> ZResult<()> {
+    validate_env_key(key)?;
+    if value.contains('\0') {
+        return Err(crate::zerr!("environment variable '{key}' contains NUL"));
+    }
+    Ok(())
+}
+
+/// Validate the CLI/state representation, which may be either `NAME=VALUE` or
+/// a bare `NAME` requesting host-environment passthrough.
+pub fn validate_env_spec(spec: &str) -> ZResult<()> {
+    match spec.split_once('=') {
+        Some((key, value)) => validate_env_pair(key, value),
+        None => validate_env_key(spec),
+    }
+}
 
 /// Look up the last value of `key` in an ordered env list.
 pub fn env_value<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -73,4 +108,20 @@ pub fn resolve_argv(env: Option<&[(String, String)]>, argv: &[String]) -> Vec<St
         *first = resolve_argv0(first, env);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_validation_rejects_execve_invalid_entries() {
+        assert!(validate_env_pair("A", "ok").is_ok());
+        assert!(validate_env_spec("A").is_ok());
+        assert!(validate_env_spec("A=").is_ok());
+        assert!(validate_env_spec("=value").is_err());
+        assert!(validate_env_spec("A=B=C").is_ok());
+        assert!(validate_env_pair("A", "bad\0value").is_err());
+        assert!(validate_env_key("A=B").is_err());
+    }
 }

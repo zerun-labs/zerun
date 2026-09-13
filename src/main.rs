@@ -353,7 +353,9 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 a.log_options_set = true;
             }
             "--env" | "-e" => {
-                a.env.push(next_value(args, &mut i, s)?);
+                let value = next_value(args, &mut i, s)?;
+                workload::validate_env_spec(&value).map_err(|e| e.to_string())?;
+                a.env.push(value);
             }
             "--volume" | "-v" => {
                 let v = next_value(args, &mut i, s)?;
@@ -595,10 +597,12 @@ fn state_env(entries: &[String]) -> Result<Vec<(String, String)>, String> {
     entries
         .iter()
         .map(|entry| {
-            entry
+            let (key, value) = entry
                 .split_once('=')
-                .map(|(key, value)| (key.to_string(), value.to_string()))
-                .ok_or_else(|| format!("invalid environment entry in state: '{entry}'"))
+                .ok_or_else(|| format!("invalid environment entry in state: '{entry}'"))?;
+            workload::validate_env_pair(key, value)
+                .map_err(|e| format!("invalid environment entry in state: '{entry}': {e}"))?;
+            Ok((key.to_string(), value.to_string()))
         })
         .collect()
 }
@@ -820,8 +824,19 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         };
         match resolve_run_image(&store, &reference, a.platform.as_deref(), a.pull) {
             Ok((rootfs, cfg)) => {
-                let env =
-                    build_image_env(&cfg.config.env, &a.env, a.hostname.as_deref(), &id, a.tty);
+                let env = match build_image_env(
+                    &cfg.config.env,
+                    &a.env,
+                    a.hostname.as_deref(),
+                    &id,
+                    a.tty,
+                ) {
+                    Ok(env) => env,
+                    Err(e) => {
+                        eprintln!("zerun run: {e}");
+                        return 1;
+                    }
+                };
                 let argv = resolve_image_argv(&cfg, a.entrypoint.as_deref(), &a.argv);
                 let mut labels = cfg.config.labels.clone();
                 labels.extend(a.labels.clone());
@@ -2129,12 +2144,17 @@ fn build_image_env(
     hostname: Option<&str>,
     id: &str,
     tty: bool,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>, String> {
     let mut env: Vec<(String, String)> = Vec::new();
     for entry in cfg_env {
-        if let Some((k, v)) = entry.split_once('=') {
-            upsert_env(&mut env, k.to_string(), v.to_string());
-        }
+        let Some((k, v)) = entry.split_once('=') else {
+            return Err(format!(
+                "image contains malformed environment entry '{entry}'"
+            ));
+        };
+        workload::validate_env_pair(k, v)
+            .map_err(|e| format!("invalid image environment entry '{entry}': {e}"))?;
+        upsert_env(&mut env, k.to_string(), v.to_string());
     }
     if workload::env_value(&env, "PATH").is_none() {
         env.push(("PATH".to_string(), workload::DEFAULT_PATH.to_string()));
@@ -2143,6 +2163,7 @@ fn build_image_env(
         env.push(("HOME".to_string(), "/root".to_string()));
     }
     for o in overrides {
+        workload::validate_env_spec(o).map_err(|e| format!("invalid --env '{o}': {e}"))?;
         match o.split_once('=') {
             Some((k, v)) => upsert_env(&mut env, k.to_string(), v.to_string()),
             None => {
@@ -2162,7 +2183,7 @@ fn build_image_env(
     if tty && workload::env_value(&env, "TERM").is_none() {
         env.push(("TERM".to_string(), "xterm".to_string()));
     }
-    env
+    Ok(env)
 }
 
 fn parse_label(raw: &str) -> Result<(String, String), String> {
@@ -5408,7 +5429,13 @@ fn cmd_exec(args: &[String]) -> i32 {
         let a = args[i].as_str();
         match a {
             "-e" | "--env" => match next_value(args, &mut i, a) {
-                Ok(v) => env_extra.push(v),
+                Ok(v) => {
+                    if let Err(e) = workload::validate_env_spec(&v) {
+                        eprintln!("zerun exec: invalid --env '{v}': {e}");
+                        return 2;
+                    }
+                    env_extra.push(v);
+                }
                 Err(e) => {
                     eprintln!("zerun exec: {e}");
                     return 2;
@@ -6431,8 +6458,15 @@ mod tests {
     }
 
     #[test]
+    fn malformed_image_environment_is_rejected() {
+        assert!(build_image_env(&["=bad".to_string()], &[], None, "id", false).is_err());
+        assert!(build_image_env(&["NO_EQUALS".to_string()], &[], None, "id", false).is_err());
+        assert!(build_image_env(&["OK=bad\0value".to_string()], &[], None, "id", false).is_err());
+    }
+
+    #[test]
     fn image_tty_gets_default_term() {
-        let env = build_image_env(&[], &[], None, "abc123", true);
+        let env = build_image_env(&[], &[], None, "abc123", true).unwrap();
         assert_eq!(workload::env_value(&env, "TERM"), Some("xterm"));
     }
 
