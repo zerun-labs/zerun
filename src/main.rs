@@ -51,6 +51,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::exit;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use store::Store;
 
@@ -730,7 +731,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
     let id = resume
         .as_ref()
         .map(|st| st.id.clone())
-        .unwrap_or_else(short_id);
+        .unwrap_or_else(|| new_container_id(&store));
 
     // Resolve the container root filesystem and, for image mode, the process
     // environment / working directory / default command from the OCI config.
@@ -5661,13 +5662,44 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe as i64 - 719_468
 }
 
+static ID_FALLBACK_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a compact, filesystem-safe container ID. Six bytes from the host
+/// kernel's entropy pool preserve the existing 12-character display format;
+/// the fallback is only for unusual hosts without `/dev/urandom`.
 fn short_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::io::Read;
+
+    let mut bytes = [0u8; 6];
+    if let Ok(mut random) = std::fs::File::open("/dev/urandom") {
+        if random.read_exact(&mut bytes).is_ok() {
+            return bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        }
+    }
+
+    // Keep the fallback deterministic enough to avoid same-process collisions
+    // while retaining the old time-based behavior on severely restricted hosts.
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{:x}", nanos & 0xffff_ffff_ffff)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let seq = ID_FALLBACK_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mixed =
+        nanos ^ (u64::from(std::process::id()) << 32) ^ seq.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    format!("{:012x}", mixed & 0xffff_ffff_ffff)
+}
+
+/// Allocate an ID that is not already represented in the runtime store. The
+/// directory check avoids reusing known IDs; kernel-provided entropy makes a
+/// collision between concurrent callers negligibly likely, including when the
+/// fallback path is unavailable.
+fn new_container_id(store: &Store) -> String {
+    loop {
+        let id = short_id();
+        if !ContainerState::dir(store, &id).exists() {
+            return id;
+        }
+    }
 }
 
 fn print_run_usage() {
@@ -6466,6 +6498,26 @@ mod tests {
     fn image_tty_gets_default_term() {
         let env = build_image_env(&[], &[], None, "abc123", true).unwrap();
         assert_eq!(workload::env_value(&env, "TERM"), Some("xterm"));
+    }
+
+    #[test]
+    fn container_ids_are_random_sized_and_store_unique() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-id-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.join("data"), root.join("run"));
+        store.ensure_dirs().unwrap();
+
+        let first = new_container_id(&store);
+        assert_eq!(first.len(), 12);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        std::fs::create_dir_all(ContainerState::dir(&store, &first)).unwrap();
+        let second = new_container_id(&store);
+        assert_ne!(first, second);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
