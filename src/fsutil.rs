@@ -1,8 +1,10 @@
 //! Filesystem helpers used by the store and the rootfs layer.
 use crate::error::ZResult;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Recursively copy `src` into `dst` (which is created if missing).
 ///
@@ -62,6 +64,8 @@ fn set_mode(p: &Path, mode: u32) -> ZResult<()> {
         .map_err(|e| crate::zerr!("chmod {}: {e}", p.display()))
 }
 
+static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Atomic and durable file write: write to a temp file in the same directory,
 /// flush its contents, rename it into place, then flush the directory entry.
 ///
@@ -75,26 +79,33 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> ZResult<()> {
         .parent()
         .ok_or_else(|| crate::zerr!("no parent for {}", path.display()))?;
     fs::create_dir_all(dir).map_err(|e| crate::zerr!("mkdir {}: {e}", dir.display()))?;
+    let sequence = ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!(
-        ".tmp-{}-{}",
+        ".tmp-{}-{sequence}-{}",
         std::process::id(),
         path.file_name().and_then(|n| n.to_str()).unwrap_or("state")
     ));
-    fs::write(&tmp, data).map_err(|e| crate::zerr!("write {}: {e}", tmp.display()))?;
-    File::open(&tmp)
-        .and_then(|file| file.sync_all())
-        .map_err(|e| {
-            let _ = fs::remove_file(&tmp);
-            crate::zerr!("sync {}: {e}", tmp.display())
-        })?;
-    fs::rename(&tmp, path).map_err(|e| {
+    let result = (|| -> ZResult<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| crate::zerr!("create {}: {e}", tmp.display()))?;
+        file.write_all(data)
+            .map_err(|e| crate::zerr!("write {}: {e}", tmp.display()))?;
+        file.sync_all()
+            .map_err(|e| crate::zerr!("sync {}: {e}", tmp.display()))?;
+        fs::rename(&tmp, path)
+            .map_err(|e| crate::zerr!("rename {} -> {}: {e}", tmp.display(), path.display()))?;
+        File::open(dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| crate::zerr!("sync directory {}: {e}", dir.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
         let _ = fs::remove_file(&tmp);
-        crate::zerr!("rename {} -> {}: {e}", tmp.display(), path.display())
-    })?;
-    File::open(dir)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|e| crate::zerr!("sync directory {}: {e}", dir.display()))?;
-    Ok(())
+    }
+    result
 }
 
 /// Remove a directory tree, tolerating a missing root (used for container fs
@@ -225,6 +236,45 @@ mod tests {
         atomic_write(&path, b"first").unwrap();
         atomic_write(&path, b"second").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"second");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_never_expose_partial_data() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-atomic-concurrent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = Arc::new(dir.join("state.json"));
+        let barrier = Arc::new(Barrier::new(8));
+        let payloads: Vec<Vec<u8>> = (0..8)
+            .map(|index| format!("payload-{index}-{}", "x".repeat(4096)).into_bytes())
+            .collect();
+        let mut workers = Vec::new();
+        for payload in &payloads {
+            let path = Arc::clone(&path);
+            let barrier = Arc::clone(&barrier);
+            let payload = payload.clone();
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                atomic_write(&path, &payload).unwrap();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let final_data = fs::read(&*path).unwrap();
+        assert!(payloads.iter().any(|payload| payload == &final_data));
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
