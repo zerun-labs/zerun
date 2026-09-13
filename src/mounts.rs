@@ -255,7 +255,8 @@ fn push_opt(data: &mut String, key: &str, value: &str) {
 /// setup above.
 pub fn mount_extra_tmpfs(rootless: bool, mounts: &[TmpfsMount]) -> ZResult<()> {
     for m in mounts {
-        syscalls::mkdir_p(&m.target, 0o1777)?;
+        let target = safe_target(Path::new("/"), &m.target)?;
+        syscalls::mkdir_p(&target, 0o1777)?;
         let mut flags = MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME;
         if m.readonly {
             flags |= MS_RDONLY;
@@ -269,7 +270,7 @@ pub fn mount_extra_tmpfs(rootless: bool, mounts: &[TmpfsMount]) -> ZResult<()> {
             rootless,
             syscalls::mount(
                 Some("tmpfs"),
-                m.target.to_string_lossy(),
+                target.to_string_lossy(),
                 Some("tmpfs"),
                 flags,
                 Some(data),
@@ -409,7 +410,7 @@ fn safe_target(rootfs: &Path, target: &Path) -> ZResult<PathBuf> {
                 if let Ok(md) = std::fs::symlink_metadata(&cur) {
                     if md.file_type().is_symlink() {
                         return Err(crate::zerr!(
-                            "refusing volume target {}: intermediate symlink escapes the rootfs",
+                            "refusing mount target {}: intermediate symlink escapes the rootfs",
                             target.display()
                         ));
                     }
@@ -417,7 +418,7 @@ fn safe_target(rootfs: &Path, target: &Path) -> ZResult<PathBuf> {
             }
             _ => {
                 return Err(crate::zerr!(
-                    "invalid volume target {} (use an absolute path without '..')",
+                    "invalid mount target {} (use an absolute path without '..')",
                     target.display()
                 ))
             }
@@ -731,6 +732,23 @@ mod bind_tests {
         assert!(validate_volume_name("app_data.v2").is_ok());
         assert!(validate_volume_name("..").is_err());
         assert!(validate_volume_name("bad/name").is_err());
+    }
+
+    #[test]
+    fn safe_target_rejects_symlinked_tmpfs_paths() {
+        let root = temp_path("safe-target");
+        let outside = temp_path("safe-target-outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("redirect")).unwrap();
+
+        assert!(safe_target(&root, Path::new("/redirect/file")).is_err());
+        assert_eq!(
+            safe_target(&root, Path::new("/new/file")).unwrap(),
+            root.join("new/file")
+        );
+        fsutil::remove_dir_all_quiet(&root);
+        fsutil::remove_dir_all_quiet(&outside);
     }
 
     #[test]
