@@ -1,8 +1,8 @@
-name: ci
+name: CI
 
 on:
+  # Run on every branch push so a branch is checked before a pull request exists.
   push:
-    branches: ["main"]
   pull_request:
   workflow_dispatch:
 
@@ -13,26 +13,83 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
 jobs:
-  check:
-    name: Format, lint, test, and build
+  fmt:
+    name: rustfmt
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: rustfmt
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Lint
-        run: cargo clippy --all-targets -- -D warnings
+  clippy:
+    name: clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Test
-        run: cargo test --locked
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
-      - name: Build
+      - name: Lint all targets
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run all tests
+        run: cargo test --locked --all-targets
+
+  build:
+    name: release build (gnu)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
         run: cargo build --locked --release
+
+  musl:
+    name: static build (x86_64 musl)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y musl-tools
+
+      - name: Build static release binary
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl

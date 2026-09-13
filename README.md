@@ -1,5 +1,7 @@
 # Zerun — a daemonless, single-binary Linux container runtime
 
+[![CI](https://github.com/zerun-labs/zerun/actions/workflows/ci.yml/badge.svg)](https://github.com/zerun-labs/zerun/actions/workflows/ci.yml)
+
 **Zerun** (binary `zerun`, install-time alias `ze`) is a lightweight container runtime for
 low-end cloud VMs (512 MB–2 GB), edge gateways, and embedded Linux. It converges the pieces
 that usually live in 5–6 separate components — OCI image pulling, OverlayFS storage, kernel
