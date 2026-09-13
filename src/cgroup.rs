@@ -69,11 +69,22 @@ impl CgroupV2 {
         let root = detect_cgroup2_root()?;
         let parent = root.join("zerun");
         let path = parent.join(id);
-        fs::create_dir_all(&path).map_err(|e| {
+        fs::create_dir_all(&parent).map_err(|e| {
             crate::zerr!(
-                "create cgroup {} failed: {e}. Hint: root or a delegated cgroup v2 subtree is required",
-                path.display()
+                "create cgroup parent {} failed: {e}. Hint: root or a delegated cgroup v2 subtree is required",
+                parent.display()
             )
+        })?;
+        // Do not use create_dir_all for the leaf: reusing an existing id could
+        // attach a new workload to another container's live cgroup after an id
+        // collision or stale state record.
+        fs::create_dir(&path).map_err(|e| {
+            let detail = if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("container cgroup already exists at {}", path.display())
+            } else {
+                format!("create cgroup {} failed: {e}", path.display())
+            };
+            crate::zerr!("{detail}. Hint: root or a delegated cgroup v2 subtree is required")
         })?;
         // Construct the owning handle before the remaining setup steps so a
         // controller or limit failure cannot leave the empty leaf behind.
