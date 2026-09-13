@@ -502,70 +502,10 @@ pub fn parse_memory_swap(value: &str) -> ZResult<i64> {
     i64::try_from(bytes).map_err(|_| crate::zerr!("memory-swap size is too large"))
 }
 
-/// Parse K/M/G/T size suffixes (optionally followed by B) into bytes.
-///
-/// This deliberately avoids floating-point parsing. Resource limits are
-/// security-sensitive, and `f64` accepts values such as `NaN` and `inf`; the
-/// subsequent float-to-integer cast would otherwise silently turn them into
-/// an unexpected limit. Decimal values are truncated to whole bytes, matching
-/// the previous behavior for inputs such as `1.5M`.
+/// Shared byte-size parser kept behind the cgroup module's existing helper so
+/// callers and tests retain the resource-limit error boundary.
 fn parse_size(s: &str) -> ZResult<u64> {
-    let s = s.trim();
-    let (number, multiplier) = split_size_suffix(s);
-    let number = number.trim();
-    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
-    if whole.is_empty() && fraction.is_empty()
-        || !whole.bytes().all(|b| b.is_ascii_digit())
-        || !fraction.bytes().all(|b| b.is_ascii_digit())
-        || fraction.len() > 38
-    {
-        return Err(crate::zerr!("cannot parse memory size: {s}"));
-    }
-
-    let whole = if whole.is_empty() {
-        0u128
-    } else {
-        whole
-            .parse::<u128>()
-            .map_err(|_| crate::zerr!("memory size is too large: {s}"))?
-    };
-    let scaled_whole = whole
-        .checked_mul(u128::from(multiplier))
-        .ok_or_else(|| crate::zerr!("memory size is too large: {s}"))?;
-    let fractional = if fraction.is_empty() {
-        0u128
-    } else {
-        let digits = fraction
-            .parse::<u128>()
-            .map_err(|_| crate::zerr!("memory size is too large: {s}"))?;
-        let denominator = 10u128.pow(fraction.len() as u32);
-        digits
-            .checked_mul(u128::from(multiplier))
-            .ok_or_else(|| crate::zerr!("memory size is too large: {s}"))?
-            / denominator
-    };
-    u64::try_from(
-        scaled_whole
-            .checked_add(fractional)
-            .ok_or_else(|| crate::zerr!("memory size is too large: {s}"))?,
-    )
-    .map_err(|_| crate::zerr!("memory size is too large: {s}"))
-}
-
-/// Split a size into its numeric portion and binary unit multiplier. Docker
-/// accepts both compact units (`64M`) and their byte-suffixed forms (`64MB`).
-fn split_size_suffix(s: &str) -> (&str, u64) {
-    let s = match s.as_bytes().last().copied() {
-        Some(b'b' | b'B') => &s[..s.len() - 1],
-        _ => s,
-    };
-    match s.as_bytes().last().copied() {
-        Some(b'k' | b'K') => (&s[..s.len() - 1], 1024u64),
-        Some(b'm' | b'M') => (&s[..s.len() - 1], 1024u64 * 1024),
-        Some(b'g' | b'G') => (&s[..s.len() - 1], 1024u64 * 1024 * 1024),
-        Some(b't' | b'T') => (&s[..s.len() - 1], 1024u64 * 1024 * 1024 * 1024),
-        _ => (s, 1u64),
-    }
+    crate::units::parse_size(s)
 }
 
 /// Parse and validate a fractional CPU count before a cgroup is created or

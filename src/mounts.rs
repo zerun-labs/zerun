@@ -158,7 +158,8 @@ pub struct TmpfsMount {
 }
 
 /// Parse Docker-style `--tmpfs PATH[:opts]`. Options are comma-separated
-/// `key=value` pairs; `size` accepts K/M/G suffixes and `mode` an octal value.
+/// `key=value` pairs; `size` accepts the same binary byte units as resource
+/// limits and is normalized to bytes, while `mode` is an octal value.
 /// Anything else is rejected so a typo fails loudly instead of silently
 /// mounting a tmpfs the operator did not ask for.
 pub fn parse_tmpfs(value: &str) -> Result<TmpfsMount, String> {
@@ -204,12 +205,10 @@ pub fn parse_tmpfs(value: &str) -> Result<TmpfsMount, String> {
             };
             match key {
                 "size" => {
-                    if !valid_size_suffix(val) {
-                        return Err(format!(
-                            "--tmpfs: invalid size '{val}' (K/M/G suffix required)"
-                        ));
-                    }
-                    push_opt(&mut data, "size", val);
+                    let bytes = crate::units::parse_size(val).map_err(|_| {
+                        format!("--tmpfs: invalid size '{val}' (byte size expected)")
+                    })?;
+                    push_opt(&mut data, "size", &bytes.to_string());
                 }
                 "mode" => {
                     let parsed = u32::from_str_radix(val.trim_start_matches("0o"), 8)
@@ -231,13 +230,6 @@ pub fn parse_tmpfs(value: &str) -> Result<TmpfsMount, String> {
         readonly,
         raw: value.to_string(),
     })
-}
-
-fn valid_size_suffix(v: &str) -> bool {
-    let digits = v
-        .strip_suffix(|c: char| matches!(c, 'k' | 'K' | 'm' | 'M' | 'g' | 'G'))
-        .unwrap_or(v);
-    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn push_opt(data: &mut String, key: &str, value: &str) {
@@ -761,7 +753,7 @@ mod bind_tests {
 
         let sized = parse_tmpfs("/scratch:size=16m,mode=0700,ro").unwrap();
         assert_eq!(sized.target, PathBuf::from("/scratch"));
-        assert_eq!(sized.data, "size=16m,mode=700");
+        assert_eq!(sized.data, "size=16777216,mode=700");
         assert!(sized.readonly);
         assert_eq!(sized.raw, "/scratch:size=16m,mode=0700,ro");
 
@@ -775,8 +767,10 @@ mod bind_tests {
         assert!(parse_tmpfs("/a/../b").is_err());
         assert!(parse_tmpfs("/").is_err());
         assert!(parse_tmpfs("/x:size=abc").is_err());
-        assert_eq!(parse_tmpfs("/x:size=64m").unwrap().data, "size=64m");
+        assert_eq!(parse_tmpfs("/x:size=64m").unwrap().data, "size=67108864");
         assert_eq!(parse_tmpfs("/x:size=64").unwrap().data, "size=64");
+        assert_eq!(parse_tmpfs("/x:size=1.5G").unwrap().data, "size=1610612736");
+        assert_eq!(parse_tmpfs("/x:size=1MB").unwrap().data, "size=1048576");
         assert!(parse_tmpfs("/x:mode=99").is_err());
         assert!(parse_tmpfs("/x:mode=8888").is_err());
         assert!(parse_tmpfs("/x:nosuid").is_err());

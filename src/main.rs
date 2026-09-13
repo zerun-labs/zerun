@@ -33,6 +33,7 @@ mod state;
 mod store;
 mod syscalls;
 mod trace;
+mod units;
 mod workload;
 
 use cgroup::ResourceLimits;
@@ -6263,7 +6264,7 @@ mod tests {
         let a = parse_run_args(&args).expect("flags");
         assert!(a.readonly);
         assert_eq!(a.tmpfs.len(), 2);
-        assert_eq!(a.tmpfs[0].data, "size=16m");
+        assert_eq!(a.tmpfs[0].data, "size=16777216");
         assert!(a.tmpfs[1].readonly);
         let launch = detached_launch_args(&a, Path::new("/tmp/rootfs"));
         assert!(launch.contains(&"--read-only".to_string()));
