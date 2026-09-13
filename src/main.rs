@@ -48,6 +48,7 @@ use psfilter::PsFilter;
 use seccomp::SeccompMode;
 use state::ContainerState;
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -3425,14 +3426,7 @@ fn kill_one(store: &Store, target: &str, signal: libc::c_int) -> Result<String, 
     if st.paused && signal_requires_thaw(signal) {
         thaw_paused_container(&mut st)?;
     }
-    let pid = st
-        .pid
-        .ok_or_else(|| format!("container {} has no PID", st.id))?;
-    let rc = unsafe { libc::kill(pid, signal) };
-    if rc != 0 {
-        let e = std::io::Error::last_os_error();
-        return Err(format!("signal container {name}: {e}"));
-    }
+    signal_container(&st, signal).map_err(|e| format!("signal container {name}: {e}"))?;
     // Give a terminating signal a brief chance to take effect, without making
     // control signals such as STOP/CONT feel like `stop`.
     if wait_pid_gone(&st, Duration::from_millis(500)) {
@@ -3529,16 +3523,9 @@ fn stop_one(store: &Store, target: &str, timeout_secs: u64) -> Result<String, St
     // A frozen task cannot service SIGTERM; thaw first so the grace period is
     // meaningful instead of always ending in SIGKILL.
     thaw_paused_container(&mut st)?;
-    let pid = st
-        .pid
-        .ok_or_else(|| format!("container {} has no PID", st.id))?;
-    unsafe {
-        libc::kill(pid, libc::SIGTERM);
-    }
+    signal_container(&st, libc::SIGTERM)?;
     if !wait_pid_gone(&st, Duration::from_secs(timeout_secs)) {
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
+        signal_container(&st, libc::SIGKILL)?;
         wait_pid_gone(&st, Duration::from_secs(5));
     }
     lifecycle::settle_exit(store, &st.id);
@@ -3855,13 +3842,9 @@ fn rm_one(store: &Store, target: &str, force: bool) -> Result<String, String> {
             ));
         }
         thaw_paused_container(&mut st)?;
-        if let Some(pid) = st.pid.filter(|p| *p > 0) {
-            if st.pid_alive() {
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-                wait_pid_gone(&st, Duration::from_secs(5));
-            }
+        if st.pid.is_some() && st.pid_alive() {
+            signal_container(&st, libc::SIGKILL)?;
+            wait_pid_gone(&st, Duration::from_secs(5));
         }
         // Let the reaper record the exit (or reconcile when it is gone), so the
         // state directory is not deleted underneath a reaper that is about to
@@ -5544,6 +5527,26 @@ fn push_row(out: &mut String, cells: &[String], w: &[usize]) {
         }
     }
     out.push('\n');
+}
+
+/// Deliver a lifecycle signal without allowing a stale PID to target an
+/// unrelated process. New records carry a starttime and use pidfds; legacy
+/// records retain the historical PID fallback because they have no identity
+/// token with which to validate the process opened by pidfd_open.
+fn signal_container(state: &state::ContainerState, signal: libc::c_int) -> Result<(), String> {
+    let pid = state
+        .pid
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| "container has no valid PID".to_string())?;
+    if let Some(expected) = state.pid_start_time {
+        let pidfd = syscalls::pidfd_open(pid).map_err(|e| e.to_string())?;
+        if crate::procinfo::process_start_time(pid) != Some(expected) {
+            return Err("container PID is no longer the recorded process".to_string());
+        }
+        syscalls::pidfd_send_signal(pidfd.as_raw_fd(), signal).map_err(|e| e.to_string())
+    } else {
+        syscalls::kill(pid, signal).map_err(|e| e.to_string())
+    }
 }
 
 fn wait_pid_gone(state: &state::ContainerState, timeout: Duration) -> bool {

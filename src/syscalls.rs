@@ -4,7 +4,7 @@
 use crate::error::{last_err, ZResult};
 use libc::{c_int, c_void};
 use std::ffi::{CStr, CString};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
 // ---------- mounts ----------
@@ -331,6 +331,44 @@ pub fn close(fd: RawFd) {
     unsafe {
         libc::close(fd);
     }
+}
+
+/// Open a stable handle for a process. Unlike a bare PID, a pidfd continues
+/// to refer to the same process even if the numeric PID is later reused.
+pub fn pidfd_open(pid: libc::pid_t) -> ZResult<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(last_err("pidfd_open"));
+    }
+    // The kernel returned a newly-owned descriptor on success.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
+/// Send a signal through a pidfd, avoiding PID-reuse races between checking
+/// liveness and delivering a lifecycle signal.
+pub fn pidfd_send_signal(pidfd: RawFd, signal: c_int) -> ZResult<()> {
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd,
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if rc < 0 {
+        return Err(last_err("pidfd_send_signal"));
+    }
+    Ok(())
+}
+
+/// Send a signal by numeric PID for legacy state records that predate
+/// persisted process identity metadata. New lifecycle paths use pidfds.
+pub fn kill(pid: libc::pid_t, signal: c_int) -> ZResult<()> {
+    if unsafe { libc::kill(pid, signal) } != 0 {
+        return Err(last_err("kill"));
+    }
+    Ok(())
 }
 
 /// Duplicate a file descriptor (`new` replaces it and is not CLOEXEC).
