@@ -25,7 +25,7 @@ jobs:
           - armv7-unknown-linux-musleabihf
           - riscv64gc-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
