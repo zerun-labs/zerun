@@ -123,10 +123,8 @@ impl CgroupV2 {
             self.write("memory.high", bytes.to_string())?;
         }
         if let Some(cpus) = limits.cpus {
-            if cpus > 0.0 {
-                let quota = (cpus * 100_000.0).round() as i64;
-                self.write("cpu.max", format!("{quota} 100000"))?;
-            }
+            let quota = cpu_quota(cpus)?;
+            self.write("cpu.max", format!("{quota} 100000"))?;
         }
         if let Some(cpuset) = &limits.cpuset_cpus {
             require_controller(parent, "cpuset")?;
@@ -471,18 +469,72 @@ pub fn parse_memory_swap(value: &str) -> ZResult<i64> {
 }
 
 /// Parse K/M/G size suffixes into bytes.
+///
+/// This deliberately avoids floating-point parsing. Resource limits are
+/// security-sensitive, and `f64` accepts values such as `NaN` and `inf`; the
+/// subsequent float-to-integer cast would otherwise silently turn them into
+/// an unexpected limit. Decimal values are truncated to whole bytes, matching
+/// the previous behavior for inputs such as `1.5M`.
 fn parse_size(s: &str) -> ZResult<u64> {
     let s = s.trim();
-    let (num, mult) = match s.chars().last() {
-        Some(c) if c == 'k' || c == 'K' => (&s[..s.len() - 1], 1024u64),
-        Some(c) if c == 'm' || c == 'M' => (&s[..s.len() - 1], 1024u64 * 1024),
-        Some(c) if c == 'g' || c == 'G' => (&s[..s.len() - 1], 1024u64 * 1024 * 1024),
+    let (number, multiplier) = match s.as_bytes().last().copied() {
+        Some(b'k' | b'K') => (&s[..s.len() - 1], 1024u64),
+        Some(b'm' | b'M') => (&s[..s.len() - 1], 1024u64 * 1024),
+        Some(b'g' | b'G') => (&s[..s.len() - 1], 1024u64 * 1024 * 1024),
         _ => (s, 1u64),
     };
-    num.trim()
-        .parse::<f64>()
-        .map(|n| (n * mult as f64) as u64)
-        .map_err(|_| crate::zerr!("cannot parse memory size: {s}"))
+    let number = number.trim();
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if whole.is_empty() && fraction.is_empty()
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+        || fraction.len() > 38
+    {
+        return Err(crate::zerr!("cannot parse memory size: {s}"));
+    }
+
+    let whole = if whole.is_empty() {
+        0u128
+    } else {
+        whole
+            .parse::<u128>()
+            .map_err(|_| crate::zerr!("memory size is too large: {s}"))?
+    };
+    let scaled_whole = whole
+        .checked_mul(u128::from(multiplier))
+        .ok_or_else(|| crate::zerr!("memory size is too large: {s}"))?;
+    let fractional = if fraction.is_empty() {
+        0u128
+    } else {
+        let digits = fraction
+            .parse::<u128>()
+            .map_err(|_| crate::zerr!("memory size is too large: {s}"))?;
+        let denominator = 10u128.pow(fraction.len() as u32);
+        digits
+            .checked_mul(u128::from(multiplier))
+            .ok_or_else(|| crate::zerr!("memory size is too large: {s}"))?
+            / denominator
+    };
+    u64::try_from(
+        scaled_whole
+            .checked_add(fractional)
+            .ok_or_else(|| crate::zerr!("memory size is too large: {s}"))?,
+    )
+    .map_err(|_| crate::zerr!("memory size is too large: {s}"))
+}
+
+/// Convert a fractional CPU count into the cgroup v2 quota (100 ms period).
+fn cpu_quota(cpus: f64) -> ZResult<i64> {
+    if !cpus.is_finite() || cpus <= 0.0 {
+        return Err(crate::zerr!(
+            "cpus must be a finite value greater than zero"
+        ));
+    }
+    let quota = (cpus * 100_000.0).round();
+    if !quota.is_finite() || quota < 1.0 || quota > i64::MAX as f64 {
+        return Err(crate::zerr!("cpus value is outside the supported range"));
+    }
+    Ok(quota as i64)
 }
 
 #[cfg(test)]
@@ -578,7 +630,24 @@ mod tests {
         assert_eq!(parse_size("512m").unwrap(), 512 * 1024 * 1024);
         assert_eq!(parse_size("1k").unwrap(), 1024);
         assert_eq!(parse_size("4096").unwrap(), 4096);
+        assert_eq!(parse_size("1.5M").unwrap(), 1_572_864);
+        assert_eq!(parse_size(".5K").unwrap(), 512);
         assert!(parse_size("abc").is_err());
+        assert!(parse_size("NaN").is_err());
+        assert!(parse_size("inf").is_err());
+        assert!(parse_size("-1M").is_err());
+        assert!(parse_size("1..5M").is_err());
+        assert!(parse_size("18446744073709551616").is_err());
+    }
+
+    #[test]
+    fn validates_cpu_quotas_without_float_overflow() {
+        assert_eq!(cpu_quota(0.5).unwrap(), 50_000);
+        assert_eq!(cpu_quota(1.25).unwrap(), 125_000);
+        assert!(cpu_quota(0.000001).is_err());
+        assert!(cpu_quota(0.0).is_err());
+        assert!(cpu_quota(f64::NAN).is_err());
+        assert!(cpu_quota(f64::INFINITY).is_err());
     }
 
     #[test]
