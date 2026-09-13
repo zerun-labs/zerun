@@ -49,6 +49,9 @@ pub struct IoLimit {
 
 pub struct CgroupV2 {
     path: PathBuf,
+    /// Newly created cgroups are owned by this handle and are cleaned up on
+    /// drop. Handles returned by `open` borrow an existing lifecycle cgroup.
+    cleanup_on_drop: bool,
 }
 
 impl CgroupV2 {
@@ -72,8 +75,13 @@ impl CgroupV2 {
                 path.display()
             )
         })?;
+        // Construct the owning handle before the remaining setup steps so a
+        // controller or limit failure cannot leave the empty leaf behind.
+        let cg = CgroupV2 {
+            path,
+            cleanup_on_drop: true,
+        };
         enable_controllers(&parent, &["memory", "cpu", "pids", "io", "cpuset"])?;
-        let cg = CgroupV2 { path };
         cg.apply_limits(&parent, limits)?;
         trace::mark("parent:cgroup:configured");
         Ok(cg)
@@ -86,6 +94,7 @@ impl CgroupV2 {
         }
         Ok(CgroupV2 {
             path: path.to_path_buf(),
+            cleanup_on_drop: false,
         })
     }
 
@@ -204,8 +213,22 @@ impl CgroupV2 {
     }
 
     /// Clean up after the container exits: rmdir the leaf directory (control files
-    /// are reclaimed by the kernel).
-    pub fn cleanup(self) {
+    /// are reclaimed by the kernel). The explicit method is kept for callers
+    /// that document the end of the run; [`Drop`] also performs the cleanup so
+    /// setup failures cannot leak a cgroup.
+    pub fn cleanup(mut self) {
+        self.cleanup_on_drop = true;
+    }
+}
+
+impl Drop for CgroupV2 {
+    fn drop(&mut self) {
+        if !self.cleanup_on_drop {
+            return;
+        }
+        // A cgroup can only be removed after its tasks have exited. Cleanup is
+        // intentionally best-effort here: lifecycle reconciliation can retry
+        // stale cgroups, while Drop must not mask the original setup error.
         let _ = fs::remove_dir(&self.path);
         let _ = fs::remove_dir(self.path.parent().unwrap_or(Path::new("/sys/fs/cgroup")));
     }
@@ -667,6 +690,45 @@ mod tests {
     }
 
     #[test]
+    fn dropping_a_cgroup_removes_the_leaf_and_empty_parent() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-cgroup-drop-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let parent = root.join("zerun");
+        let leaf = parent.join("container");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&leaf).unwrap();
+        {
+            let _cg = CgroupV2 {
+                path: leaf.clone(),
+                cleanup_on_drop: true,
+            };
+        }
+        assert!(!leaf.exists());
+        assert!(!parent.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dropping_an_open_handle_does_not_remove_a_live_cgroup() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-cgroup-open-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let leaf = root.join("zerun/container");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&leaf).unwrap();
+        {
+            let _cg = CgroupV2::open(&leaf).unwrap();
+        }
+        assert!(leaf.is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn writes_cgroup_freeze_state() {
         let dir = std::env::temp_dir().join(format!(
             "zerun-cgroup-freeze-{}-{:?}",
@@ -675,7 +737,10 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let cg = CgroupV2 { path: dir.clone() };
+        let cg = CgroupV2 {
+            path: dir.clone(),
+            cleanup_on_drop: false,
+        };
         cg.set_freeze(true).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("cgroup.freeze")).unwrap(),
