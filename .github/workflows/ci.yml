@@ -114,6 +114,38 @@ jobs:
           test "$status" -eq 23
           grep -Fx zerun-smoke-ok "$RUNNER_TEMP/zerun-smoke.log"
 
+  cross:
+    name: static build (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+          - riscv64gc-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.14.1
+
+      - name: Install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild
+
+      - name: Build static release binary
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo zigbuild --locked --release --target ${{ matrix.target }}
+
   musl:
     name: static build (x86_64 musl)
     runs-on: ubuntu-24.04
