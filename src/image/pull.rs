@@ -284,7 +284,7 @@ fn materialize_rootfs(
     config: &ImageConfig,
 ) -> ZResult<std::path::PathBuf> {
     for (i, layer) in manifest.layers.iter().enumerate() {
-        println!(
+        eprintln!(
             "  layer {}/{}: {} ({})",
             i + 1,
             manifest.layers.len(),
