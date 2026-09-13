@@ -348,6 +348,23 @@ mod tests {
         b.into_inner().unwrap()
     }
 
+    fn unsafe_path_tar(path: &[u8]) -> Vec<u8> {
+        let mut header = [0u8; 512];
+        header[..path.len()].copy_from_slice(path);
+        header[100..108].copy_from_slice(b"0000644\0");
+        header[124..136].copy_from_slice(b"00000000000\0");
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        header[148..156].fill(b' ');
+        let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+        let encoded = format!("{checksum:06o}\0 ");
+        header[148..156].copy_from_slice(encoded.as_bytes());
+        let mut archive = header.to_vec();
+        archive.extend_from_slice(&[0u8; 1024]);
+        archive
+    }
+
     fn make_tar(entries: &[(String, tar::EntryType, Option<String>, Vec<u8>)]) -> Vec<u8> {
         let mut b = tar::Builder::new(Vec::new());
         for (path, ty, link, content) in entries {
@@ -414,6 +431,18 @@ mod tests {
             fs::read_to_string(dir.join("var/log/new.log")).unwrap(),
             "new"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unpack_rejects_unsafe_tar_entries_instead_of_silently_skipping_them() {
+        let dir = std::env::temp_dir().join(format!("zerun-unpack-unsafe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let err =
+            unpack_layer(unsafe_path_tar(b"../outside").as_slice(), &dir, "test").unwrap_err();
+        assert!(err.to_string().contains("unsafe tar path"));
+        assert!(!dir.join("outside").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
