@@ -2,7 +2,7 @@
 use crate::error::ZResult;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -59,22 +59,26 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> ZResult<()> {
 }
 
 fn set_mode(p: &Path, mode: u32) -> ZResult<()> {
-    use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(p, fs::Permissions::from_mode(mode))
         .map_err(|e| crate::zerr!("chmod {}: {e}", p.display()))
 }
 
 static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Atomic and durable file write: write to a temp file in the same directory,
-/// flush its contents, rename it into place, then flush the directory entry.
-///
-/// The rename prevents readers from observing a partial JSON document; the
-/// file and directory syncs make the replacement survive a sudden reboot on
-/// filesystems that honor fsync. This is the durability boundary for the
-/// daemonless state and image indexes.
+/// Atomic and durable file write using the process umask for the new file.
 #[allow(dead_code)] // used by the image store milestone
 pub fn atomic_write(path: &Path, data: &[u8]) -> ZResult<()> {
+    atomic_write_mode(path, data, 0o666)
+}
+
+/// Atomic and durable file write with an explicit mode.
+///
+/// The temporary file is created with `mode` before any bytes are written, so
+/// sensitive records are never briefly exposed through a world-readable
+/// temporary inode. The rename prevents readers from observing a partial JSON
+/// document; the file and directory syncs make the replacement survive a
+/// sudden reboot on filesystems that honor fsync.
+pub fn atomic_write_mode(path: &Path, data: &[u8], mode: u32) -> ZResult<()> {
     let dir = path
         .parent()
         .ok_or_else(|| crate::zerr!("no parent for {}", path.display()))?;
@@ -89,6 +93,7 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> ZResult<()> {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(mode)
             .open(&tmp)
             .map_err(|e| crate::zerr!("create {}: {e}", tmp.display()))?;
         file.write_all(data)
@@ -156,6 +161,17 @@ fn remove_rec(p: &Path) -> std::io::Result<()> {
 /// Best-effort create-all parents.
 pub fn mkdir_p(p: &Path) -> ZResult<()> {
     fs::create_dir_all(p).map_err(|e| crate::zerr!("mkdir {}: {e}", p.display()))
+}
+
+/// Create a directory tree and tighten the final directory's permissions.
+///
+/// `create_dir_all` honors the process umask but does not change an existing
+/// directory. Runtime metadata needs a stronger invariant than that: a store
+/// left behind by an older version must become private on the next invocation.
+pub fn mkdir_p_mode(p: &Path, mode: u32) -> ZResult<()> {
+    mkdir_p(p)?;
+    fs::set_permissions(p, fs::Permissions::from_mode(mode))
+        .map_err(|e| crate::zerr!("chmod {}: {e}", p.display()))
 }
 
 /// A tiny cache of absolute canonical paths so callers avoid repeating
@@ -237,6 +253,53 @@ mod tests {
         atomic_write(&path, b"second").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"second");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_mode_keeps_private_files_private() {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-atomic-private-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        atomic_write_mode(&path, b"secret", 0o600).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        atomic_write_mode(&path, b"secret-2", 0o600).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mkdir_p_mode_tightens_existing_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-mkdir-mode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        mkdir_p_mode(&dir, 0o700).unwrap();
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

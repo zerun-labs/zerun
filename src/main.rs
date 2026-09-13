@@ -49,6 +49,7 @@ use seccomp::SeccompMode;
 use state::ContainerState;
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1256,7 +1257,7 @@ fn run_detached(
     }
 
     let sdir = state::ContainerState::dir(store, &id);
-    if let Err(e) = fsutil::mkdir_p(&sdir) {
+    if let Err(e) = fsutil::mkdir_p_mode(&sdir, 0o700) {
         eprintln!("zerun: {e}");
         if !resuming {
             if let Some(fs) = container_fs.as_ref() {
@@ -1274,12 +1275,14 @@ fn run_detached(
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(&log_path)
     } else {
         std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
+            .mode(0o600)
             .open(&log_path)
     } {
         Ok(f) => f,
@@ -1293,6 +1296,15 @@ fn run_detached(
             return 1;
         }
     };
+    if let Err(e) = log_fd.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        eprintln!("zerun: secure {}: {e}", log_path.display());
+        if !resuming {
+            if let Some(fs) = container_fs.as_ref() {
+                store.cleanup_container_fs(fs);
+            }
+        }
+        return 1;
+    }
     let env: Vec<String> = spec
         .env
         .as_ref()

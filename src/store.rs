@@ -75,11 +75,19 @@ impl Store {
             self.data_root.join("overlays"),
             self.data_root.join("volumes"),
             self.data_root.join("tmp"),
+        ] {
+            fsutil::mkdir_p(&d)?;
+        }
+        // Runtime state contains command lines, environment variables, and
+        // logs. Keep the whole runtime tree owner-only, including trees left
+        // behind by older Zerun versions.
+        for d in [
+            self.run_root.clone(),
             self.run_root.join("containers"),
             self.run_root.join("locks"),
             self.run_root.join("net"), // file-based IPAM (M5)
         ] {
-            fsutil::mkdir_p(&d)?;
+            fsutil::mkdir_p_mode(&d, 0o700)?;
         }
         Ok(())
     }

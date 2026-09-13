@@ -328,8 +328,10 @@ Stopped containers retain both their writable layer and read-only lower rootfs; 
 garbage collection keeps that lower reachable even after the image tag is removed, until
 the container itself is removed.
 `attach` streams a running detached container's live output over an owner-only Unix socket.
-When the workload exits, a final control frame closes the stream and the attach command
-returns the container's exit code without mixing runtime metadata into output.
+Detached state and console logs are stored owner-only because state contains the resolved
+command line and environment. When the workload exits, a final control frame closes the stream
+and the attach command returns the container's exit code without mixing runtime metadata into
+output.
 Use `exec` for interactive input.
 `commit` produces a single-layer OCI image from the container rootfs. Exited detached
 containers retain their writable layer until `rm`; `--rm` still removes it on exit.

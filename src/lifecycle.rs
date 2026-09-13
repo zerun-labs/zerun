@@ -24,7 +24,7 @@ use crate::store::{ContainerFs, Store};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::RawFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -216,6 +216,9 @@ struct RotatingLog {
 impl RotatingLog {
     fn open(active: &Path, options: LogOptions) -> std::io::Result<Self> {
         let file = OpenOptions::new().append(true).open(active)?;
+        // Logs may contain application secrets. Tighten files created by older
+        // versions as well as newly-created files before the collector writes.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         let written = file.metadata()?.len();
         Ok(Self {
             active: active.to_path_buf(),
@@ -266,10 +269,21 @@ impl RotatingLog {
         } else {
             let _ = std::fs::remove_file(&self.active);
         }
+        // Existing archives may have been created before private log files
+        // were enforced. Secure every retained inode after the rename pass.
+        for index in 1..max_files {
+            let archive = numbered_path(&self.active, index);
+            match std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o600)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
         let replacement = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
+            .mode(0o600)
             .open(&self.active)?;
         drop(std::mem::replace(&mut self.file, replacement));
         self.written = 0;

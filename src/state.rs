@@ -308,7 +308,13 @@ impl ContainerState {
         let p = Self::path_from(&self.log);
         let json = serde_json::to_vec_pretty(self)
             .map_err(|e| crate::zerr!("serialize state for {}: {e}", self.id))?;
-        fsutil::atomic_write(&p, &json)
+        let parent = p
+            .parent()
+            .ok_or_else(|| crate::zerr!("state path has no parent: {}", p.display()))?;
+        // State includes the resolved environment and command line, which can
+        // contain credentials or other operator-provided secrets.
+        fsutil::mkdir_p_mode(parent, 0o700)?;
+        fsutil::atomic_write_mode(&p, &json, 0o600)
     }
 
     fn path_from(log_path: &str) -> PathBuf {
