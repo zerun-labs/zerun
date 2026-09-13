@@ -243,12 +243,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--cpus" => {
                 let v = next_value(args, &mut i, "--cpus")?;
-                a.cpus = Some(
-                    v.parse::<f64>()
-                        .ok()
-                        .filter(|c| *c > 0.0)
-                        .ok_or_else(|| format!("invalid --cpus value '{v}'"))?,
-                );
+                a.cpus = Some(cgroup::parse_cpus(&v).map_err(|e| e.to_string())?);
             }
             "--cpuset-cpus" => {
                 let v = next_value(args, &mut i, "--cpuset-cpus")?;
@@ -4284,13 +4279,13 @@ fn cmd_update(args: &[String]) -> i32 {
                 }
             },
             "--cpus" => match next_value(args, &mut i, a) {
-                Ok(v) => match v.parse::<f64>() {
-                    Ok(c) if c > 0.0 => {
+                Ok(v) => match cgroup::parse_cpus(&v) {
+                    Ok(c) => {
                         limits.cpus = Some(c);
                         continue;
                     }
-                    _ => {
-                        eprintln!("zerun update: --cpus expects a positive number, got '{v}'");
+                    Err(e) => {
+                        eprintln!("zerun update: invalid --cpus '{v}': {e}");
                         return 2;
                     }
                 },

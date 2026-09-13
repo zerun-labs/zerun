@@ -523,6 +523,19 @@ fn parse_size(s: &str) -> ZResult<u64> {
     .map_err(|_| crate::zerr!("memory size is too large: {s}"))
 }
 
+/// Parse and validate a fractional CPU count before a cgroup is created or
+/// updated. The cgroup quota has 10,000 microsecond granularity, so values
+/// that would round down to zero are rejected instead of failing later in the
+/// kernel.
+pub fn parse_cpus(value: &str) -> ZResult<f64> {
+    let cpus = value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| crate::zerr!("cannot parse cpus: '{value}'"))?;
+    cpu_quota(cpus)?;
+    Ok(cpus)
+}
+
 /// Convert a fractional CPU count into the cgroup v2 quota (100 ms period).
 fn cpu_quota(cpus: f64) -> ZResult<i64> {
     if !cpus.is_finite() || cpus <= 0.0 {
@@ -642,6 +655,9 @@ mod tests {
 
     #[test]
     fn validates_cpu_quotas_without_float_overflow() {
+        assert_eq!(parse_cpus(" 0.5 ").unwrap(), 0.5);
+        assert!(parse_cpus("NaN").is_err());
+        assert!(parse_cpus("0.000001").is_err());
         assert_eq!(cpu_quota(0.5).unwrap(), 50_000);
         assert_eq!(cpu_quota(1.25).unwrap(), 125_000);
         assert!(cpu_quota(0.000001).is_err());
