@@ -18,6 +18,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One tagged (or digest-pinned) image in the local index.
@@ -44,6 +45,8 @@ pub struct ImageRecord {
 pub struct ImageStore {
     data_root: PathBuf,
 }
+
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 impl ImageStore {
     /// Open (and create on first use) the image store under `store`'s data root.
@@ -74,16 +77,30 @@ impl ImageStore {
         Ok(self.data_root.join("blobs").join("sha256").join(hex))
     }
 
+    /// Verify an existing blob against the sha256 digest encoded by its path.
+    /// Missing or non-regular entries are reported as `false`; filesystem
+    /// errors other than not-found are returned to the caller.
+    pub fn verify_blob(&self, digest: &str) -> ZResult<bool> {
+        let expected = digest_hex(digest)?;
+        let path = self.data_root.join("blobs").join("sha256").join(&expected);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(crate::zerr!("stat blob {digest}: {error}"));
+            }
+        };
+        if !metadata.file_type().is_file() {
+            return Ok(false);
+        }
+        Ok(sha256_file(&path)? == expected)
+    }
+
+    /// Boolean compatibility wrapper for callers that cannot propagate an
+    /// integrity-check error. New storage paths should prefer [`verify_blob`].
+    #[allow(dead_code)]
     pub fn has_blob(&self, digest: &str) -> bool {
-        digest_hex(digest)
-            .map(|hex| {
-                self.data_root
-                    .join("blobs")
-                    .join("sha256")
-                    .join(hex)
-                    .is_file()
-            })
-            .unwrap_or(false)
+        self.verify_blob(digest).unwrap_or(false)
     }
 
     pub fn read_blob(&self, digest: &str) -> ZResult<Option<Vec<u8>>> {
@@ -98,20 +115,35 @@ impl ImageStore {
 
     /// Store in-memory bytes as a blob, verifying `digest` matches the content.
     pub fn write_blob(&self, digest: &str, bytes: &[u8]) -> ZResult<()> {
-        let path = self.blob_path(digest)?;
-        if path.is_file() {
-            return Ok(()); // already present
-        }
+        let expected = digest_hex(digest)?;
         let actual = sha256_hex(bytes);
-        if digest != format!("sha256:{actual}") {
+        if actual != expected {
             return Err(crate::zerr!(
-                "blob digest mismatch: expected {digest}, got sha256:{actual}"
+                "blob digest mismatch: expected sha256:{expected}, got sha256:{actual}"
             ));
         }
-        let tmp = self.tmp_path("blob");
-        fs::write(&tmp, bytes).map_err(|e| crate::zerr!("write blob {digest}: {e}"))?;
-        fs::rename(&tmp, &path).map_err(|e| crate::zerr!("install blob {digest}: {e}"))?;
-        Ok(())
+        let path = self.data_root.join("blobs").join("sha256").join(&expected);
+        if self.verify_blob(digest)? {
+            return Ok(());
+        }
+
+        let tmp = self.tmp_path(&format!("blob-{short}-incoming", short = &expected[..8]));
+        let result = (|| -> ZResult<()> {
+            let mut out = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .map_err(|error| crate::zerr!("create blob temp file: {error}"))?;
+            out.write_all(bytes)
+                .map_err(|error| crate::zerr!("write blob {digest}: {error}"))?;
+            out.sync_all()
+                .map_err(|error| crate::zerr!("sync blob {digest}: {error}"))?;
+            self.install_blob_temp(&tmp, &path, digest)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        result
     }
 
     /// Stream a blob body from `reader` into the store, hashing as it goes and
@@ -119,19 +151,17 @@ impl ImageStore {
     pub fn store_blob_stream<R: Read>(&self, digest: &str, reader: R) -> ZResult<()> {
         let expected = digest_hex(digest)?;
         let path = self.data_root.join("blobs").join("sha256").join(&expected);
-        if path.is_file() {
+        if self.verify_blob(digest)? {
             return Ok(());
         }
-        let tmp = self.data_root.join("blobs").join("sha256").join(format!(
-            ".tmp-{}-{}-{}",
-            std::process::id(),
-            &expected[..8.min(expected.len())],
-            "incoming"
-        ));
-        let mut hasher = Sha256::new();
-        {
-            let mut out =
-                fs::File::create(&tmp).map_err(|e| crate::zerr!("create blob temp file: {e}"))?;
+        let tmp = self.tmp_path(&format!("blob-{short}-incoming", short = &expected[..8]));
+        let result = (|| -> ZResult<()> {
+            let mut hasher = Sha256::new();
+            let mut out = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .map_err(|e| crate::zerr!("create blob temp file: {e}"))?;
             let mut buf = [0u8; 64 * 1024];
             let mut reader = reader;
             loop {
@@ -145,16 +175,20 @@ impl ImageStore {
                 out.write_all(&buf[..n])
                     .map_err(|e| crate::zerr!("write blob body: {e}"))?;
             }
-        }
-        let actual = hex(&hasher.finalize());
-        if actual != expected {
+            out.sync_all()
+                .map_err(|e| crate::zerr!("sync blob body: {e}"))?;
+            let actual = hex(&hasher.finalize());
+            if actual != expected {
+                return Err(crate::zerr!(
+                    "blob digest mismatch: expected sha256:{expected}, got sha256:{actual}"
+                ));
+            }
+            self.install_blob_temp(&tmp, &path, digest)
+        })();
+        if result.is_err() {
             let _ = fs::remove_file(&tmp);
-            return Err(crate::zerr!(
-                "blob digest mismatch: expected sha256:{expected}, got sha256:{actual}"
-            ));
         }
-        fs::rename(&tmp, &path).map_err(|e| crate::zerr!("install blob {digest}: {e}"))?;
-        Ok(())
+        result
     }
 
     /// A temporary file next to blob storage; renaming it into place is
@@ -167,12 +201,18 @@ impl ImageStore {
     /// blob, and return its digest and size. The source must be on the image
     /// store filesystem so installation is a rename.
     pub fn install_blob_file(&self, source: &Path) -> ZResult<(String, u64)> {
+        let metadata = fs::symlink_metadata(source)
+            .map_err(|e| crate::zerr!("stat blob {}: {e}", source.display()))?;
+        if !metadata.file_type().is_file() {
+            return Err(crate::zerr!(
+                "blob source {} is not a regular file",
+                source.display()
+            ));
+        }
         let digest = format!("sha256:{}", sha256_file(source)?);
         let path = self.blob_path(&digest)?;
-        let size = fs::metadata(source)
-            .map(|m| m.len())
-            .map_err(|e| crate::zerr!("stat blob {}: {e}", source.display()))?;
-        if path.is_file() {
+        let size = metadata.len();
+        if self.verify_blob(&digest)? {
             let _ = fs::remove_file(source);
             return Ok((digest, size));
         }
@@ -507,11 +547,16 @@ impl ImageStore {
         }
     }
 
+    fn install_blob_temp(&self, tmp: &Path, path: &Path, digest: &str) -> ZResult<()> {
+        fs::rename(tmp, path).map_err(|error| crate::zerr!("install blob {digest}: {error}"))
+    }
+
     fn tmp_path(&self, what: &str) -> PathBuf {
+        let sequence = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         self.data_root
             .join("blobs")
             .join("sha256")
-            .join(format!(".tmp-{}-{what}", std::process::id()))
+            .join(format!(".tmp-{}-{sequence}-{what}", std::process::id()))
     }
 }
 
@@ -627,13 +672,61 @@ mod tests {
         let s = test_store();
         let content = b"hello blob";
         let d = format!("sha256:{}", sha256_hex(content));
-        assert!(!s.has_blob(&d));
+        assert!(!s.verify_blob(&d).unwrap());
         s.write_blob(&d, content).unwrap();
-        assert!(s.has_blob(&d));
+        assert!(s.verify_blob(&d).unwrap());
         assert_eq!(s.read_blob(&d).unwrap().unwrap(), content);
         // Mismatched content is rejected (digest is checked before install).
         let bad_d = format!("sha256:{}", sha256_hex(b"other"));
         assert!(s.write_blob(&bad_d, b"different").is_err());
+        let _ = fs::remove_dir_all(&s.data_root);
+    }
+
+    #[test]
+    fn existing_corrupt_blob_is_not_trusted_and_is_replaced() {
+        let s = test_store();
+        let content = b"trusted content";
+        let digest = format!("sha256:{}", sha256_hex(content));
+        let path = s.blob_path(&digest).unwrap();
+
+        s.write_blob(&digest, content).unwrap();
+        fs::write(&path, b"tampered content").unwrap();
+        assert!(!s.verify_blob(&digest).unwrap());
+
+        s.write_blob(&digest, content).unwrap();
+        assert!(s.verify_blob(&digest).unwrap());
+        assert_eq!(s.read_blob(&digest).unwrap().unwrap(), content);
+
+        fs::write(&path, b"truncated").unwrap();
+        s.store_blob_stream(&digest, &content[..]).unwrap();
+        assert!(s.verify_blob(&digest).unwrap());
+        assert_eq!(s.read_blob(&digest).unwrap().unwrap(), content);
+
+        let _ = fs::remove_dir_all(&s.data_root);
+    }
+
+    #[test]
+    fn blob_writer_races_keep_a_valid_content_addressed_file() {
+        let s = Arc::new(test_store());
+        let content = Arc::new(b"concurrent content".to_vec());
+        let digest = format!("sha256:{}", sha256_hex(&content));
+        let barrier = Arc::new(Barrier::new(4));
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let s = Arc::clone(&s);
+            let content = Arc::clone(&content);
+            let barrier = Arc::clone(&barrier);
+            let digest = digest.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                s.store_blob_stream(&digest, &content[..]).unwrap();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(s.verify_blob(&digest).unwrap());
+        assert_eq!(s.read_blob(&digest).unwrap().unwrap(), *content);
         let _ = fs::remove_dir_all(&s.data_root);
     }
 
@@ -665,8 +758,8 @@ mod tests {
         );
 
         s.gc_with_protected(&BTreeSet::new()).unwrap();
-        assert!(s.has_blob(&kept_digest));
-        assert!(!s.has_blob(&orphan_digest));
+        assert!(s.verify_blob(&kept_digest).unwrap());
+        assert!(!s.verify_blob(&orphan_digest).unwrap());
         assert!(!orphan_rootfs.exists());
         assert_eq!(s.reclaimable_bytes_with_protected(&BTreeSet::new()), 0);
     }

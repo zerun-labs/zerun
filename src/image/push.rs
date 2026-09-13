@@ -12,7 +12,6 @@ use crate::image::name::Reference;
 use crate::image::registry::RegistryClient;
 use crate::image::store::ImageStore;
 use std::collections::BTreeSet;
-use std::path::Path;
 
 /// Result returned to the CLI after a successful manifest PUT.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,8 +108,7 @@ fn validate_manifest_tree(
             let mut blobs = vec![m.config.clone()];
             blobs.extend(m.layers.iter().cloned());
             for blob in blobs {
-                let path = store.blob_path(&blob.digest)?;
-                verify_blob(&path, blob.size)?;
+                verify_blob(store, &blob.digest, blob.size)?;
             }
         }
         ImageDoc::Index(index) => {
@@ -297,16 +295,18 @@ fn put_manifest(
     Ok(())
 }
 
-fn verify_blob(path: &Path, advertised_size: u64) -> ZResult<()> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| crate::zerr!("local blob {} is missing: {e}", path.display()))?;
-    if !metadata.is_file() {
-        return Err(crate::zerr!("local blob is not a file: {}", path.display()));
+fn verify_blob(store: &ImageStore, digest: &str, advertised_size: u64) -> ZResult<()> {
+    if !store.verify_blob(digest)? {
+        return Err(crate::zerr!(
+            "local blob {digest} is missing or its digest does not match"
+        ));
     }
+    let path = store.blob_path(digest)?;
+    let metadata =
+        std::fs::metadata(&path).map_err(|e| crate::zerr!("stat local blob {digest}: {e}"))?;
     if advertised_size != 0 && metadata.len() != advertised_size {
         return Err(crate::zerr!(
-            "local blob {} size {} does not match manifest size {advertised_size}",
-            path.display(),
+            "local blob {digest} size {} does not match manifest size {advertised_size}",
             metadata.len()
         ));
     }
@@ -358,6 +358,36 @@ mod tests {
         let reference = Reference::parse(&format!("localhost:1/org/app@{digest}")).unwrap();
         let err = push_image(&store, &mut client, &reference).unwrap_err();
         assert!(err.to_string().contains("not a digest reference"));
+    }
+
+    #[test]
+    fn push_rejects_a_corrupted_blob_before_network_access() {
+        let store = test_store();
+        let source = std::env::temp_dir().join(format!(
+            "zerun-push-corrupt-rootfs-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("marker"), b"marker").unwrap();
+        let target = "localhost:1/org/corrupt:v1";
+        let record = commit_image(&store, &source, target, Default::default()).unwrap();
+        let manifest_bytes = store.read_blob(&record.manifest).unwrap().unwrap();
+        let manifest = match manifest::classify(&manifest_bytes).unwrap() {
+            ImageDoc::Manifest(manifest) => manifest,
+            ImageDoc::Index(_) => panic!("commit should produce a single manifest"),
+        };
+        let layer = &manifest.layers[0];
+        let layer_path = store.blob_path(&layer.digest).unwrap();
+        let mut corrupted = std::fs::read(&layer_path).unwrap();
+        corrupted[0] ^= 0xff;
+        std::fs::write(&layer_path, &corrupted).unwrap();
+
+        let reference = Reference::parse(target).unwrap();
+        let mut client = RegistryClient::new();
+        let err = push_image(&store, &mut client, &reference).unwrap_err();
+        assert!(err.to_string().contains("digest does not match"));
+        let _ = std::fs::remove_dir_all(&source);
     }
 
     #[test]

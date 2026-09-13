@@ -160,9 +160,14 @@ fn copy_manifest_tree(
 }
 
 fn store_blob(store: &ImageStore, digest: &str) -> ZResult<Vec<u8>> {
+    if !store.verify_blob(digest)? {
+        return Err(crate::zerr!(
+            "blob {digest} is missing or corrupted in the image store"
+        ));
+    }
     store
         .read_blob(digest)?
-        .ok_or_else(|| crate::zerr!("blob {digest} is missing from the image store"))
+        .ok_or_else(|| crate::zerr!("blob {digest} disappeared from the image store"))
 }
 
 fn copy_blob_to_layout(layout: &Path, digest: &str, bytes: &[u8]) -> ZResult<()> {
@@ -328,9 +333,9 @@ fn import_manifest(
     source_index: Option<&str>,
 ) -> ZResult<ImageRecord> {
     for layer in &manifest.layers {
-        if !store.has_blob(&layer.digest) {
+        if !store.verify_blob(&layer.digest)? {
             return Err(crate::zerr!(
-                "archive is missing layer blob {} referenced by {}",
+                "archive is missing or has a corrupted layer blob {} referenced by {}",
                 layer.digest,
                 digest
             ));
@@ -551,7 +556,7 @@ mod tests {
             .remove_record("docker.io/example/multi-arm", Some("v1"), None)
             .unwrap();
         store.gc_with_protected(&BTreeSet::new()).unwrap();
-        assert!(!store.has_blob(&index_digest));
+        assert!(!store.verify_blob(&index_digest).unwrap());
 
         let imported = load_archive(&store, &archive_path).unwrap();
         assert_eq!(imported.len(), 1);
@@ -559,8 +564,8 @@ mod tests {
         // multi-architecture index for push/save.
         assert_eq!(imported[0].manifest, amd.manifest);
         assert_eq!(imported[0].index.as_deref(), Some(index_digest.as_str()));
-        assert!(store.has_blob(&amd.manifest));
-        assert!(store.has_blob(&arm.manifest));
+        assert!(store.verify_blob(&amd.manifest).unwrap());
+        assert!(store.verify_blob(&arm.manifest).unwrap());
         assert_eq!(
             fs::read(store.rootfs_path(&amd.config).unwrap().join("bin/marker")).unwrap(),
             b"amd64"

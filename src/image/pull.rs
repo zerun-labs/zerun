@@ -52,9 +52,15 @@ pub fn local_image(
             reference.canonical()
         ));
     }
+    if !store.verify_blob(&rec.config)? {
+        return Err(crate::zerr!(
+            "image {} config blob is missing or corrupted; re-pull it",
+            reference.canonical()
+        ));
+    }
     let cfg_bytes = store
         .read_blob(&rec.config)?
-        .ok_or_else(|| crate::zerr!("image {} config blob is missing", reference.canonical()))?;
+        .ok_or_else(|| crate::zerr!("image {} config blob disappeared", reference.canonical()))?;
     let config = ImageConfig::parse(&cfg_bytes)?;
     Ok(Some((rootfs, config)))
 }
@@ -252,7 +258,7 @@ fn ensure_blob(
     repo: &str,
     digest: &str,
 ) -> ZResult<()> {
-    if store.has_blob(digest) {
+    if store.verify_blob(digest)? {
         return Ok(());
     }
     let mut last_err: Option<ZError> = None;
@@ -628,8 +634,8 @@ mod tests {
             .unwrap();
         assert_eq!(record.manifest, manifest_digest);
         assert_eq!(record.index.as_deref(), Some(index_digest.as_str()));
-        assert!(store.has_blob(&index_digest));
-        assert!(store.has_blob(&manifest_digest));
+        assert!(store.verify_blob(&index_digest).unwrap());
+        assert!(store.verify_blob(&manifest_digest).unwrap());
         let _ = std::fs::remove_dir_all(&source);
         let _ = std::fs::remove_dir_all(store_root);
     }
