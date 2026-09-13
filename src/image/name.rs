@@ -5,7 +5,8 @@
 //!
 //! Defaults: registry `docker.io`, tag `latest`. A single-component repository on
 //! docker.io is interpreted as the `library` namespace (e.g. `alpine` ->
-//! `docker.io/library/alpine`).
+//! `docker.io/library/alpine`). Repository components, tags, registry ports, and
+//! digest syntax are validated before they are used to construct registry URLs.
 use crate::error::ZResult;
 
 const DEFAULT_REGISTRY: &str = "docker.io";
@@ -34,7 +35,7 @@ impl Reference {
                 if !is_digest(d) {
                     return Err(crate::zerr!("invalid digest in image reference: {d}"));
                 }
-                (&input[..pos], Some(d.to_string()))
+                (&input[..pos], Some(d.to_ascii_lowercase()))
             }
             None => (input, None),
         };
@@ -50,6 +51,7 @@ impl Reference {
             }
             _ => (DEFAULT_REGISTRY.to_string(), rest.to_string()),
         };
+        validate_registry(&registry)?;
 
         // Split tag from the repository tail (last ':' after the final '/').
         let (repo, tag) = split_tag(&repo_part)?;
@@ -96,7 +98,7 @@ fn looks_like_registry(component: &str) -> bool {
 
 /// Split `repository[:tag]`, where ':' may only appear after the last '/'.
 fn split_tag(repo_part: &str) -> ZResult<(String, Option<String>)> {
-    match repo_part.rfind(':') {
+    let (repo, tag) = match repo_part.rfind(':') {
         Some(pos) if !repo_part[pos + 1..].contains('/') => {
             let repo = &repo_part[..pos];
             let tag = &repo_part[pos + 1..];
@@ -106,10 +108,141 @@ fn split_tag(repo_part: &str) -> ZResult<(String, Option<String>)> {
             if tag.is_empty() {
                 return Err(crate::zerr!("image reference has empty tag"));
             }
-            Ok((repo.to_lowercase(), Some(tag.to_lowercase())))
+            (repo, Some(tag.to_ascii_lowercase()))
         }
-        _ => Ok((repo_part.to_lowercase(), None)),
+        _ => (repo_part, None),
+    };
+    validate_repository(repo)?;
+    if let Some(tag) = &tag {
+        validate_tag(tag)?;
     }
+    Ok((repo.to_ascii_lowercase(), tag))
+}
+
+fn validate_registry(registry: &str) -> ZResult<()> {
+    if registry.is_empty()
+        || registry
+            .chars()
+            .any(|c| c.is_ascii_control() || c.is_ascii_whitespace())
+        || registry.contains(['/', '?', '#', '@', '\\'])
+    {
+        return Err(crate::zerr!(
+            "invalid registry in image reference: {registry}"
+        ));
+    }
+
+    if registry.starts_with('[') {
+        let Some(close) = registry.find(']') else {
+            return Err(crate::zerr!(
+                "invalid registry in image reference: {registry}"
+            ));
+        };
+        if close == 1
+            || registry[close + 1..]
+                .chars()
+                .any(|c| c != ':' && !c.is_ascii_digit())
+        {
+            return Err(crate::zerr!(
+                "invalid registry in image reference: {registry}"
+            ));
+        }
+        if let Some(port) = registry.get(close + 1..).and_then(|s| s.strip_prefix(':')) {
+            validate_port(port, registry)?;
+        }
+        return Ok(());
+    }
+
+    if registry.starts_with(':') || registry.matches(':').count() > 1 {
+        return Err(crate::zerr!(
+            "invalid registry in image reference: {registry}"
+        ));
+    }
+    if let Some((host, port)) = registry.rsplit_once(':') {
+        if host.is_empty() {
+            return Err(crate::zerr!(
+                "invalid registry in image reference: {registry}"
+            ));
+        }
+        validate_port(port, registry)?;
+    }
+    Ok(())
+}
+
+fn validate_port(port: &str, registry: &str) -> ZResult<()> {
+    let value = port
+        .parse::<u16>()
+        .map_err(|_| crate::zerr!("invalid registry port in image reference: {registry}"))?;
+    if value == 0 {
+        return Err(crate::zerr!(
+            "invalid registry port in image reference: {registry}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_repository(repository: &str) -> ZResult<()> {
+    if repository.is_empty() || repository.len() > 255 {
+        return Err(crate::zerr!(
+            "invalid repository in image reference: {repository}"
+        ));
+    }
+    for component in repository.split('/') {
+        if !valid_repository_component(component) {
+            return Err(crate::zerr!(
+                "invalid repository component in image reference: {component}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn valid_repository_component(component: &str) -> bool {
+    let bytes = component.as_bytes();
+    if bytes.is_empty() || !is_repo_alphanumeric(bytes[0]) {
+        return false;
+    }
+    let mut index = 0;
+    while index < bytes.len() {
+        while index < bytes.len() && is_repo_alphanumeric(bytes[index]) {
+            index += 1;
+        }
+        if index == bytes.len() {
+            return true;
+        }
+        match bytes[index] {
+            b'.' => index += 1,
+            b'_' if bytes.get(index + 1) == Some(&b'_') => index += 2,
+            b'_' => index += 1,
+            b'-' => {
+                while index < bytes.len() && bytes[index] == b'-' {
+                    index += 1;
+                }
+            }
+            _ => return false,
+        }
+        if index == bytes.len() || !is_repo_alphanumeric(bytes[index]) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_repo_alphanumeric(byte: u8) -> bool {
+    byte.is_ascii_lowercase() || byte.is_ascii_digit()
+}
+
+fn validate_tag(tag: &str) -> ZResult<()> {
+    let bytes = tag.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 128
+        || !(bytes[0].is_ascii_alphanumeric() || bytes[0] == b'_')
+        || !bytes[1..]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+    {
+        return Err(crate::zerr!("invalid tag in image reference: {tag}"));
+    }
+    Ok(())
 }
 
 fn is_digest(d: &str) -> bool {
@@ -178,5 +311,35 @@ mod tests {
         assert!(Reference::parse("").is_err());
         assert!(Reference::parse("repo:").is_err());
         assert!(Reference::parse(":tag").is_err());
+        for input in [
+            "registry/",
+            "repo//name",
+            "/repo",
+            "repo/name?query",
+            "repo/name tag",
+            "repo:name!",
+            "example.com:abc/repo",
+            "example.com:65536/repo",
+        ] {
+            assert!(Reference::parse(input).is_err(), "accepted invalid {input}");
+        }
+    }
+
+    #[test]
+    fn validates_repository_components_and_tags() {
+        assert!(Reference::parse("org/a__b-c:v1.2-rc_1").is_ok());
+        for input in ["org/a..b", "org/a___b", "org/.hidden", "org/a-"] {
+            assert!(Reference::parse(input).is_err(), "accepted invalid {input}");
+        }
+    }
+
+    #[test]
+    fn canonicalizes_digest_hex_case() {
+        let r =
+            p("busybox@sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(
+            r.digest.as_deref(),
+            Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
     }
 }
