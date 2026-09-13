@@ -193,6 +193,9 @@ pub struct ContainerState {
     pub image: String,
     /// Host-side PID of the container's PID 1 while running.
     pub pid: Option<i32>,
+    /// `/proc/<pid>/stat` starttime in clock ticks, used to detect PID reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_start_time: Option<u64>,
     pub status: Status,
     /// True while the detached container's cgroup freezer is active.
     #[serde(default)]
@@ -320,16 +323,21 @@ impl ContainerState {
         }
     }
 
-    /// True when the recorded PID is still alive on the host.
+    /// True when the recorded PID is still alive on the host and, for new
+    /// records, is the same process that was originally started. Older state
+    /// files without `pid_start_time` retain the historical kill(2)-only
+    /// fallback for backward compatibility.
     pub fn pid_alive(&self) -> bool {
-        match self.pid {
-            Some(pid) if pid > 0 => {
-                let alive = unsafe { libc::kill(pid, 0) } == 0;
-                let denied = std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-                alive || denied
-            }
-            _ => false,
+        let Some(pid) = self.pid.filter(|pid| *pid > 0) else {
+            return false;
+        };
+        let alive = unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        if !alive {
+            return false;
         }
+        self.pid_start_time
+            .is_none_or(|expected| crate::procinfo::process_start_time(pid) == Some(expected))
     }
 }
 
@@ -512,6 +520,52 @@ mod tests {
     }
 
     #[test]
+    fn pid_start_time_prevents_pid_reuse_false_positive() {
+        let mut state = ContainerState {
+            version: 1,
+            id: "pid-check".to_string(),
+            name: None,
+            image: "alpine".to_string(),
+            pid: Some(std::process::id() as i32),
+            pid_start_time: crate::procinfo::process_start_time(std::process::id() as i32),
+            status: Status::Running,
+            paused: false,
+            exit_code: None,
+            created: now_rfc3339(),
+            started: Some(now_rfc3339()),
+            finished: None,
+            rootless: false,
+            net: "none".to_string(),
+            ports: vec![],
+            port_protocols: None,
+            port_ips: None,
+            ip: None,
+            cmd: vec![],
+            env: vec![],
+            cwd: None,
+            user: None,
+            capabilities: None,
+            seccomp: None,
+            log: String::new(),
+            log_max_size: None,
+            log_max_file: None,
+            lower: None,
+            rootfs: String::new(),
+            overlay: None,
+            tmpfs_upper: false,
+            labels: BTreeMap::new(),
+            launch_args: None,
+            table: None,
+            veth: None,
+            cgroup: None,
+            metrics: None,
+        };
+        assert!(state.pid_alive());
+        state.pid_start_time = state.pid_start_time.map(|start| start.saturating_add(1));
+        assert!(!state.pid_alive());
+    }
+
+    #[test]
     fn container_name_validation() {
         assert!(valid_name("web"));
         assert!(valid_name("a1._-x"));
@@ -533,6 +587,7 @@ mod tests {
             name: Some("web".to_string()),
             image: "alpine:latest".to_string(),
             pid: None,
+            pid_start_time: None,
             status: Status::Exited,
             paused: false,
             exit_code: Some(0),

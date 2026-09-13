@@ -66,6 +66,24 @@ fn bad_link(text: &str) -> io::Error {
     )
 }
 
+/// Read the kernel starttime for a process from `/proc/<pid>/stat`.
+///
+/// The value is the number of clock ticks after boot (stat field 22). It is
+/// stable for one process lifetime and changes when the kernel reuses a PID,
+/// making it suitable for validating persisted lifecycle records.
+pub fn process_start_time(pid: i32) -> Option<u64> {
+    if pid <= 0 {
+        return None;
+    }
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    start_time_from_stat(&stat)
+}
+
+fn start_time_from_stat(stat: &str) -> Option<u64> {
+    // stat field 22, after pid and the parenthesized comm field.
+    stat_fields(stat)?.get(19)?.parse().ok()
+}
+
 /// Snapshot one process from /proc; `None` when it vanished mid-read.
 fn read_process(pid: i32) -> Option<ProcessInfo> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -169,6 +187,13 @@ mod tests {
         assert_eq!(fields[11], "7"); // utime
         assert_eq!(fields[12], "3"); // stime
         assert!(stat_fields("no parens here").is_none());
+    }
+
+    #[test]
+    fn stat_start_time_uses_field_twenty_two() {
+        let stat = "1454 (my pro(g) v2) S 1300 1454 1300 34816 1454 4194304 1 0 0 0 7 3 0 0 20 0 1 0 987654 30 900 1";
+        assert_eq!(start_time_from_stat(stat), Some(987654));
+        assert_eq!(start_time_from_stat("1454 (cmd) S"), None);
     }
 
     #[test]

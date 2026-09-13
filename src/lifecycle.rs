@@ -71,6 +71,7 @@ pub fn run_detached(
             st.status = Status::Running;
             st.paused = false;
             st.pid = Some(info.pid);
+            st.pid_start_time = info.pid_start_time;
             st.started = Some(state::now_rfc3339());
             st.ip = info.ip;
             st.table = info.table.clone();

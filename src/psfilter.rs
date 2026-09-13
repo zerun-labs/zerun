@@ -118,6 +118,7 @@ mod tests {
             name: Some("web".to_string()),
             image: "alpine:latest".to_string(),
             pid: None,
+            pid_start_time: None,
             status,
             paused: false,
             exit_code,

@@ -105,6 +105,8 @@ extern "C" fn forward_to_child(sig: libc::c_int) {
 /// What the parent knows once the container workload has exec'd.
 pub struct StartedInfo {
     pub pid: i32,
+    /// `/proc/<pid>/stat` starttime, used to detect PID reuse in persisted state.
+    pub pid_start_time: Option<u64>,
     /// Bridge IP of the container (net == bridge).
     pub ip: Option<std::net::Ipv4Addr>,
     /// Egress-NAT nft table name (crash reconcile).
@@ -320,6 +322,7 @@ where
     // persists "running" state and releases the `run -d` CLI here.
     let started = StartedInfo {
         pid,
+        pid_start_time: crate::procinfo::process_start_time(pid),
         ip: spec.bridge_ip,
         table: host_net
             .as_ref()

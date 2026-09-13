@@ -274,6 +274,7 @@ mod tests {
             name: name.map(String::from),
             image: "alpine".to_string(),
             pid: None,
+            pid_start_time: None,
             status,
             paused: false,
             exit_code: exit,

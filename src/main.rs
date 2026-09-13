@@ -1302,6 +1302,7 @@ fn run_detached(
         name: info.name.clone(),
         image: image_desc.to_string(),
         pid: None,
+        pid_start_time: None,
         status: state::Status::Created,
         paused: false,
         exit_code: None,
@@ -1336,6 +1337,7 @@ fn run_detached(
     });
     st.status = state::Status::Created;
     st.pid = None;
+    st.pid_start_time = None;
     st.paused = false;
     st.exit_code = None;
     st.started = None;
@@ -3433,7 +3435,7 @@ fn kill_one(store: &Store, target: &str, signal: libc::c_int) -> Result<String, 
     }
     // Give a terminating signal a brief chance to take effect, without making
     // control signals such as STOP/CONT feel like `stop`.
-    if wait_pid_gone(pid, Duration::from_millis(500)) {
+    if wait_pid_gone(&st, Duration::from_millis(500)) {
         lifecycle::settle_exit(store, &st.id);
     }
     Ok(name)
@@ -3533,11 +3535,11 @@ fn stop_one(store: &Store, target: &str, timeout_secs: u64) -> Result<String, St
     unsafe {
         libc::kill(pid, libc::SIGTERM);
     }
-    if !wait_pid_gone(pid, Duration::from_secs(timeout_secs)) {
+    if !wait_pid_gone(&st, Duration::from_secs(timeout_secs)) {
         unsafe {
             libc::kill(pid, libc::SIGKILL);
         }
-        wait_pid_gone(pid, Duration::from_secs(5));
+        wait_pid_gone(&st, Duration::from_secs(5));
     }
     lifecycle::settle_exit(store, &st.id);
     Ok(name)
@@ -3854,11 +3856,11 @@ fn rm_one(store: &Store, target: &str, force: bool) -> Result<String, String> {
         }
         thaw_paused_container(&mut st)?;
         if let Some(pid) = st.pid.filter(|p| *p > 0) {
-            if pid_alive(pid) {
+            if st.pid_alive() {
                 unsafe {
                     libc::kill(pid, libc::SIGKILL);
                 }
-                wait_pid_gone(pid, Duration::from_secs(5));
+                wait_pid_gone(&st, Duration::from_secs(5));
             }
         }
         // Let the reaper record the exit (or reconcile when it is gone), so the
@@ -5544,23 +5546,15 @@ fn push_row(out: &mut String, cells: &[String], w: &[usize]) {
     out.push('\n');
 }
 
-fn pid_alive(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    let r = unsafe { libc::kill(pid, 0) };
-    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-fn wait_pid_gone(pid: i32, timeout: Duration) -> bool {
+fn wait_pid_gone(state: &state::ContainerState, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if !pid_alive(pid) {
+        if !state.pid_alive() {
             return true;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    !pid_alive(pid)
+    !state.pid_alive()
 }
 
 /// `console.log` stores timestamps at capture time. Docker-style default
