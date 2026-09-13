@@ -74,6 +74,46 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release
 
+  smoke:
+    name: rootful runtime smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build test binary
+        run: cargo build --locked
+
+      - name: Install static BusyBox
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y busybox-static
+
+      - name: Run isolated rootfs smoke test
+        run: |
+          set +e
+          rootfs="$RUNNER_TEMP/zerun-smoke-rootfs"
+          data="$RUNNER_TEMP/zerun-smoke-data"
+          runtime="$RUNNER_TEMP/zerun-smoke-runtime"
+          mkdir -p "$rootfs/bin" "$data" "$runtime"
+          install -m 0755 /usr/bin/busybox "$rootfs/bin/busybox"
+          ln -s busybox "$rootfs/bin/sh"
+
+          sudo env \
+            ZERUN_DATA_ROOT="$data" \
+            ZERUN_RUNTIME_ROOT="$runtime" \
+            target/debug/zerun run --rootfs "$rootfs" --net none --init -- \
+            /bin/sh -c 'printf "zerun-smoke-ok\n"; exit 23' >"$RUNNER_TEMP/zerun-smoke.log" 2>&1
+          status=$?
+          set -e
+
+          cat "$RUNNER_TEMP/zerun-smoke.log"
+          test "$status" -eq 23
+          grep -Fx zerun-smoke-ok "$RUNNER_TEMP/zerun-smoke.log"
+
   musl:
     name: static build (x86_64 musl)
     runs-on: ubuntu-24.04
