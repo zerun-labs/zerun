@@ -293,6 +293,11 @@ impl ContainerState {
 
     /// Load the state of one container id (exact match).
     pub fn load(store: &Store, id: &str) -> Option<ContainerState> {
+        // `load` is also reached by CLI arguments through `resolve`; never
+        // allow an arbitrary path component to escape `containers/`.
+        if !valid_id(id) {
+            return None;
+        }
         let p = Self::path(store, id);
         let text = std::fs::read_to_string(&p).ok()?;
         serde_json::from_str(&text).ok()
@@ -405,6 +410,13 @@ pub fn valid_name(name: &str) -> bool {
         && bytes[1..]
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// Container IDs are generated as hexadecimal strings. Restricting exact
+/// state-file lookup to this alphabet prevents `../` and absolute-path input
+/// from turning a lifecycle command into an arbitrary file read.
+fn valid_id(id: &str) -> bool {
+    (1..=64).contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Resolve a user-supplied container argument (`<id>`/`<id-prefix>`/`<name>`)
@@ -563,6 +575,28 @@ mod tests {
         assert!(state.pid_alive());
         state.pid_start_time = state.pid_start_time.map(|start| start.saturating_add(1));
         assert!(!state.pid_alive());
+    }
+
+    #[test]
+    fn exact_state_lookup_rejects_path_traversal() {
+        assert!(valid_id("0123456789abcdef"));
+        assert!(valid_id(&"a".repeat(64)));
+        assert!(!valid_id(""));
+        assert!(!valid_id("../outside"));
+        assert!(!valid_id("/absolute"));
+        assert!(!valid_id(&"f".repeat(65)));
+
+        let root = std::env::temp_dir().join(format!(
+            "zerun-state-path-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.join("data"), root.join("run"));
+        store.ensure_dirs().unwrap();
+        assert!(ContainerState::load(&store, "../state").is_none());
+        assert!(ContainerState::load(&store, "/tmp/state").is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
