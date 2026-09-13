@@ -3177,15 +3177,14 @@ fn cmd_wait(args: &[String]) -> i32 {
             return 1;
         }
     };
+    // `wait` reports the workload exit code as data. A non-zero workload exit
+    // is not a failure of the wait operation itself; this matches Docker's
+    // `docker wait` behavior and lets scripts distinguish lookup errors from
+    // the container's own status using the printed value.
     let mut failed = false;
     for target in targets {
         match wait_one(&store, &target) {
-            Ok(code) => {
-                println!("{code}");
-                if code != 0 {
-                    failed = true;
-                }
-            }
+            Ok(code) => println!("{code}"),
             Err(e) => {
                 eprintln!("zerun wait: {e}");
                 failed = true;

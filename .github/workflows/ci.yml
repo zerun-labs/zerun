@@ -114,6 +114,46 @@ jobs:
           test "$status" -eq 23
           grep -Fx zerun-smoke-ok "$RUNNER_TEMP/zerun-smoke.log"
 
+      - name: Run detached lifecycle smoke test
+        run: |
+          set -euo pipefail
+          rootfs="$RUNNER_TEMP/zerun-detached-rootfs"
+          data="$RUNNER_TEMP/zerun-detached-data"
+          runtime="$RUNNER_TEMP/zerun-detached-runtime"
+          mkdir -p "$rootfs/bin" "$data" "$runtime"
+          install -m 0755 /usr/bin/busybox "$rootfs/bin/busybox"
+          ln -s busybox "$rootfs/bin/sh"
+
+          zerun=(sudo env
+            ZERUN_DATA_ROOT="$data"
+            ZERUN_RUNTIME_ROOT="$runtime"
+            target/debug/zerun)
+
+          id="$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
+            --init --name ci-detached -- /bin/sh -c \
+            'printf "detached-smoke\n"; sleep 30')"
+          test -n "$id"
+          test "$("${zerun[@]}" ps -q)" = "$id"
+          for attempt in $(seq 1 50); do
+            output="$("${zerun[@]}" logs "$id" 2>/dev/null || true)"
+            if grep -Fx detached-smoke <<<"$output"; then
+              break
+            fi
+            if test "$attempt" -eq 50; then
+              echo "detached workload output was not captured" >&2
+              exit 1
+            fi
+            sleep 0.1
+          done
+
+          "${zerun[@]}" kill --signal TERM "$id"
+          wait_output="$("${zerun[@]}" wait "$id")"
+          test "$wait_output" = 143
+          "${zerun[@]}" ps -a -q | grep -Fx "$id"
+
+          "${zerun[@]}" rm "$id"
+          test -z "$("${zerun[@]}" ps -a -q)"
+
   cross:
     name: static build (${{ matrix.target }})
     runs-on: ubuntu-24.04
