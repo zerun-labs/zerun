@@ -49,7 +49,7 @@ use seccomp::SeccompMode;
 use state::ContainerState;
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -727,12 +727,29 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
     }
 
     // One id per run: used for the HOSTNAME default, the per-run overlay, the
-    // nft table/veth names and the lifecycle state directory. Resuming keeps
-    // the original identity and writable layer.
+    // nft table/veth names and the lifecycle state directory. New runs reserve
+    // their directory atomically before any filesystem or kernel resources are
+    // created; resuming keeps the original identity and writable layer.
+    let id_reservation = if resume.is_some() {
+        None
+    } else {
+        match ContainerIdReservation::reserve(&store) {
+            Ok(reservation) => Some(reservation),
+            Err(e) => {
+                eprintln!("zerun run: {e}");
+                return 1;
+            }
+        }
+    };
     let id = resume
         .as_ref()
         .map(|st| st.id.clone())
-        .unwrap_or_else(|| new_container_id(&store));
+        .or_else(|| {
+            id_reservation
+                .as_ref()
+                .map(|reservation| reservation.id.clone())
+        })
+        .expect("new runs reserve an id and resumed runs have one");
 
     // Resolve the container root filesystem and, for image mode, the process
     // environment / working directory / default command from the OCI config.
@@ -1007,6 +1024,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
                 resume,
                 report_id,
             },
+            id_reservation,
         );
     }
 
@@ -1236,6 +1254,7 @@ fn run_detached(
     image_desc: &str,
     state_rootfs: &str,
     mut info: DetachedInfo,
+    mut id_reservation: Option<ContainerIdReservation>,
 ) -> i32 {
     use std::os::unix::io::AsRawFd;
 
@@ -1405,6 +1424,11 @@ fn run_detached(
             }
         }
         return 1;
+    }
+    // The state record now owns the directory. Disarm the reservation before
+    // forking so neither the CLI nor the reaper removes it on scope exit.
+    if let Some(reservation) = id_reservation.as_mut() {
+        reservation.commit();
     }
 
     let (started_r, started_w) = match syscalls::pipe2_cloexec() {
@@ -5700,15 +5724,54 @@ fn short_id() -> String {
     format!("{:012x}", mixed & 0xffff_ffff_ffff)
 }
 
-/// Allocate an ID that is not already represented in the runtime store. The
-/// directory check avoids reusing known IDs; kernel-provided entropy makes a
-/// collision between concurrent callers negligibly likely, including when the
-/// fallback path is unavailable.
-fn new_container_id(store: &Store) -> String {
-    loop {
-        let id = short_id();
-        if !ContainerState::dir(store, &id).exists() {
-            return id;
+/// Reservation for a newly allocated container id.
+///
+/// The runtime directory itself is the reservation token: `mkdir` is atomic,
+/// so concurrent CLI processes cannot select the same id between a check and
+/// the later state/overlay creation. The reservation is removed automatically
+/// when setup fails before the detached state record takes ownership.
+struct ContainerIdReservation {
+    id: String,
+    path: PathBuf,
+    committed: bool,
+}
+
+impl ContainerIdReservation {
+    fn reserve(store: &Store) -> Result<Self, String> {
+        let containers = store.run_root().join("containers");
+        loop {
+            let id = short_id();
+            let path = containers.join(&id);
+            let result = std::fs::DirBuilder::new().mode(0o700).create(&path);
+            match result {
+                Ok(()) => {
+                    return Ok(Self {
+                        id,
+                        path,
+                        committed: false,
+                    })
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "reserve container id in {}: {error}",
+                        containers.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Hand ownership of the reserved directory to the state record.
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ContainerIdReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            fsutil::remove_dir_all_quiet(&self.path);
         }
     }
 }
@@ -6522,12 +6585,57 @@ mod tests {
         let store = Store::at(root.join("data"), root.join("run"));
         store.ensure_dirs().unwrap();
 
-        let first = new_container_id(&store);
-        assert_eq!(first.len(), 12);
-        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        std::fs::create_dir_all(ContainerState::dir(&store, &first)).unwrap();
-        let second = new_container_id(&store);
-        assert_ne!(first, second);
+        let first = ContainerIdReservation::reserve(&store).unwrap();
+        assert_eq!(first.id.len(), 12);
+        assert!(first.id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(first.path.is_dir());
+        let first_id = first.id.clone();
+        drop(first);
+        assert!(!ContainerState::dir(&store, &first_id).exists());
+
+        let second = ContainerIdReservation::reserve(&store).unwrap();
+        assert_ne!(first_id, second.id);
+        let second_dir = second.path.clone();
+        let mut second = second;
+        second.commit();
+        drop(second);
+        assert!(second_dir.is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_id_reservations_are_unique() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let root = std::env::temp_dir().join(format!(
+            "zerun-id-concurrent-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Arc::new(Store::at(root.join("data"), root.join("run")));
+        store.ensure_dirs().unwrap();
+
+        let mut workers = Vec::new();
+        for _ in 0..16 {
+            let store = Arc::clone(&store);
+            workers.push(thread::spawn(move || {
+                let mut reservation = ContainerIdReservation::reserve(&store).unwrap();
+                let id = reservation.id.clone();
+                reservation.commit();
+                id
+            }));
+        }
+        let ids: Vec<String> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        let unique: BTreeSet<_> = ids.iter().cloned().collect();
+        assert_eq!(unique.len(), ids.len());
+        assert!(ids
+            .iter()
+            .all(|id| ContainerState::dir(&store, id).is_dir()));
         let _ = std::fs::remove_dir_all(&root);
     }
 
