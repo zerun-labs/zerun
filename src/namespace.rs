@@ -127,14 +127,17 @@ pub struct RunExit {
 
 /// Full run path without a lifecycle hook. Returns the workload exit code.
 pub fn run_container(spec: RunSpec) -> ZResult<i32> {
-    Ok(run_container_with_report(spec, |_| {})?.code)
+    Ok(run_container_with_report(spec, |_| Ok(()))?.code)
 }
 
 /// Full run path, returning both the exit code and final cgroup metrics. This
-/// is the implementation used by `run_container` and `run_container_with_hook`.
+/// is the implementation used by `run_container` and the detached lifecycle
+/// reaper. The callback runs after the workload has entered its final exec
+/// path; a callback failure therefore aborts the workload and performs the
+/// same host-side cleanup as any other setup failure.
 pub fn run_container_with_report<F>(spec: RunSpec, on_started: F) -> ZResult<RunExit>
 where
-    F: FnOnce(&StartedInfo),
+    F: FnOnce(&StartedInfo) -> ZResult<()>,
 {
     trace::init();
     trace::mark("parent:begin");
@@ -330,7 +333,22 @@ where
         veth: host_net.as_ref().map(|n| n.veth_name().to_string()),
         cgroup: cg.as_ref().map(|c| c.path().display().to_string()),
     };
-    on_started(&started);
+    if let Err(error) = on_started(&started) {
+        // The callback owns persistence of the detached "running" record. Do
+        // not let a failed state write turn into a falsely successful `run -d`:
+        // the workload is already running at this point, so terminate it and
+        // release every host-side resource before returning the error.
+        let _ = syscalls::kill(pid, libc::SIGKILL);
+        let _ = wait_pid(pid);
+        if let Some(net) = &host_net {
+            crate::network::teardown_host_side(net);
+        }
+        if let Some(cg) = cg {
+            cg.cleanup();
+        }
+        release_bridge_ip(&spec);
+        return Err(error);
+    }
 
     let pty_pump = pty_pair.as_mut().map(|pair| {
         // Transfer master ownership to the pump for the wait period. It either

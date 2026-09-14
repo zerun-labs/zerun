@@ -31,6 +31,29 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// Persist the running transition before the detached CLI is released.
+///
+/// This is deliberately a fallible boundary: a detached run without a durable
+/// running record cannot be safely addressed by later lifecycle commands.
+fn persist_started_state(
+    store: &Store,
+    id: &str,
+    info: &crate::namespace::StartedInfo,
+) -> ZResult<()> {
+    let mut st = ContainerState::load(store, id)
+        .ok_or_else(|| crate::zerr!("detached state for {id} disappeared before start"))?;
+    st.status = Status::Running;
+    st.paused = false;
+    st.pid = Some(info.pid);
+    st.pid_start_time = info.pid_start_time;
+    st.started = Some(state::now_rfc3339());
+    st.ip = info.ip;
+    st.table = info.table.clone();
+    st.veth = info.veth.clone();
+    st.cgroup = info.cgroup.clone();
+    st.save()
+}
+
 /// The detached reaper's whole job. Runs the container, persists state, then
 /// returns the exit code (the caller `_exit`s). `overlay_dir` (if any) is
 /// removed after the container exits; `started_w` carries the "0" (started)
@@ -67,21 +90,11 @@ pub fn run_detached(
     let result = run_container_with_report(spec, |info| {
         // Persist "running" before releasing the CLI so `ze ps` never sees a
         // Created-but-alive container.
-        if let Some(mut st) = ContainerState::load(&store, &id) {
-            st.status = Status::Running;
-            st.paused = false;
-            st.pid = Some(info.pid);
-            st.pid_start_time = info.pid_start_time;
-            st.started = Some(state::now_rfc3339());
-            st.ip = info.ip;
-            st.table = info.table.clone();
-            st.veth = info.veth.clone();
-            st.cgroup = info.cgroup.clone();
-            let _ = st.save();
-        }
+        persist_started_state(&store, &id, info)?;
         signaled = true;
         let _ = write_all(started_w, b"0\n");
         let _ = unsafe { libc::close(started_w) };
+        Ok(())
     });
     let mut metrics = None;
     match result {
@@ -661,5 +674,28 @@ mod attach_tests {
         assert!(!bytes.windows(b"second".len()).any(|w| w == b"second"));
         assert!(!dir.join("console.log.1").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn started_state_persistence_requires_the_record_to_exist() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-started-state-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.join("data"), root.join("run"));
+        store.ensure_dirs().unwrap();
+        let info = crate::namespace::StartedInfo {
+            pid: std::process::id() as i32,
+            pid_start_time: None,
+            ip: None,
+            table: None,
+            veth: None,
+            cgroup: None,
+        };
+        let error = persist_started_state(&store, "0123456789ab", &info).unwrap_err();
+        assert!(error.to_string().contains("disappeared before start"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
