@@ -58,8 +58,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run all tests
-        run: cargo test --locked --all-targets
+      - name: Run all tests (serialized)
+        # Several parser/store tests intentionally exercise process-wide
+        # environment overrides; serialize them to avoid test-thread races.
+        run: cargo test --locked --all-targets -- --test-threads=1
 
   build:
     name: release build (gnu)
@@ -153,6 +155,44 @@ jobs:
 
           "${zerun[@]}" rm "$id"
           test -z "$("${zerun[@]}" ps -a -q)"
+
+  rootful-integration:
+    name: rootful integration (overlay/cgroup/bridge/ports)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build test binary
+        run: cargo build --locked
+
+      - name: Install runtime fixtures
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y busybox-static curl
+
+      - name: Prepare static BusyBox rootfs
+        run: |
+          set -euo pipefail
+          rootfs="$RUNNER_TEMP/zerun-integration-rootfs"
+          mkdir -p "$rootfs/bin" "$rootfs/srv"
+          install -m 0755 /usr/bin/busybox "$rootfs/bin/busybox"
+          for applet in sh httpd ip grep; do
+            ln -s busybox "$rootfs/bin/$applet"
+          done
+          printf 'zerun-port-ok\n' >"$rootfs/srv/index.html"
+
+      - name: Run rootful integration checks
+        run: |
+          set -euo pipefail
+          ./ci/rootful-runtime.sh \
+            target/debug/zerun \
+            "$RUNNER_TEMP/zerun-integration-rootfs" \
+            "$RUNNER_TEMP/zerun-integration-data" \
+            "$RUNNER_TEMP/zerun-integration-runtime"
 
   cross:
     name: static build (${{ matrix.target }})
