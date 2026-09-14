@@ -1230,6 +1230,21 @@ fn start_one(store: &Store, target: &str) -> Result<String, String> {
     Ok(name)
 }
 
+/// Remove resources prepared for a new detached run when the reaper cannot
+/// even be forked. Once the state record is written, the id reservation has
+/// been committed, so dropping it alone is no longer enough to avoid a stale
+/// `Created` container.
+fn cleanup_failed_detached_start(
+    store: &Store,
+    container_fs: Option<&store::ContainerFs>,
+    state_dir: &Path,
+) {
+    if let Some(fs) = container_fs {
+        store.cleanup_container_fs(fs);
+    }
+    fsutil::remove_dir_all_quiet(state_dir);
+}
+
 /// `zerun run -d` / `zerun start`: fork a per-container reaper, optionally
 /// print the container id once the workload is up, and exit. Everything
 /// container-shaped (clone, wait, host-resource teardown, overlay cleanup,
@@ -1279,9 +1294,7 @@ fn run_detached(
     if let Err(e) = fsutil::mkdir_p_mode(&sdir, 0o700) {
         eprintln!("zerun: {e}");
         if !resuming {
-            if let Some(fs) = container_fs.as_ref() {
-                store.cleanup_container_fs(fs);
-            }
+            cleanup_failed_detached_start(store, container_fs.as_ref(), &sdir);
         }
         return 1;
     }
@@ -1308,9 +1321,7 @@ fn run_detached(
         Err(e) => {
             eprintln!("zerun: open {}: {e}", log_path.display());
             if !resuming {
-                if let Some(fs) = container_fs.as_ref() {
-                    store.cleanup_container_fs(fs);
-                }
+                cleanup_failed_detached_start(store, container_fs.as_ref(), &sdir);
             }
             return 1;
         }
@@ -1318,9 +1329,7 @@ fn run_detached(
     if let Err(e) = log_fd.set_permissions(std::fs::Permissions::from_mode(0o600)) {
         eprintln!("zerun: secure {}: {e}", log_path.display());
         if !resuming {
-            if let Some(fs) = container_fs.as_ref() {
-                store.cleanup_container_fs(fs);
-            }
+            cleanup_failed_detached_start(store, container_fs.as_ref(), &sdir);
         }
         return 1;
     }
@@ -1419,9 +1428,7 @@ fn run_detached(
     if let Err(e) = st.save() {
         eprintln!("zerun: {e}");
         if !resuming {
-            if let Some(fs) = container_fs.as_ref() {
-                store.cleanup_container_fs(fs);
-            }
+            cleanup_failed_detached_start(store, container_fs.as_ref(), &sdir);
         }
         return 1;
     }
@@ -1436,9 +1443,7 @@ fn run_detached(
         Err(e) => {
             eprintln!("zerun: {e}");
             if !resuming {
-                if let Some(fs) = container_fs.as_ref() {
-                    store.cleanup_container_fs(fs);
-                }
+                cleanup_failed_detached_start(store, container_fs.as_ref(), &sdir);
             }
             return 1;
         }
@@ -1450,10 +1455,10 @@ fn run_detached(
     match unsafe { libc::fork() } {
         -1 => {
             eprintln!("zerun: fork: {}", std::io::Error::last_os_error());
+            syscalls::close(started_r);
+            syscalls::close(started_w);
             if !resuming {
-                if let Some(fs) = container_fs.as_ref() {
-                    store.cleanup_container_fs(fs);
-                }
+                cleanup_failed_detached_start(store, container_fs.as_ref(), &sdir);
             }
             1
         }
