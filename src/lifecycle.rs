@@ -51,7 +51,7 @@ fn persist_started_state(
     st.table = info.table.clone();
     st.veth = info.veth.clone();
     st.cgroup = info.cgroup.clone();
-    st.save()
+    st.save(store)
 }
 
 /// The detached reaper's whole job. Runs the container, persists state, then
@@ -133,7 +133,7 @@ pub fn run_detached(
         st.paused = false;
         st.exit_code = Some(code);
         st.finished = Some(state::now_rfc3339());
-        let _ = st.save();
+        let _ = st.save(&store);
     }
     // Keep the writable layer for an addressable exited container so it can be
     // committed or inspected later. `--rm` retains Docker's remove-on-exit
@@ -494,7 +494,7 @@ pub fn settle_exit(store: &Store, id: &str) {
     }
     if let Some(mut st) = ContainerState::load(store, id) {
         if st.status == Status::Running && !st.pid_alive() && reconcile_stale(store, &mut st) {
-            let _ = st.save();
+            let _ = st.save(store);
         }
     }
 }

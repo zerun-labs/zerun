@@ -303,9 +303,16 @@ impl ContainerState {
         serde_json::from_str(&text).ok()
     }
 
-    /// Atomically persist this record.
-    pub fn save(&self) -> ZResult<()> {
-        let p = Self::path_from(&self.log);
+    /// Atomically persist this record at the store-owned canonical path.
+    ///
+    /// Never derive the state-file location from the serialized `log` field:
+    /// that field is persisted metadata and must not be able to redirect a
+    /// lifecycle update outside `<run>/containers/<id>/`.
+    pub fn save(&self, store: &Store) -> ZResult<()> {
+        if !valid_id(&self.id) {
+            return Err(crate::zerr!("invalid container id '{}'", self.id));
+        }
+        let p = Self::path(store, &self.id);
         let json = serde_json::to_vec_pretty(self)
             .map_err(|e| crate::zerr!("serialize state for {}: {e}", self.id))?;
         let parent = p
@@ -315,13 +322,6 @@ impl ContainerState {
         // contain credentials or other operator-provided secrets.
         fsutil::mkdir_p_mode(parent, 0o700)?;
         fsutil::atomic_write_mode(&p, &json, 0o600)
-    }
-
-    fn path_from(log_path: &str) -> PathBuf {
-        Path::new(log_path)
-            .parent()
-            .map(|d| d.join("state.json"))
-            .unwrap_or_else(|| PathBuf::from("state.json"))
     }
 
     /// Human-friendly status line for `ze ps`.
@@ -660,17 +660,23 @@ mod tests {
             cgroup: None,
             metrics: None,
         };
-        // The struct has no store; save requires a writable dir under the log path.
-        // Exercise save/load round trip through a temp dir instead.
         let dir = std::env::temp_dir().join(format!("zerun-state-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        a.log = dir.join("console.log").display().to_string();
-        a.save().unwrap();
-        assert!(dir.join("state.json").exists());
-        let loaded: ContainerState = serde_json::from_str::<ContainerState>(
-            &std::fs::read_to_string(dir.join("state.json")).unwrap(),
-        )
-        .unwrap();
+        let store = Store::at(dir.join("data"), dir.join("run"));
+        store.ensure_dirs().unwrap();
+        // A persisted log path must not be able to redirect state writes.
+        a.log = dir
+            .join("attacker")
+            .join("console.log")
+            .display()
+            .to_string();
+        a.save(&store).unwrap();
+        let state_path = ContainerState::path(&store, &a.id);
+        assert!(state_path.exists());
+        assert!(!dir.join("attacker/state.json").exists());
+        let loaded: ContainerState =
+            serde_json::from_str::<ContainerState>(&std::fs::read_to_string(state_path).unwrap())
+                .unwrap();
         assert_eq!(loaded.id, a.id);
         assert_eq!(loaded.name.as_deref(), Some("web"));
         assert_eq!(loaded.status, Status::Exited);
@@ -680,6 +686,9 @@ mod tests {
         );
         assert_eq!(loaded.seccomp, Some(SeccompMode::Unconfined));
         assert_eq!(loaded.lower.as_deref(), Some("/tmp/lower"));
+        let mut invalid = a.clone();
+        invalid.id = "../outside".to_string();
+        assert!(invalid.save(&store).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
