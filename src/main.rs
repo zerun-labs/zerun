@@ -1301,7 +1301,7 @@ fn run_detached(
     let log_path = info
         .resume
         .as_ref()
-        .map(|st| PathBuf::from(&st.log))
+        .map(|st| st.log_path_for(store))
         .unwrap_or_else(|| sdir.join("console.log"));
     let log_fd = match if resuming {
         std::fs::OpenOptions::new()
@@ -3988,7 +3988,7 @@ fn cmd_logs(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let path = PathBuf::from(&st.log);
+    let path = st.log_path_for(&store);
     let max_files = st.log_max_file.unwrap_or(1).clamp(1, logs::MAX_FILES);
     let (bytes, cursor, read_any) = match read_log_snapshot(&path, max_files) {
         Ok(snapshot) => snapshot,
@@ -5404,13 +5404,7 @@ fn cmd_attach(args: &[String]) -> i32 {
         );
         return 1;
     }
-    let Some(sock_path) = Path::new(&st.log)
-        .parent()
-        .map(|dir| dir.join("attach.sock"))
-    else {
-        eprintln!("zerun attach: container {} has no state directory", st.id);
-        return 1;
-    };
+    let sock_path = st.log_path_for(&store).with_file_name("attach.sock");
     if !sock_path.exists() {
         eprintln!(
             "zerun attach: container {} has no attach socket (older reaper or not running)",

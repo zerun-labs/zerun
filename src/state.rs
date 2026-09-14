@@ -236,7 +236,9 @@ pub struct ContainerState {
     /// default deny-by-default profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seccomp: Option<SeccompMode>,
-    /// Absolute path to this container's console.log.
+    /// Canonical absolute path to this container's console.log. Runtime code
+    /// derives it from the store and id; the field remains serialized for
+    /// compatibility and inspection.
     pub log: String,
     /// Rotation threshold for the console log. None = legacy/unbounded record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -300,7 +302,25 @@ impl ContainerState {
         }
         let p = Self::path(store, id);
         let text = std::fs::read_to_string(&p).ok()?;
-        serde_json::from_str(&text).ok()
+        let mut state: ContainerState = serde_json::from_str(&text).ok()?;
+        // The directory name is the record's identity. Reject a JSON payload
+        // that claims another id rather than letting metadata redirect later
+        // lifecycle operations.
+        if state.id != id || !valid_id(&state.id) {
+            return None;
+        }
+        state.log = Self::log_path(store, id).display().to_string();
+        Some(state)
+    }
+
+    /// Canonical console-log path for this container.
+    pub fn log_path(store: &Store, id: &str) -> PathBuf {
+        Self::dir(store, id).join("console.log")
+    }
+
+    /// Canonical console-log path for this loaded record.
+    pub fn log_path_for(&self, store: &Store) -> PathBuf {
+        Self::log_path(store, &self.id)
     }
 
     /// Atomically persist this record at the store-owned canonical path.
@@ -313,7 +333,9 @@ impl ContainerState {
             return Err(crate::zerr!("invalid container id '{}'", self.id));
         }
         let p = Self::path(store, &self.id);
-        let json = serde_json::to_vec_pretty(self)
+        let mut persisted = self.clone();
+        persisted.log = Self::log_path_for(self, store).display().to_string();
+        let json = serde_json::to_vec_pretty(&persisted)
             .map_err(|e| crate::zerr!("serialize state for {}: {e}", self.id))?;
         let parent = p
             .parent()
@@ -675,7 +697,7 @@ mod tests {
         assert!(state_path.exists());
         assert!(!dir.join("attacker/state.json").exists());
         let loaded: ContainerState =
-            serde_json::from_str::<ContainerState>(&std::fs::read_to_string(state_path).unwrap())
+            serde_json::from_str::<ContainerState>(&std::fs::read_to_string(&state_path).unwrap())
                 .unwrap();
         assert_eq!(loaded.id, a.id);
         assert_eq!(loaded.name.as_deref(), Some("web"));
@@ -686,6 +708,19 @@ mod tests {
         );
         assert_eq!(loaded.seccomp, Some(SeccompMode::Unconfined));
         assert_eq!(loaded.lower.as_deref(), Some("/tmp/lower"));
+        assert_eq!(
+            loaded.log,
+            ContainerState::log_path_for(&loaded, &store)
+                .display()
+                .to_string()
+        );
+
+        let mut tampered: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        tampered["id"] = serde_json::Value::String("fedcba987654".to_string());
+        std::fs::write(&state_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        assert!(ContainerState::load(&store, &a.id).is_none());
+
         let mut invalid = a.clone();
         invalid.id = "../outside".to_string();
         assert!(invalid.save(&store).is_err());
