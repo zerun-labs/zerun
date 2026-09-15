@@ -1930,19 +1930,13 @@ fn cmd_commit(args: &[String]) -> i32 {
                     }
                 }
             }
-            None => {
-                if st.lower.is_some() {
-                    match lower_rootfs(&store, &st) {
-                        Ok(path) => path,
-                        Err(e) => {
-                            eprintln!("zerun commit: {e}");
-                            return 1;
-                        }
-                    }
-                } else {
-                    std::path::PathBuf::from(&st.rootfs)
+            None => match lower_rootfs(&store, &st) {
+                Ok(path) => path,
+                Err(e) => {
+                    eprintln!("zerun commit: {e}");
+                    return 1;
                 }
-            }
+            },
         }
     };
     if !rootfs.is_dir() {
@@ -5065,7 +5059,20 @@ fn lower_rootfs(store: &Store, st: &state::ContainerState) -> Result<PathBuf, St
         return resumable_lower_rootfs(store, st);
     }
     if let Some(path) = st.image.strip_prefix("rootfs:") {
-        return Ok(PathBuf::from(path));
+        let rootfs = PathBuf::from(path);
+        let canonical = std::fs::canonicalize(&rootfs).map_err(|e| {
+            format!(
+                "recorded rootfs is unavailable at {}: {e}",
+                rootfs.display()
+            )
+        })?;
+        if !canonical.is_dir() {
+            return Err(format!(
+                "recorded rootfs is not a directory: {}",
+                rootfs.display()
+            ));
+        }
+        return Ok(canonical);
     }
     let reference = Reference::parse(&st.image).map_err(|e| e.to_string())?;
     let imgstore = image::store::ImageStore::open(store).map_err(|e| e.to_string())?;
