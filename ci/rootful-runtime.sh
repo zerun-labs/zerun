@@ -34,6 +34,17 @@ else
     "$binary")
 fi
 
+# Always clean up detached records, including when a later integration check
+# fails. The runner is ephemeral, but explicit cleanup makes repeated local
+# runs deterministic and prevents leaked bridge listeners between checks.
+cleanup_ids=()
+cleanup() {
+  for id in "${cleanup_ids[@]}"; do
+    "${zerun[@]}" rm -f "$id" >/dev/null 2>&1 || true
+  done
+}
+trap cleanup EXIT
+
 # A foreground run proves the namespace/pivot/init path and preserves the
 # workload exit code instead of treating a non-zero workload status as a
 # runtime failure.
@@ -63,11 +74,45 @@ grep -Fx cgroup-ok <<<"$cgroup_output" >/dev/null
 # the persisted cgroup-path validation used by the exec joiner.
 exec_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
   --pids 32 --init -- /bin/sh -c 'sleep 30')
+cleanup_ids+=("$exec_id")
 exec_output=$("${zerun[@]}" exec "$exec_id" /bin/sh -c 'printf "exec-ok\\n"')
 grep -Fx exec-ok <<<"$exec_output" >/dev/null
 "${zerun[@]}" kill --signal TERM "$exec_id" >/dev/null
 "${zerun[@]}" wait "$exec_id" >/dev/null
 "${zerun[@]}" rm "$exec_id" >/dev/null
+
+# Restart must stop and resume the same detached record rather than creating a
+# replacement container. Verify that the workload ran once before and once
+# after the restart while retaining the same id and log history.
+restart_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
+  --init -- /bin/sh -c 'printf "restart-ok\\n"; sleep 30')
+cleanup_ids+=("$restart_id")
+for attempt in $(seq 1 50); do
+  restart_logs=$("${zerun[@]}" logs "$restart_id" 2>/dev/null || true)
+  if (( $(grep -c 'restart-ok' <<<"$restart_logs" || true) >= 1 )); then
+    break
+  fi
+  if (( attempt == 50 )); then
+    echo "restart workload did not start" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+"${zerun[@]}" restart --time 1 "$restart_id" >/dev/null
+for attempt in $(seq 1 50); do
+  restart_logs=$("${zerun[@]}" logs "$restart_id" 2>/dev/null || true)
+  if (( $(grep -c 'restart-ok' <<<"$restart_logs" || true) >= 2 )); then
+    break
+  fi
+  if (( attempt == 50 )); then
+    echo "restart workload did not run twice" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+"${zerun[@]}" kill --signal TERM "$restart_id" >/dev/null
+"${zerun[@]}" wait "$restart_id" >/dev/null
+"${zerun[@]}" rm "$restart_id" >/dev/null
 
 # Bridge setup covers the netlink/veth path and the child-side eth0 setup.
 bridge_output=$("${zerun[@]}" run --rootfs "$rootfs" --net bridge --no-overlay --init -- \
@@ -77,16 +122,9 @@ grep -Fx bridge-ok <<<"$bridge_output" >/dev/null
 # Published ports use Zerun's built-in proxy. Keep the workload in a
 # detached container so the listener remains alive while curl connects.
 port=18080
-container_id=""
-cleanup() {
-  if [[ -n $container_id ]]; then
-    "${zerun[@]}" rm -f "$container_id" >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT
-
 container_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net bridge \
   -p "$port:8080" --init -- /bin/httpd -f -p 8080 -h /srv)
+cleanup_ids+=("$container_id")
 [[ "$container_id" =~ ^[0-9a-f]{12}$ ]]
 
 for attempt in $(seq 1 50); do
@@ -105,6 +143,5 @@ done
 wait_status=$("${zerun[@]}" wait "$container_id")
 test "$wait_status" -ne 0
 "${zerun[@]}" rm "$container_id" >/dev/null
-container_id=""
 
 echo "rootful-runtime-ok"
