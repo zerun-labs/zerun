@@ -62,6 +62,27 @@ pub fn run(
         return Err(crate::zerr!("exec: a command is required"));
     }
 
+    // Validate the persisted cgroup path before entering the container's
+    // namespaces. The state file is owner-only in normal operation, but it is
+    // still untrusted input: after setns(cgroup), resolving a path supplied by
+    // the record could make `exec` write its worker PID into an unrelated
+    // host cgroup. Keep the store-derived path and pass that authority down.
+    let cgroup_path = match state.cgroup.as_deref() {
+        Some(persisted) => {
+            let expected = crate::cgroup::CgroupV2::container_path(&state.id)?;
+            if Path::new(persisted) != expected {
+                return Err(crate::zerr!(
+                    "refusing cgroup path {} for container {} (expected {})",
+                    persisted,
+                    state.id,
+                    expected.display()
+                ));
+            }
+            Some(expected)
+        }
+        None => None,
+    };
+
     // The joiner C.
     match unsafe { libc::fork() } {
         -1 => Err(crate::zerr!(
@@ -69,7 +90,7 @@ pub fn run(
             std::io::Error::last_os_error()
         )),
         0 => {
-            let code = joiner(state, pid, env_extra, workdir, argv);
+            let code = joiner(state, pid, cgroup_path.as_deref(), env_extra, workdir, argv);
             unsafe { libc::_exit(code) }
         }
         parent => {
@@ -106,6 +127,7 @@ pub fn run(
 fn joiner(
     state: &ContainerState,
     container_pid: i32,
+    cgroup_path: Option<&Path>,
     env_extra: &[String],
     workdir: Option<&str>,
     argv: &[String],
@@ -160,7 +182,7 @@ fn joiner(
             1
         }
         0 => {
-            let code = worker(state, env_extra, workdir, argv);
+            let code = worker(state, cgroup_path, env_extra, workdir, argv);
             unsafe { libc::_exit(code) }
         }
         d => {
@@ -204,15 +226,16 @@ fn setns(f: &File, what: &str) -> Result<(), String> {
 /// The in-container worker: cgroup join, cwd, env, hardening, exec.
 fn worker(
     state: &ContainerState,
+    cgroup_path: Option<&Path>,
     env_extra: &[String],
     workdir: Option<&str>,
     argv: &[String],
 ) -> i32 {
     // Best effort: join the container's cgroup so the exec'd process is
     // accounted against the same memory/cpu/pids limits.
-    if let Some(cg) = &state.cgroup {
-        let procs = Path::new(cg).join("cgroup.procs");
-        let _ = std::fs::write(&procs, std::process::id().to_string());
+    if let Some(cg) = cgroup_path {
+        let procs = cg.join("cgroup.procs");
+        let _ = std::fs::write(procs, std::process::id().to_string());
     }
 
     // Working directory: `-w` wins, then the container's recorded cwd, then
