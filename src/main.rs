@@ -3644,11 +3644,11 @@ fn cmd_system_df(args: &[String]) -> i32 {
             let _ = st.save(&store);
         }
         let state_dir = state::ContainerState::dir(&store, &st.id);
-        let overlay_bytes = st
-            .overlay
-            .as_deref()
-            .map(|dir| fsutil::dir_size(Path::new(dir)))
-            .unwrap_or(0);
+        let overlay_bytes = if st.overlay.is_some() {
+            fsutil::dir_size(&store.container_overlay_dir(&st.id))
+        } else {
+            0
+        };
         let bytes = fsutil::dir_size(&state_dir) + overlay_bytes;
         containers += 1;
         container_bytes += bytes;
