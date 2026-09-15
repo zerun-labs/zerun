@@ -59,6 +59,16 @@ cgroup_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
   --pids 32 --init -- /bin/sh -c 'printf "cgroup-ok\\n"')
 grep -Fx cgroup-ok <<<"$cgroup_output" >/dev/null
 
+# Detached exec must join the same cgroup as the container. This also guards
+# the persisted cgroup-path validation used by the exec joiner.
+exec_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
+  --pids 32 --init -- /bin/sh -c 'sleep 30')
+exec_output=$("${zerun[@]}" exec "$exec_id" /bin/sh -c 'printf "exec-ok\\n"')
+grep -Fx exec-ok <<<"$exec_output" >/dev/null
+"${zerun[@]}" kill --signal TERM "$exec_id" >/dev/null
+"${zerun[@]}" wait "$exec_id" >/dev/null
+"${zerun[@]}" rm "$exec_id" >/dev/null
+
 # Bridge setup covers the netlink/veth path and the child-side eth0 setup.
 bridge_output=$("${zerun[@]}" run --rootfs "$rootfs" --net bridge --no-overlay --init -- \
   /bin/sh -c '/bin/busybox ip -4 addr show dev eth0 | /bin/busybox grep -q "10.88.0."; printf "bridge-ok\\n"')
