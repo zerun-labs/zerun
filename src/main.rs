@@ -633,12 +633,13 @@ fn protected_image_rootfs_excluding(
     store: &Store,
     excluded_ids: &BTreeSet<String>,
 ) -> BTreeSet<PathBuf> {
-    let rootfs_root = imgstore.rootfs_dir();
+    let rootfs_root =
+        std::fs::canonicalize(imgstore.rootfs_dir()).unwrap_or_else(|_| imgstore.rootfs_dir());
     state::list(store)
         .into_iter()
         .filter(|st| !excluded_ids.contains(&st.id))
         .filter_map(|st| st.lower)
-        .map(PathBuf::from)
+        .filter_map(|path| std::fs::canonicalize(path).ok())
         .filter(|path| path.starts_with(&rootfs_root))
         .collect()
 }
@@ -761,24 +762,13 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
             );
             return 1;
         }
-        let lower = match st.lower.as_deref() {
-            Some(lower) => PathBuf::from(lower),
-            None => {
-                eprintln!(
-                    "zerun start: container {} predates resumable state and cannot be started",
-                    display_name(st)
-                );
+        let lower = match resumable_lower_rootfs(&store, st) {
+            Ok(lower) => lower,
+            Err(e) => {
+                eprintln!("zerun start: {e}");
                 return 1;
             }
         };
-        if !lower.is_dir() {
-            eprintln!(
-                "zerun start: container {} lower rootfs is missing at {}",
-                display_name(st),
-                lower.display()
-            );
-            return 1;
-        }
         let env = match state_environment(st) {
             Ok(env) => env,
             Err(e) => {
@@ -946,7 +936,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         .map(|st| st.image.clone())
         .unwrap_or_else(|| match &a.image {
             Some(i) => i.clone(),
-            None => format!("rootfs:{}", rootfs.display()),
+            None => format!("rootfs:{}", fsutil::canonical_or_self(&rootfs).display()),
         });
 
     // Where the container actually pivoted to (overlay merged dir or the raw
@@ -1123,7 +1113,8 @@ fn set_container_paused(store: &Store, target: &str, paused: bool) -> Result<Str
              cgroup v2 hierarchy"
         )
     })?;
-    let cgroup = cgroup::CgroupV2::open(Path::new(cgroup_path)).map_err(|e| e.to_string())?;
+    let cgroup = cgroup::CgroupV2::open_for_container(&st.id, Path::new(cgroup_path))
+        .map_err(|e| e.to_string())?;
     cgroup.freeze(paused).map_err(|e| e.to_string())?;
     st.paused = paused;
     if let Err(error) = st.save(store) {
@@ -1915,9 +1906,9 @@ fn cmd_commit(args: &[String]) -> i32 {
             }
         }
     } else {
-        match st.overlay.as_deref() {
-            Some(overlay) => {
-                let upper = std::path::Path::new(overlay).join("upper");
+        match st.overlay.as_ref() {
+            Some(_) => {
+                let upper = store.container_overlay_dir(&st.id).join("upper");
                 let staging = imgstore.blob_tmp("commit-source");
                 match lower_rootfs(&store, &st) {
                     Ok(lower) => {
@@ -1939,7 +1930,19 @@ fn cmd_commit(args: &[String]) -> i32 {
                     }
                 }
             }
-            None => std::path::PathBuf::from(&st.rootfs),
+            None => {
+                if st.lower.is_some() {
+                    match lower_rootfs(&store, &st) {
+                        Ok(path) => path,
+                        Err(e) => {
+                            eprintln!("zerun commit: {e}");
+                            return 1;
+                        }
+                    }
+                } else {
+                    std::path::PathBuf::from(&st.rootfs)
+                }
+            }
         }
     };
     if !rootfs.is_dir() {
@@ -3520,7 +3523,8 @@ fn thaw_paused_container(store: &Store, st: &mut state::ContainerState) -> Resul
         .cgroup
         .as_deref()
         .ok_or_else(|| format!("container {name} is marked paused but has no lifecycle cgroup"))?;
-    let cgroup = cgroup::CgroupV2::open(Path::new(cgroup_path)).map_err(|e| e.to_string())?;
+    let cgroup = cgroup::CgroupV2::open_for_container(&st.id, Path::new(cgroup_path))
+        .map_err(|e| e.to_string())?;
     cgroup.freeze(false).map_err(|e| e.to_string())?;
     st.paused = false;
     if let Err(error) = st.save(store) {
@@ -3898,8 +3902,8 @@ fn rm_one(store: &Store, target: &str, force: bool) -> Result<String, String> {
     // Reclaim any host-side leftovers still recorded (best effort; the normal
     // reaper path already cleaned them up).
     lifecycle::reclaim_resources(store, &st);
-    if let Some(ov) = &st.overlay {
-        fsutil::remove_dir_all_quiet(Path::new(ov));
+    if st.overlay.is_some() {
+        fsutil::remove_dir_all_quiet(&store.container_overlay_dir(&st.id));
     }
     let dir = state::ContainerState::dir(store, &st.id);
     fsutil::remove_dir_all_quiet(&dir);
@@ -4212,6 +4216,7 @@ fn cmd_stats(args: &[String]) -> i32 {
                 st.cgroup
                     .as_deref()
                     .map(Path::new)
+                    .filter(|p| cgroup::CgroupV2::is_container_path(&st.id, p))
                     .filter(|p| p.exists())
                     .map(state::ContainerMetrics::from_cgroup_path)
                     .or(st.metrics)
@@ -4452,7 +4457,7 @@ fn cmd_update(args: &[String]) -> i32 {
         );
         return 1;
     };
-    let cg = match cgroup::CgroupV2::open(Path::new(&cgroup_path)) {
+    let cg = match cgroup::CgroupV2::open_for_container(&st.id, Path::new(&cgroup_path)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("zerun update: {e}");
@@ -4943,14 +4948,14 @@ fn cmd_diff(args: &[String]) -> i32 {
         eprintln!("zerun diff: a --tmpfs-upper container has no persisted writable layer");
         return 1;
     }
-    let Some(overlay) = &st.overlay else {
+    if st.overlay.is_none() {
         eprintln!(
             "zerun diff: container {} has no writable overlay",
             display_name(&st)
         );
         return 1;
-    };
-    let upper = Path::new(overlay).join("upper");
+    }
+    let upper = store.container_overlay_dir(&st.id).join("upper");
     let lower = match lower_rootfs(&store, &st) {
         Ok(path) => path,
         Err(e) => {
@@ -4974,7 +4979,91 @@ fn cmd_diff(args: &[String]) -> i32 {
 /// Locate the base rootfs for a container. This intentionally shares commit's
 /// semantics: image-backed containers use the materialized lower root, while
 /// legacy `rootfs:` containers use their original unpacked directory.
+/// Resolve the persisted lower rootfs for a resumable container.
+///
+/// The lower path is captured at creation time so retained containers continue
+/// to work after their image tag is removed. For image-backed records, accept
+/// only a materialized directory below the current image store root; a
+/// tampered state path must never become an arbitrary host path passed to
+/// overlayfs or pivot_root. Legacy `rootfs:` records intentionally retain
+/// their operator-supplied external rootfs semantics.
+fn resumable_lower_rootfs(store: &Store, st: &state::ContainerState) -> Result<PathBuf, String> {
+    let Some(raw) = st.lower.as_deref() else {
+        return Err(format!(
+            "container {} predates resumable state and cannot be started",
+            display_name(st)
+        ));
+    };
+    let lower = PathBuf::from(raw);
+    if !lower.is_absolute() {
+        return Err(format!(
+            "container {} has a non-absolute lower rootfs path",
+            display_name(st)
+        ));
+    }
+    if let Some(raw_image_root) = st.image.strip_prefix("rootfs:") {
+        let recorded_root = PathBuf::from(raw_image_root);
+        let canonical_recorded = std::fs::canonicalize(&recorded_root).map_err(|e| {
+            format!(
+                "container {} recorded rootfs is unavailable at {}: {e}",
+                display_name(st),
+                recorded_root.display()
+            )
+        })?;
+        let canonical_lower = std::fs::canonicalize(&lower).map_err(|e| {
+            format!(
+                "container {} lower rootfs is missing at {}: {e}",
+                display_name(st),
+                lower.display()
+            )
+        })?;
+        if canonical_recorded != canonical_lower {
+            return Err(format!(
+                "container {} lower rootfs does not match its recorded rootfs",
+                display_name(st)
+            ));
+        }
+        return Ok(canonical_lower);
+    }
+
+    let imgstore = image::store::ImageStore::open(store).map_err(|e| e.to_string())?;
+    let rootfs_root = std::fs::canonicalize(imgstore.rootfs_dir()).map_err(|e| {
+        format!(
+            "container {} image rootfs store is unavailable: {e}",
+            display_name(st)
+        )
+    })?;
+    let canonical_lower = std::fs::canonicalize(&lower).map_err(|e| {
+        format!(
+            "container {} lower rootfs is missing at {}: {e}",
+            display_name(st),
+            lower.display()
+        )
+    })?;
+    if !canonical_lower.starts_with(&rootfs_root) {
+        return Err(format!(
+            "container {} lower rootfs {} is outside the image store",
+            display_name(st),
+            lower.display()
+        ));
+    }
+    if !canonical_lower.is_dir() {
+        return Err(format!(
+            "container {} lower rootfs is not a directory: {}",
+            display_name(st),
+            lower.display()
+        ));
+    }
+    Ok(canonical_lower)
+}
+
+/// Locate the base rootfs for a container. Prefer the persisted materialized
+/// lower so `diff` and `commit` continue to work after image-tag garbage
+/// collection; older records without `lower` fall back to the local index.
 fn lower_rootfs(store: &Store, st: &state::ContainerState) -> Result<PathBuf, String> {
+    if st.lower.is_some() {
+        return resumable_lower_rootfs(store, st);
+    }
     if let Some(path) = st.image.strip_prefix("rootfs:") {
         return Ok(PathBuf::from(path));
     }

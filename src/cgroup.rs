@@ -55,12 +55,45 @@ pub struct CgroupV2 {
 }
 
 impl CgroupV2 {
+    /// Return the cgroup path owned by Zerun for one container id.
+    ///
+    /// Lifecycle state may be edited or corrupted independently of cgroupfs,
+    /// so callers must use this authority when opening or removing a cgroup
+    /// instead of trusting a serialized path.
+    pub fn container_path(id: &str) -> ZResult<PathBuf> {
+        validate_container_id(id)?;
+        Ok(detect_cgroup2_root()?.join("zerun").join(id))
+    }
+
+    /// Open a lifecycle cgroup only when its persisted path is exactly the
+    /// path Zerun derives for the same container id.
+    pub fn open_for_container(id: &str, persisted: &Path) -> ZResult<Self> {
+        let expected = Self::container_path(id)?;
+        if persisted != expected {
+            return Err(crate::zerr!(
+                "refusing cgroup path {} for container {} (expected {})",
+                persisted.display(),
+                id,
+                expected.display()
+            ));
+        }
+        Self::open(&expected)
+    }
+
+    /// Check whether a persisted path is the cgroup Zerun owns for `id`.
+    /// This is intentionally best effort: a missing cgroup hierarchy means
+    /// there is no safe path to inspect or remove.
+    pub fn is_container_path(id: &str, persisted: &Path) -> bool {
+        Self::container_path(id).is_ok_and(|expected| expected == persisted)
+    }
+
     /// Create the sub-hierarchy <cgroup2>/zerun/<id>.
     ///
     /// cgroups v2 requires every controller to be enabled in the parent's
     /// subtree_control before the leaf gets the corresponding control files, so
     /// the intermediate <cgroup2>/zerun level enables cpu/memory/pids on demand.
     pub fn create(id: &str, limits: &ResourceLimits) -> ZResult<Self> {
+        validate_container_id(id)?;
         if limits.memory.is_none() && limits.memory_swap.is_some_and(|swap| swap >= 0) {
             return Err(crate::zerr!(
                 "a finite memory-swap ceiling requires --memory"
@@ -400,6 +433,13 @@ pub fn parse_cpuset(value: &str) -> ZResult<String> {
     Ok(value.to_string())
 }
 
+fn validate_container_id(id: &str) -> ZResult<()> {
+    if !(1..=64).contains(&id.len()) || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(crate::zerr!("invalid container id '{id}' for cgroup"));
+    }
+    Ok(())
+}
+
 fn require_controller(parent: &Path, controller: &str) -> ZResult<()> {
     let available = fs::read_to_string(parent.join("cgroup.controllers"))
         .map_err(|e| crate::zerr!("read {}: {e}", parent.join("cgroup.controllers").display()))?;
@@ -653,6 +693,16 @@ mod tests {
         assert!(cpu_quota(0.0).is_err());
         assert!(cpu_quota(f64::NAN).is_err());
         assert!(cpu_quota(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn cgroup_container_paths_reject_untrusted_ids() {
+        assert!(CgroupV2::container_path("../outside").is_err());
+        assert!(CgroupV2::container_path("id/child").is_err());
+        assert!(!CgroupV2::is_container_path(
+            "../outside",
+            Path::new("/sys/fs/cgroup/zerun/../outside")
+        ));
     }
 
     #[test]

@@ -97,6 +97,16 @@ impl Store {
         self.data_root.join("volumes").join(name)
     }
 
+    /// Canonical per-container writable-layer directory.
+    ///
+    /// The persisted `overlay` field is compatibility metadata only. Runtime
+    /// cleanup and inspection must derive this path from the store and the
+    /// validated container id so a tampered state record cannot redirect a
+    /// filesystem operation elsewhere on the host.
+    pub fn container_overlay_dir(&self, id: &str) -> PathBuf {
+        self.data_root.join("overlays").join(id)
+    }
+
     /// Prepare a per-run writable container filesystem (overlay dirs).
     pub fn prepare_container_fs(
         &self,
@@ -104,7 +114,8 @@ impl Store {
         lower: &Path,
         tmpfs_upper: bool,
     ) -> ZResult<ContainerFs> {
-        let dir = self.data_root.join("overlays").join(id);
+        validate_container_id(id)?;
+        let dir = self.container_overlay_dir(id);
         let upper = dir.join("upper");
         let work = dir.join("work");
         let merged = dir.join("merged");
@@ -133,7 +144,8 @@ impl Store {
         lower: &Path,
         tmpfs_upper: bool,
     ) -> ZResult<ContainerFs> {
-        let dir = self.data_root.join("overlays").join(id);
+        validate_container_id(id)?;
+        let dir = self.container_overlay_dir(id);
         let upper = dir.join("upper");
         let work = dir.join("work");
         let merged = dir.join("merged");
@@ -200,6 +212,15 @@ fn xdg_runtime_dir() -> ZResult<PathBuf> {
     Ok(PathBuf::from(format!("/run/user/{uid}")))
 }
 
+fn validate_container_id(id: &str) -> ZResult<()> {
+    if !(1..=64).contains(&id.len()) || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(crate::zerr!(
+            "invalid container id '{id}' for overlay storage"
+        ));
+    }
+    Ok(())
+}
+
 fn absolute(p: &Path) -> ZResult<PathBuf> {
     if p.is_absolute() {
         Ok(p.to_path_buf())
@@ -223,6 +244,19 @@ mod tests {
         assert_eq!(s.run_root(), Path::new("/tmp/zerun-test-run"));
         std::env::remove_var("ZERUN_DATA_ROOT");
         std::env::remove_var("ZERUN_RUNTIME_ROOT");
+    }
+
+    #[test]
+    fn overlay_storage_rejects_untrusted_ids() {
+        let store = Store::at(
+            PathBuf::from("/tmp/zerun-store-data"),
+            PathBuf::from("/tmp/zerun-store-run"),
+        );
+        let lower = Path::new("/tmp/lower");
+        assert!(store
+            .prepare_container_fs("../outside", lower, false)
+            .is_err());
+        assert!(store.reopen_container_fs("id/child", lower, false).is_err());
     }
 
     #[test]

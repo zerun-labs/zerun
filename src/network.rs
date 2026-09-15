@@ -252,6 +252,11 @@ pub fn peer_name(id: &str) -> String {
 /// Shared nft table for all managed bridge containers (`table ip zerun-nat`).
 pub const SHARED_NAT_TABLE: &str = "zerun-nat";
 
+/// Name used by pre-shared-NAT state records. New records leave `table` empty.
+fn legacy_table_name(id: &str) -> String {
+    format!("zerun-{id}")
+}
+
 /// Deterministic container IPv4 address derived from the container id:
 /// 10.88.0.2 ..= 10.88.0.254 (FNV-1a over the id string).
 pub fn container_ip(id: &str) -> Ipv4Addr {
@@ -460,11 +465,25 @@ fn read_ifindex(name: &str) -> Option<u32> {
 /// Best-effort removal of a container's host-side leftovers by name. Used by
 /// normal teardown and by crash reconcile (`ze ps`, `ze rm -f`) where the
 /// reaper died before it could clean up.
-pub fn teardown_named(veth: &str, table: Option<&str>) {
+pub fn teardown_named(id: &str, veth: &str, table: Option<&str>) {
+    let expected_veth = veth_name(id);
+    if veth != expected_veth {
+        eprintln!(
+            "zerun: warn: refusing to remove unexpected veth {veth} for container {id} (expected {expected_veth})"
+        );
+        return;
+    }
     trace::mark("teardown:begin");
     if let Some(table) = table {
-        if let Ok(nft) = Nftables::new() {
-            nft.remove_table(table);
+        let expected_table = legacy_table_name(id);
+        if table == expected_table {
+            if let Ok(nft) = Nftables::new() {
+                nft.remove_table(table);
+            }
+        } else {
+            eprintln!(
+                "zerun: warn: refusing to remove unexpected nft table {table} for container {id}"
+            );
         }
     }
     trace::mark("teardown:nft");
@@ -502,6 +521,12 @@ fn enable_ip_forward() -> ZResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_resource_names_are_container_specific() {
+        assert_eq!(legacy_table_name("0123456789ab"), "zerun-0123456789ab");
+        assert_ne!(legacy_table_name("0123456789ab"), SHARED_NAT_TABLE);
+    }
 
     #[test]
     fn names_stay_within_ifnamelen() {

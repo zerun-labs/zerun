@@ -454,14 +454,22 @@ pub fn reconcile_stale(store: &Store, st: &mut ContainerState) -> bool {
     // the host rebooted. Best-effort reclaim of everything the reaper would
     // have torn down.
     if let Some(veth) = st.veth.as_deref() {
-        crate::network::teardown_named(veth, st.table.as_deref());
+        crate::network::teardown_named(&st.id, veth, st.table.as_deref());
     }
     if let Some(cg) = st.cgroup.as_deref() {
         let path = Path::new(cg);
-        if path.exists() {
-            st.metrics = Some(state::ContainerMetrics::from_cgroup_path(path));
+        if crate::cgroup::CgroupV2::is_container_path(&st.id, path) {
+            if path.exists() {
+                st.metrics = Some(state::ContainerMetrics::from_cgroup_path(path));
+            }
+            let _ = std::fs::remove_dir(path);
+        } else {
+            eprintln!(
+                "zerun: warn: refusing to reclaim unexpected cgroup path {} for container {}",
+                path.display(),
+                st.id
+            );
         }
-        let _ = std::fs::remove_dir(path);
     }
     if st.net == "bridge" {
         crate::network::release_ip(store.run_root(), &st.id);
@@ -503,7 +511,7 @@ pub fn settle_exit(store: &Store, id: &str) {
 /// (used by `rm` on records whose reaper did not clean up).
 pub fn reclaim_resources(store: &Store, st: &ContainerState) {
     if let Some(veth) = st.veth.as_deref() {
-        crate::network::teardown_named(veth, st.table.as_deref());
+        crate::network::teardown_named(&st.id, veth, st.table.as_deref());
     }
     if st.net == "bridge" {
         crate::network::release_ip(store.run_root(), &st.id);
