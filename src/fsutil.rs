@@ -65,6 +65,37 @@ fn set_mode(p: &Path, mode: u32) -> ZResult<()> {
 
 static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Own a temporary regular file until the caller deliberately transfers it
+/// to another owner (for example, by atomically renaming it into a store).
+///
+/// This guard is for paths created by the caller as temporary files. It never
+/// follows symlinks: cleanup only removes the directory entry itself.
+pub struct TempFileGuard(Option<PathBuf>);
+
+impl TempFileGuard {
+    /// Start owning `path`. The file need not exist yet; this also covers
+    /// failures that happen while creating or filling it.
+    pub fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    /// Transfer the path to the caller after it has been installed elsewhere.
+    /// The guard will no longer remove it on drop.
+    pub fn persist(mut self) -> PathBuf {
+        self.0
+            .take()
+            .expect("temporary file guard was already disarmed")
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 /// Atomic and durable file write using the process umask for the new file.
 #[allow(dead_code)] // used by the image store milestone
 pub fn atomic_write(path: &Path, data: &[u8]) -> ZResult<()> {
@@ -236,6 +267,37 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("missing"), dir.join("broken")).unwrap();
 
         assert_eq!(dir_size(&dir), 25);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn temp_file_guard_removes_uninstalled_file_and_can_be_disarmed() {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-temp-file-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let removed = dir.join("removed");
+        fs::write(&removed, b"temporary").unwrap();
+        {
+            let _guard = TempFileGuard::new(removed.clone());
+        }
+        assert!(!removed.exists());
+
+        let retained = dir.join("retained");
+        fs::write(&retained, b"installed").unwrap();
+        let returned = {
+            let guard = TempFileGuard::new(retained.clone());
+            guard.persist()
+        };
+        assert_eq!(returned, retained);
+        assert_eq!(fs::read(&retained).unwrap(), b"installed");
         let _ = fs::remove_dir_all(&dir);
     }
 

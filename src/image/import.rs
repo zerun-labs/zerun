@@ -12,18 +12,7 @@ use crate::image::commit::{commit_image, CommitOptions};
 use crate::image::pull::open_layer_reader;
 use crate::image::store::ImageStore;
 use std::io::Write;
-use std::path::{Path, PathBuf};
-
-/// Remove a temporary file even when import fails before its normal cleanup
-/// path. The guard is intentionally limited to files created by this module;
-/// a caller-supplied source path is never placed under its ownership.
-struct TemporaryFile(PathBuf);
-
-impl Drop for TemporaryFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+use std::path::Path;
 
 /// Metadata recorded on the imported image config.
 #[derive(Debug, Clone, Default)]
@@ -46,7 +35,7 @@ pub fn import_image(
         let tmp = store.blob_tmp("import-stdin");
         fsutil::remove_dir_all_quiet(&tmp);
         let _ = std::fs::remove_file(&tmp);
-        let spool_guard = TemporaryFile(tmp.clone());
+        let spool_guard = fsutil::TempFileGuard::new(tmp.clone());
         let mut file =
             std::fs::File::create(&tmp).map_err(|e| crate::zerr!("create import spool: {e}"))?;
         std::io::copy(&mut std::io::stdin().lock(), &mut file)
@@ -133,20 +122,6 @@ mod tests {
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::write(dir.join("bin/hello"), b"world").unwrap();
         dir
-    }
-
-    #[test]
-    fn temporary_import_spool_is_removed_on_drop() {
-        let path = std::env::temp_dir().join(format!(
-            "zerun-import-spool-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::write(&path, b"temporary").unwrap();
-        {
-            let _guard = TemporaryFile(path.clone());
-        }
-        assert!(!path.exists());
     }
 
     #[test]

@@ -14,7 +14,7 @@ use crate::image::store::{sha256_hex, ImageStore};
 use crate::image::unpack::unpack_layer;
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 
@@ -345,7 +345,12 @@ pub(crate) fn materialize_local_rootfs(
         };
         let diff_ok = format!("sha256:{actual_diff}") == expected_diff;
         if diff_ok {
-            let res = unpack_layer(File::open(&spool)?, &tmp, &hint);
+            // Clean the spool before every read, including the open failure
+            // path; otherwise a corrupted or interrupted pull can leave one
+            // temporary file per layer behind.
+            let res = File::open(&spool)
+                .map_err(|e| crate::zerr!("open layer spool {}: {e}", spool.display()))
+                .and_then(|file| unpack_layer(file, &tmp, &hint));
             fsutil::remove_dir_all_quiet(&spool);
             if let Err(e) = res {
                 fsutil::remove_dir_all_quiet(&tmp);
@@ -385,7 +390,16 @@ fn spool_layer(
     let spool = store
         .rootfs_dir()
         .join(format!(".tmp-spool-{}-{index}", std::process::id()));
-    let mut out = File::create(&spool).map_err(|e| crate::zerr!("create layer spool: {e}"))?;
+    // A previous process may have died after creating this deterministic path.
+    // Remove that entry first, then use create_new so a symlink or concurrent
+    // writer can never redirect the decompressed layer elsewhere.
+    fsutil::remove_dir_all_quiet(&spool);
+    let spool_guard = fsutil::TempFileGuard::new(spool.clone());
+    let mut out = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&spool)
+        .map_err(|e| crate::zerr!("create layer spool: {e}"))?;
     let mut hasher = Sha256::new();
     let mut reader = reader;
     let mut buf = [0u8; 64 * 1024];
@@ -400,7 +414,7 @@ fn spool_layer(
         out.write_all(&buf[..n])
             .map_err(|e| crate::zerr!("write layer spool: {e}"))?;
     }
-    Ok((spool, hex(&hasher.finalize())))
+    Ok((spool_guard.persist(), hex(&hasher.finalize())))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -656,6 +670,36 @@ mod tests {
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         out
+    }
+
+    #[test]
+    fn failed_layer_spooling_cleans_stale_output() {
+        let store = test_store();
+        let bad_blob = temp_blob("bad-layer", &[0x1f, 0x8b, 0x08]);
+        let spool = store
+            .rootfs_dir()
+            .join(format!(".tmp-spool-{}-91", std::process::id()));
+        let outside = std::env::temp_dir().join(format!(
+            "zerun-pull-outside-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&outside, b"must survive").unwrap();
+        std::os::unix::fs::symlink(&outside, &spool).unwrap();
+
+        let result = spool_layer(
+            &store,
+            &bad_blob,
+            "application/vnd.docker.image.rootfs.diff.tar.gzip",
+            91,
+        );
+        assert!(result.is_err());
+        assert!(!spool.exists());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"must survive");
+
+        let _ = std::fs::remove_file(&bad_blob);
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(store.rootfs_dir().parent().unwrap());
     }
 
     #[test]

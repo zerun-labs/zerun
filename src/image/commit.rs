@@ -20,16 +20,6 @@ use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-/// Remove a partially-written compressed layer when commit fails before the
-/// content-addressed blob can take ownership of it.
-struct TemporaryLayer(PathBuf);
-
-impl Drop for TemporaryLayer {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
 const MANIFEST_MEDIA_TYPE: &str = "application/vnd.docker.distribution.manifest.v2+json";
 const CONFIG_MEDIA_TYPE: &str = "application/vnd.docker.container.image.v1+json";
 const LAYER_MEDIA_TYPE: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
@@ -76,7 +66,7 @@ pub fn commit_image(
     let layer_tmp = store.blob_tmp("commit-layer");
     fsutil::remove_dir_all_quiet(&layer_tmp); // directory form if an old failure left it
     let _ = fs::remove_file(&layer_tmp);
-    let _layer_guard = TemporaryLayer(layer_tmp.clone());
+    let _layer_guard = fsutil::TempFileGuard::new(layer_tmp.clone());
     let (diff_id, _uncompressed_size) = create_layer(source_rootfs, &layer_tmp)?;
     let (layer_digest, layer_size) = store.install_blob_file(&layer_tmp)?;
 
@@ -364,21 +354,6 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn temporary_layer_removes_partial_file_on_drop() {
-        let path = std::env::temp_dir().join(format!(
-            "zerun-commit-layer-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        let _ = std::fs::remove_file(&path);
-        std::fs::write(&path, b"partial").unwrap();
-        {
-            let _guard = super::TemporaryLayer(path.clone());
-        }
-        assert!(!path.exists());
-    }
-
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
