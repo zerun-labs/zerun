@@ -197,11 +197,15 @@ fn worker(
     workdir: Option<&str>,
     argv: &[String],
 ) -> i32 {
-    // Best effort: join the container's cgroup so the exec'd process is
-    // accounted against the same memory/cpu/pids limits.
+    // Join the container's cgroup before exec so the child is accounted
+    // against the same memory/cpu/pids limits. If the persisted cgroup has
+    // disappeared or cannot be written, fail closed instead of running the
+    // command outside the container's resource policy.
     if let Some(cg) = cgroup_path {
-        let procs = cg.join("cgroup.procs");
-        let _ = std::fs::write(procs, std::process::id().to_string());
+        if let Err(error) = join_cgroup(cg, std::process::id()) {
+            eprintln!("zerun exec: join cgroup {}: {error}", cg.display());
+            return 1;
+        }
     }
 
     // Working directory: `-w` wins, then the container's recorded cwd, then
@@ -297,10 +301,49 @@ fn worker(
     1
 }
 
+fn join_cgroup(path: &Path, pid: u32) -> std::io::Result<()> {
+    std::fs::write(path.join("cgroup.procs"), pid.to_string())
+}
+
 fn upsert(env: &mut Vec<(String, String)>, key: &str, value: &str) {
     if let Some(slot) = env.iter_mut().find(|(k, _)| k == key) {
         slot.1 = value.to_string();
     } else {
         env.push((key.to_string(), value.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::join_cgroup;
+
+    #[test]
+    fn join_cgroup_writes_the_worker_pid() {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-exec-cgroup-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        join_cgroup(&dir, 1234).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("cgroup.procs")).unwrap(),
+            "1234"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn join_cgroup_reports_missing_cgroup_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-exec-missing-cgroup-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::write(&dir, b"not a directory").unwrap();
+        assert!(join_cgroup(&dir, 1234).is_err());
+        let _ = std::fs::remove_file(&dir);
     }
 }
