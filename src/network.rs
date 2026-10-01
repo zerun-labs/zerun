@@ -38,7 +38,7 @@ use crate::netlink::Netlink;
 use crate::nfnetlink::{NatConfig, Nftables};
 use crate::trace;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::thread;
@@ -132,7 +132,12 @@ impl PortProxy {
                 let thread_listener = listener
                     .try_clone()
                     .map_err(|e| crate::zerr!("clone listener for {host_label}:{host}: {e}"))?;
-                thread::spawn(move || accept_loop(thread_listener, container_ip, container));
+                thread::Builder::new()
+                    .name("zerun-port-tcp".to_string())
+                    .spawn(move || accept_loop(thread_listener, container_ip, container))
+                    .map_err(|e| {
+                        crate::zerr!("spawn TCP port proxy for {host_label}:{host}: {e}")
+                    })?;
                 Ok(PortProxy {
                     _listener: ProxyListener::Tcp(listener),
                 })
@@ -146,7 +151,12 @@ impl PortProxy {
                 let thread_listener = listener
                     .try_clone()
                     .map_err(|e| crate::zerr!("clone UDP socket for {host_label}:{host}: {e}"))?;
-                thread::spawn(move || udp_loop(thread_listener, container_ip, container));
+                thread::Builder::new()
+                    .name("zerun-port-udp".to_string())
+                    .spawn(move || udp_loop(thread_listener, container_ip, container))
+                    .map_err(|e| {
+                        crate::zerr!("spawn UDP port proxy for {host_label}:{host}: {e}")
+                    })?;
                 Ok(PortProxy {
                     _listener: ProxyListener::Udp(listener),
                 })
@@ -179,9 +189,14 @@ pub fn host_ip_label(ip: IpAddr) -> String {
 fn accept_loop(listener: TcpListener, container_ip: Ipv4Addr, container: u16) {
     for conn in listener.incoming() {
         let Ok(client) = conn else { break }; // listener closed -> shutdown
-        thread::spawn(move || {
-            let _ = forward(client, container_ip, container);
-        });
+        if let Err(error) = thread::Builder::new()
+            .name("zerun-port-client".to_string())
+            .spawn(move || {
+                let _ = forward(client, container_ip, container);
+            })
+        {
+            eprintln!("zerun: warn: failed to spawn TCP port client proxy: {error}");
+        }
     }
 }
 
@@ -209,15 +224,21 @@ fn udp_loop(listener: UdpSocket, container_ip: Ipv4Addr, container: u16) {
             let Ok(registered) = upstream.try_clone() else {
                 continue;
             };
-            clients.insert(client, registered);
-            thread::spawn(move || {
-                let mut buf = [0u8; 65535];
-                while let Ok(len) = upstream.recv(&mut buf) {
-                    if reply.send(&buf[..len]).is_err() {
-                        break;
+            if let Err(error) = thread::Builder::new()
+                .name("zerun-port-udp-client".to_string())
+                .spawn(move || {
+                    let mut buf = [0u8; 65535];
+                    while let Ok(len) = upstream.recv(&mut buf) {
+                        if reply.send(&buf[..len]).is_err() {
+                            break;
+                        }
                     }
-                }
-            });
+                })
+            {
+                eprintln!("zerun: warn: failed to spawn UDP port client proxy: {error}");
+                continue;
+            }
+            clients.insert(client, registered);
             let Some(upstream) = clients.get(&client) else {
                 continue;
             };
@@ -232,8 +253,28 @@ fn forward(mut client: TcpStream, container_ip: Ipv4Addr, container: u16) -> std
     let mut upstream = TcpStream::connect((container_ip, container))?;
     let mut c2u = client.try_clone()?;
     let mut u2c = upstream.try_clone()?;
-    let a = thread::spawn(move || std::io::copy(&mut c2u, &mut upstream));
-    let b = thread::spawn(move || std::io::copy(&mut u2c, &mut client));
+    // Keep control descriptors so a failed second spawn can wake the first
+    // pump even after the data streams have moved into their closures.
+    let client_control = client.try_clone()?;
+    let upstream_control = upstream.try_clone()?;
+    let a = thread::Builder::new()
+        .name("zerun-port-client-to-container".to_string())
+        .spawn(move || std::io::copy(&mut c2u, &mut upstream))
+        .map_err(|e| std::io::Error::other(format!("spawn TCP pump: {e}")))?;
+    let b = match thread::Builder::new()
+        .name("zerun-port-container-to-client".to_string())
+        .spawn(move || std::io::copy(&mut u2c, &mut client))
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            // The first pump owns cloned descriptors. Shut down the control
+            // descriptors so its blocking copy wakes before we join it.
+            let _ = client_control.shutdown(Shutdown::Both);
+            let _ = upstream_control.shutdown(Shutdown::Both);
+            let _ = a.join();
+            return Err(std::io::Error::other(format!("spawn TCP pump: {error}")));
+        }
+    };
     let _ = a.join();
     let _ = b.join();
     Ok(())
