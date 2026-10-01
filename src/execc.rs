@@ -23,7 +23,6 @@ use crate::error::ZResult;
 use crate::state::{ContainerState, Status};
 use crate::workload;
 use std::fs::File;
-use std::os::fd::AsRawFd;
 use std::path::Path;
 
 /// Join the running container described by `state` and run `argv` with the
@@ -213,14 +212,8 @@ fn joiner(
 
 /// setns into one namespace by fd, with a readable error.
 fn setns(f: &File, what: &str) -> Result<(), String> {
-    let rc = unsafe { libc::setns(f.as_raw_fd(), 0) };
-    if rc != 0 {
-        return Err(format!(
-            "setns({what}): {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(())
+    use std::os::fd::AsRawFd;
+    crate::syscalls::setns(f.as_raw_fd(), 0).map_err(|error| format!("setns({what}): {error}"))
 }
 
 /// The in-container worker: cgroup join, cwd, env, hardening, exec.

@@ -457,6 +457,14 @@ pub fn exit_process(code: i32) -> ! {
     unsafe { libc::_exit(code) }
 }
 
+/// Enter the namespace referred to by an open namespace descriptor.
+pub fn setns(fd: RawFd, flags: c_int) -> ZResult<()> {
+    if unsafe { libc::setns(fd, flags) } != 0 {
+        return Err(last_err("setns"));
+    }
+    Ok(())
+}
+
 /// Open a stable handle for a process. Unlike a bare PID, a pidfd continues
 /// to refer to the same process even if the numeric PID is later reused.
 pub fn pidfd_open(pid: libc::pid_t) -> ZResult<OwnedFd> {
