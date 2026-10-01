@@ -426,8 +426,12 @@ pub fn allocate_ip(run_root: &Path, id: &str) -> ZResult<Ipv4Addr> {
 
 /// Release this container's bridge IP (best effort; idempotent).
 pub fn release_ip(run_root: &Path, id: &str) {
-    let Ok(_guard) = lock_ipam(run_root) else {
-        return;
+    let _guard = match lock_ipam(run_root) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("zerun: warning: cannot lock IPAM state to release {id}: {error}");
+            return;
+        }
     };
     let path = ipam_file(run_root);
     let mut map = match read_ipam(&path) {
@@ -440,7 +444,9 @@ pub fn release_ip(run_root: &Path, id: &str) {
     if map.remove(id).is_none() {
         return;
     }
-    let _ = write_ipam(&path, &map);
+    if let Err(error) = write_ipam(&path, &map) {
+        eprintln!("zerun: warning: cannot persist IPAM release for {id}: {error}");
+    }
 }
 
 /// Host side: ensure the bridge and shared NAT rule, create the veth peer
@@ -661,6 +667,25 @@ mod tests {
         let mut duplicate = valid.clone();
         duplicate.insert("abcdef".to_string(), Ipv4Addr::new(10, 88, 0, 42));
         assert!(validate_ipam(&duplicate).is_err());
+    }
+
+    #[test]
+    fn ipam_release_removes_the_recorded_address() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-network-ipam-release-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let id = "0123456789ab";
+        let allocated = allocate_ip(&root, id).unwrap();
+        assert_eq!(
+            read_ipam(&ipam_file(&root)).unwrap().get(id),
+            Some(&allocated)
+        );
+        release_ip(&root, id);
+        assert!(read_ipam(&ipam_file(&root)).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
