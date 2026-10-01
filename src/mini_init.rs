@@ -65,15 +65,11 @@ pub fn run(
     let mut business_code = 0i32;
     let mut business_exited = false;
     loop {
-        let mut status: libc::c_int = 0;
-        let rpid = unsafe { libc::waitpid(-1, &mut status, 0) };
-        if rpid < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            break; // ECHILD: no children left
-        }
+        let (rpid, status) = match crate::syscalls::wait_pid(-1, 0) {
+            Ok(Some(result)) => result,
+            Ok(None) => continue,
+            Err(_) => break, // ECHILD: no children left
+        };
         if rpid == pid {
             business_code = decode_status(status);
             business_exited = true;
@@ -81,7 +77,7 @@ pub fn run(
         if business_exited {
             // Non-blocking sweep for processes that became orphans after the
             // workload exited.
-            while unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) } > 0 {}
+            while matches!(crate::syscalls::wait_pid(-1, libc::WNOHANG), Ok(Some(_))) {}
             break;
         }
     }
@@ -89,13 +85,7 @@ pub fn run(
 }
 
 fn decode_status(status: libc::c_int) -> i32 {
-    if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else if libc::WIFSIGNALED(status) {
-        128 + libc::WTERMSIG(status)
-    } else {
-        1
-    }
+    crate::syscalls::wait_status_code(status).unwrap_or(1)
 }
 
 fn exec_business(

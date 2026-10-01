@@ -465,6 +465,40 @@ pub fn exit_process(code: i32) -> ! {
     unsafe { libc::_exit(code) }
 }
 
+/// Wait for a child, retrying when the call is interrupted by a signal.
+///
+/// `None` is returned only for a non-blocking wait (`WNOHANG`) when no child
+/// has changed state yet. The returned status is intentionally kept inside the
+/// syscall layer so callers do not need to touch `waitpid(2)` directly.
+pub fn wait_pid(pid: libc::pid_t, options: c_int) -> ZResult<Option<(libc::pid_t, c_int)>> {
+    loop {
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, options) };
+        if waited < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(error.into());
+        }
+        if waited == 0 {
+            return Ok(None);
+        }
+        return Ok(Some((waited, status)));
+    }
+}
+
+/// Convert a wait status to the conventional shell exit code.
+pub fn wait_status_code(status: c_int) -> Option<i32> {
+    if libc::WIFEXITED(status) {
+        Some(libc::WEXITSTATUS(status))
+    } else if libc::WIFSIGNALED(status) {
+        Some(128 + libc::WTERMSIG(status))
+    } else {
+        None
+    }
+}
+
 /// Enter the namespace referred to by an open namespace descriptor.
 pub fn setns(fd: RawFd, flags: c_int) -> ZResult<()> {
     if unsafe { libc::setns(fd, flags) } != 0 {

@@ -709,21 +709,7 @@ impl Drop for PtyPair {
 }
 
 fn wait_pid(pid: i32) -> ZResult<i32> {
-    loop {
-        let mut status: libc::c_int = 0;
-        let r = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if r < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(e.into());
-        }
-        if libc::WIFEXITED(status) {
-            return Ok(libc::WEXITSTATUS(status));
-        }
-        if libc::WIFSIGNALED(status) {
-            return Ok(128 + libc::WTERMSIG(status));
-        }
-    }
+    let (_, status) =
+        syscalls::wait_pid(pid, 0)?.ok_or_else(|| crate::zerr!("waitpid returned no child"))?;
+    Ok(syscalls::wait_status_code(status).unwrap_or(1))
 }

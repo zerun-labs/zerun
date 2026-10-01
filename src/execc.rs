@@ -91,25 +91,9 @@ pub fn run(
         }
         Ok(parent) => {
             // Wait for C, which exits with D's code.
-            let mut status: libc::c_int = 0;
-            loop {
-                let r = unsafe { libc::waitpid(parent, &mut status, 0) };
-                if r < 0 {
-                    let e = std::io::Error::last_os_error();
-                    if e.raw_os_error() == Some(libc::EINTR) {
-                        continue;
-                    }
-                    return Err(e.into());
-                }
-                break;
-            }
-            if libc::WIFEXITED(status) {
-                Ok(libc::WEXITSTATUS(status))
-            } else if libc::WIFSIGNALED(status) {
-                Ok(128 + libc::WTERMSIG(status))
-            } else {
-                Ok(1)
-            }
+            let (_, status) = crate::syscalls::wait_pid(parent, 0)?
+                .ok_or_else(|| crate::zerr!("exec: waitpid returned no child"))?;
+            Ok(crate::syscalls::wait_status_code(status).unwrap_or(1))
         }
     }
 }
@@ -183,26 +167,18 @@ fn joiner(
         }
         Ok(d) => {
             // C waits for D and mirrors its exit code to the CLI.
-            let mut status: libc::c_int = 0;
-            loop {
-                let r = unsafe { libc::waitpid(d, &mut status, 0) };
-                if r < 0 {
-                    let e = std::io::Error::last_os_error();
-                    if e.raw_os_error() == Some(libc::EINTR) {
-                        continue;
-                    }
-                    eprintln!("zerun exec: waitpid: {e}");
+            let (_, status) = match crate::syscalls::wait_pid(d, 0) {
+                Ok(Some(result)) => result,
+                Ok(None) => {
+                    eprintln!("zerun exec: waitpid returned no child");
                     return 1;
                 }
-                break;
-            }
-            if libc::WIFEXITED(status) {
-                libc::WEXITSTATUS(status)
-            } else if libc::WIFSIGNALED(status) {
-                128 + libc::WTERMSIG(status)
-            } else {
-                1
-            }
+                Err(error) => {
+                    eprintln!("zerun exec: waitpid: {error}");
+                    return 1;
+                }
+            };
+            crate::syscalls::wait_status_code(status).unwrap_or(1)
         }
     }
 }
