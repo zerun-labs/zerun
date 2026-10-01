@@ -359,7 +359,37 @@ pub fn write_all_fd(fd: RawFd, data: &[u8]) -> ZResult<()> {
     Ok(())
 }
 
-// ---------- prctl / capabilities ----------
+// ---------- seccomp / prctl / capabilities ----------
+
+/// Install a classic-BPF seccomp filter. The filter remains owned by the
+/// caller only until this syscall returns; the kernel copies it immediately.
+pub fn install_seccomp_filter(filter: &[libc::sock_filter]) -> ZResult<()> {
+    if filter.len() > u16::MAX as usize {
+        return Err(crate::zerr!("seccomp filter is too large"));
+    }
+    #[repr(C)]
+    struct SockFprog {
+        len: u16,
+        filter: *const libc::sock_filter,
+    }
+    const SECCOMP_SET_MODE_FILTER: libc::c_long = 1;
+    let program = SockFprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr(),
+    };
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            SECCOMP_SET_MODE_FILTER,
+            0,
+            &program as *const SockFprog,
+        )
+    };
+    if rc != 0 {
+        return Err(last_err("seccomp(SECCOMP_SET_MODE_FILTER)"));
+    }
+    Ok(())
+}
 
 pub fn prctl_set(option: c_int, arg: libc::c_ulong) -> ZResult<()> {
     if unsafe { libc::prctl(option, arg, 0, 0, 0) } != 0 {

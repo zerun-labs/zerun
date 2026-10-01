@@ -25,7 +25,6 @@ const BPF_RET: u16 = 0x06;
 const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
-const SECCOMP_SET_MODE_FILTER: u32 = 1;
 const EPERM: u32 = 1;
 
 // offsetof(struct seccomp_data, nr / arch)
@@ -45,12 +44,6 @@ const AUDIT_ARCH_NATIVE: u32 = 0x4000_0028;
 #[cfg(target_arch = "riscv64")]
 const AUDIT_ARCH_NATIVE: u32 = 0xc000_00f3;
 
-#[repr(C)]
-struct SockFprog {
-    len: u16,
-    filter: *const libc::sock_filter,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SeccompMode {
@@ -69,21 +62,7 @@ pub fn apply(mode: SeccompMode) -> ZResult<()> {
         return Ok(());
     }
     let insns = build_default_program()?;
-    let prog = SockFprog {
-        len: insns.len() as u16,
-        filter: insns.as_ptr(),
-    };
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_seccomp,
-            SECCOMP_SET_MODE_FILTER as libc::c_long,
-            0,
-            &prog as *const SockFprog,
-        )
-    };
-    if rc != 0 {
-        return Err(crate::error::last_err("seccomp(SECCOMP_SET_MODE_FILTER)"));
-    }
+    crate::syscalls::install_seccomp_filter(&insns)?;
     trace::mark("child:seccomp:loaded");
     Ok(())
 }
