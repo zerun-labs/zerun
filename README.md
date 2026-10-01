@@ -51,8 +51,9 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
 
 ## Continuous integration
 
-Every push and pull request runs formatting, Clippy, the serialized unit/integration suite on
-Ubuntu 22.04 and 24.04, and the release-profile test suite. Dedicated rootful jobs exercise
+Every push and pull request runs formatting, ShellCheck/shell syntax checks, Clippy, the
+serialized unit/integration suite on Ubuntu 22.04 and 24.04, and the release-profile test
+suite. Dedicated rootful jobs exercise
 namespace isolation, OverlayFS, cgroups v2, bridge/veth networking, and TCP/UDP published-port
 proxies; static GNU and musl builds plus ARM64, ARMv7, and RISC-V64 cross-builds are checked as
 well. Tagged releases are gated on the source test suite before artifacts are published.

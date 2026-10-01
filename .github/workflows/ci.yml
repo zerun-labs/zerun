@@ -33,6 +33,24 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  scripts:
+    name: shell scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y shellcheck
+
+      - name: Check shell syntax
+        run: bash -n ci/rootful-runtime.sh
+
+      - name: Lint shell scripts
+        run: shellcheck --severity=warning ci/rootful-runtime.sh
+
   clippy:
     name: clippy
     runs-on: ubuntu-24.04
