@@ -12,6 +12,9 @@ use libc::{
     MNT_DETACH, MS_BIND, MS_NODEV, MS_NOEXEC, MS_NOSUID, MS_PRIVATE, MS_RDONLY, MS_REC,
     MS_RELATIME, MS_REMOUNT, MS_STRICTATIME,
 };
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 /// Sensitive procfs/sysfs paths that are masked inside the container
@@ -26,6 +29,15 @@ const MASKED_PATHS: &[&str] = &[
 ];
 
 const READONLY_PATHS: &[&str] = &["/proc/sys", "/proc/sysrq-trigger", "/proc/irq", "/proc/bus"];
+
+const DEVICE_NODES: &[(&str, u32, u32)] = &[
+    ("/dev/null", 1, 3),
+    ("/dev/zero", 1, 5),
+    ("/dev/full", 1, 7),
+    ("/dev/random", 1, 8),
+    ("/dev/urandom", 1, 9),
+    ("/dev/tty", 5, 0),
+];
 
 /// OverlayFS component directories for a per-container writable filesystem.
 #[derive(Debug, Clone)]
@@ -301,6 +313,8 @@ pub struct RootfsConfig<'a> {
     pub overlay: Option<&'a OverlayPaths>,
     /// Host bind mounts, established while the host root is still reachable.
     pub volumes: &'a [BindMount],
+    /// O_PATH handles for rootless host devices opened before pivot_root.
+    pub device_sources: &'a [Option<File>],
 }
 
 /// Full root migration + pseudo-filesystem assembly, run by the child inside the
@@ -341,7 +355,7 @@ pub fn setup_rootfs(cfg: &RootfsConfig) -> ZResult<()> {
     trace::mark("child:pivot_root:done");
 
     mount_pseudo_fs(cfg.rootless)?;
-    populate_dev(cfg.rootless)?;
+    populate_dev(cfg.rootless, cfg.device_sources)?;
     apply_masked_and_readonly(cfg.rootless)?;
 
     if let Some(h) = cfg.hostname {
@@ -620,33 +634,67 @@ fn require_or_warn(rootless: bool, r: ZResult<()>, what: &str) -> ZResult<()> {
 /// Minimal /dev device nodes and conventional symlinks.
 /// rootful: mknod character devices; rootless (non-initial user ns): mknod is
 /// restricted, so bind host whitelist devices instead.
-fn populate_dev(rootless: bool) -> ZResult<()> {
-    const NODES: &[(&str, u32, u32)] = &[
-        ("/dev/null", 1, 3),
-        ("/dev/zero", 1, 5),
-        ("/dev/full", 1, 7),
-        ("/dev/random", 1, 8),
-        ("/dev/urandom", 1, 9),
-        ("/dev/tty", 5, 0),
-    ];
-    for &(path, maj, min) in NODES {
-        if rootless {
-            // Create an empty file on tmpfs as the mount point, then bind the host
-            // device with the same name.
-            if std::fs::write(path, b"").is_ok() {
-                let _ = syscalls::mount(Some(path), path, None, MS_BIND, None);
+/// Open host device handles before pivot_root hides the initial `/dev`.
+///
+/// Rootless containers cannot reliably create device nodes with `mknod`; the
+/// handles are later exposed through `/proc/self/fd/*` after the private `/dev`
+/// tmpfs is mounted. Missing or inaccessible devices are a degraded-host
+/// warning, not a rootless setup failure.
+pub fn open_rootless_device_sources(rootless: bool) -> Vec<Option<File>> {
+    if !rootless {
+        return Vec::new();
+    }
+    DEVICE_NODES
+        .iter()
+        .map(|(path, _, _)| match open_device_source(path) {
+            Ok(source) => Some(source),
+            Err(error) => {
+                eprintln!("zerun: warn: cannot open rootless host device {path}: {error}");
+                None
             }
+        })
+        .collect()
+}
+
+/// Minimal /dev device nodes and conventional symlinks.
+/// rootful: mknod character devices; rootless (non-initial user ns): bind the
+/// pre-opened host whitelist devices through procfs fd magic links.
+fn populate_dev(rootless: bool, device_sources: &[Option<File>]) -> ZResult<()> {
+    for (index, &(path, maj, min)) in DEVICE_NODES.iter().enumerate() {
+        if rootless {
+            // Create an empty file on tmpfs as the mount point, then bind the
+            // actual host device opened before pivot_root. Binding `path` to
+            // itself here would only expose the empty mount-point file.
+            if let Err(error) = std::fs::write(path, b"") {
+                eprintln!("zerun: warn: cannot create rootless device mount point {path}: {error}");
+                continue;
+            }
+            let Some(source) = device_sources.get(index).and_then(Option::as_ref) else {
+                continue;
+            };
+            let source_path = format!("/proc/self/fd/{}", source.as_raw_fd());
+            require_or_warn(
+                true,
+                syscalls::mount(Some(&source_path), path, None, MS_BIND, None),
+                &format!("bind rootless device {path}"),
+            )?;
         } else {
             syscalls::mknod_char(path, maj, min, 0o666)?;
         }
     }
-
     let _ = syscalls::symlink("/proc/self/fd", "/dev/fd");
     let _ = syscalls::symlink("/proc/self/fd/0", "/dev/stdin");
     let _ = syscalls::symlink("/proc/self/fd/1", "/dev/stdout");
     let _ = syscalls::symlink("/proc/self/fd/2", "/dev/stderr");
     let _ = syscalls::symlink("/dev/pts/ptmx", "/dev/ptmx");
     Ok(())
+}
+
+fn open_device_source(path: &str) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+        .open(path)
 }
 
 fn apply_masked_and_readonly(rootless: bool) -> ZResult<()> {
@@ -703,6 +751,12 @@ pub fn bind_file_into(src_on_host: &Path, target_in_root: &str) -> ZResult<()> {
 
 #[cfg(test)]
 mod bind_tests {
+    #[test]
+    fn rootless_device_source_inventory_matches_the_minimal_dev_set() {
+        let sources = super::open_rootless_device_sources(true);
+        assert_eq!(sources.len(), super::DEVICE_NODES.len());
+    }
+
     use super::*;
 
     fn temp_path(name: &str) -> PathBuf {

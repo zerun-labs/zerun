@@ -18,8 +18,8 @@
 use crate::cgroup::{CgroupV2, ResourceLimits};
 use crate::error::ZResult;
 use crate::mounts::{
-    make_root_readonly, mount_extra_tmpfs, setup_rootfs, BindMount, OverlayPaths, RootfsConfig,
-    TmpfsMount,
+    make_root_readonly, mount_extra_tmpfs, open_rootless_device_sources, setup_rootfs, BindMount,
+    OverlayPaths, RootfsConfig, TmpfsMount,
 };
 use crate::seccomp::SeccompMode;
 use crate::security;
@@ -487,6 +487,9 @@ fn child_stage(
         }
     }
 
+    // Open rootless device handles before pivot_root hides the host /dev.
+    let device_sources = open_rootless_device_sources(identity.rootless);
+
     // 1. Root migration + pseudo-filesystems.
     let cfg = RootfsConfig {
         rootfs: &spec.rootfs,
@@ -494,6 +497,7 @@ fn child_stage(
         rootless: identity.rootless,
         overlay: spec.overlay.as_ref(),
         volumes: &spec.volumes,
+        device_sources: &device_sources,
     };
     setup_rootfs(&cfg)?;
 
