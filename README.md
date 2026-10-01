@@ -56,7 +56,8 @@ serialized unit/integration suite on Ubuntu 22.04 and 24.04, and the release-pro
 suite. Dedicated rootful jobs exercise
 namespace isolation, OverlayFS, cgroups v2, bridge/veth networking, and TCP/UDP published-port
 proxies; static GNU and musl builds plus ARM64, ARMv7, and RISC-V64 cross-builds are checked as
-well. Tagged releases are gated on the source test suite before artifacts are published.
+well. Tagged releases are gated on both debug and release-profile source tests before artifacts
+are published.
 
 ## Highlights
 

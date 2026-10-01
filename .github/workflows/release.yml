@@ -26,6 +26,9 @@ jobs:
       - name: Run all tests
         run: cargo test --locked --all-targets -- --test-threads=1
 
+      - name: Run all tests in release mode
+        run: cargo test --locked --release --all-targets -- --test-threads=1
+
   build:
     name: ${{ matrix.target }}
     needs: test
