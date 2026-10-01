@@ -46,10 +46,15 @@ jobs:
           sudo apt-get install --no-install-recommends -y shellcheck
 
       - name: Check shell syntax
-        run: bash -n ci/rootful-runtime.sh
+        run: |
+          while IFS= read -r -d '' script; do
+            bash -n "$script"
+          done < <(find . -type f -name '*.sh' -not -path './target/*' -print0)
 
       - name: Lint shell scripts
-        run: shellcheck --severity=warning ci/rootful-runtime.sh
+        run: |
+          find . -type f -name '*.sh' -not -path './target/*' -print0 | \
+            xargs -0 -r shellcheck --severity=warning
 
   clippy:
     name: clippy
