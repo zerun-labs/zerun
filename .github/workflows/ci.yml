@@ -49,9 +49,18 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
   test:
-    name: cargo test
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep the unit/integration suite exercised on both supported hosted
+        # Ubuntu generations; rootful namespace tests stay in their dedicated
+        # jobs below so a kernel capability failure is reported separately.
+        os:
+          - ubuntu-22.04
+          - ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
@@ -62,6 +71,21 @@ jobs:
         # Several parser/store tests intentionally exercise process-wide
         # environment overrides; serialize them to avoid test-thread races.
         run: cargo test --locked --all-targets -- --test-threads=1
+
+  test-release:
+    name: cargo test (release profile)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run all tests in release mode
+        # Release-only optimization and panic settings are part of the
+        # shipped binary, so exercise the suite under the production profile.
+        run: cargo test --locked --release --all-targets -- --test-threads=1
 
   build:
     name: release build (gnu)
