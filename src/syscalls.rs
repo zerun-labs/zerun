@@ -22,6 +22,13 @@ pub fn effective_gid() -> libc::gid_t {
 /// Probe whether a PID currently exists. EPERM still means that the process
 /// exists but is not inspectable by this user.
 pub fn pid_exists(pid: libc::pid_t) -> bool {
+    // kill(2) treats zero and negative values as process-group selectors, not
+    // individual PIDs. Lifecycle state only accepts positive PIDs, so reject
+    // those values here instead of accidentally reporting a process group as
+    // a container init.
+    if pid <= 0 {
+        return false;
+    }
     (unsafe { libc::kill(pid, 0) }) == 0
         || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
@@ -782,6 +789,8 @@ mod tests {
         let _uid = effective_uid();
         let _gid = effective_gid();
         assert!(pid_exists(std::process::id() as libc::pid_t));
+        assert!(!pid_exists(0));
+        assert!(!pid_exists(-1));
         assert!(!pid_exists(i32::MAX));
         assert!(clock_ticks_per_second() > 0);
         assert!(kernel_release().is_some());
