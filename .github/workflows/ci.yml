@@ -223,7 +223,10 @@ jobs:
 
   rootless-smoke:
     name: rootless runtime smoke test
-    runs-on: ubuntu-24.04
+    # Ubuntu 24.04 hosted images apply an AppArmor restriction to unprivileged
+    # user namespaces. Keep this job on 22.04 so it exercises Zerun's actual
+    # rootless clone/mapping path rather than failing before the runtime starts.
+    runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
@@ -283,6 +286,15 @@ jobs:
           cat "$base/output"
           if test "$status" -ne 0; then
             echo "rootless workload exited with status $status" >&2
+            # Hosted-runner logs are not always available after a failed job;
+            # repeat the captured runtime diagnostics as annotations so the
+            # next failure identifies clone/mount/exec errors directly.
+            while IFS= read -r line; do
+              line=${line//\%/%25}
+              line=${line//$'\r'/%0D}
+              line=${line//$'\n'/%0A}
+              echo "::error title=rootless runtime output::$line"
+            done <"$base/output"
             exit 90
           fi
           if ! grep -Fx rootless-smoke-ok "$base/output"; then
