@@ -312,10 +312,8 @@ fn lock_ipam(run_root: &Path) -> std::io::Result<std::fs::File> {
         .write(true)
         .open(&lock)?;
     // LOCK_EX on the whole file; released on drop/close.
-    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    crate::syscalls::flock(f.as_raw_fd(), libc::LOCK_EX)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     Ok(f)
 }
 

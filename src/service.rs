@@ -21,7 +21,7 @@ pub fn generate(a: &RunArgs, out: &mut dyn Write) -> Result<(), String> {
         .map_err(|e| format!("resolve current executable: {e}"))?
         .canonicalize()
         .map_err(|e| format!("canonicalize current executable: {e}"))?;
-    let rootful = unsafe { libc::geteuid() } == 0;
+    let rootful = crate::syscalls::effective_uid() == 0;
     let unit = render(&binary, a, rootful)?;
     out.write_all(unit.as_bytes())
         .map_err(|e| format!("write service: {e}"))?;

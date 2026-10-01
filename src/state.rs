@@ -14,6 +14,7 @@ use crate::error::ZResult;
 use crate::fsutil;
 use crate::seccomp::SeccompMode;
 use crate::store::Store;
+use crate::syscalls;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -364,8 +365,7 @@ impl ContainerState {
         let Some(pid) = self.pid.filter(|pid| *pid > 0) else {
             return false;
         };
-        let alive = unsafe { libc::kill(pid, 0) } == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        let alive = syscalls::pid_exists(pid);
         if !alive {
             return false;
         }

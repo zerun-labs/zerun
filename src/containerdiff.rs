@@ -195,15 +195,8 @@ mod tests {
     }
 
     fn make_whiteout(path: &Path) {
-        let target = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        let rc = unsafe { libc::mknod(target.as_ptr(), libc::S_IFCHR | 0o600, 0) };
-        assert_eq!(
-            rc,
-            0,
-            "mknod {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        );
+        crate::syscalls::mknod_char(path, 0, 0, 0o600)
+            .unwrap_or_else(|error| panic!("mknod {}: {error}", path.display()));
     }
 
     fn changes_as_map(changes: &[Change]) -> HashMap<PathBuf, ChangeKind> {

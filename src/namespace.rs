@@ -142,7 +142,7 @@ where
     trace::init();
     trace::mark("parent:begin");
 
-    let rootless = unsafe { libc::geteuid() } != 0;
+    let rootless = crate::syscalls::effective_uid() != 0;
 
     // Create the cgroup on the parent side first (attach right after clone).
     // Detached containers keep one even without limits so pause/unpause can
@@ -234,8 +234,8 @@ where
     // The host euid/egid must be captured before clone: once the child is inside
     // the new user namespace and before the mapping is written, geteuid() reports
     // 65534 (nobody).
-    let host_euid = unsafe { libc::geteuid() };
-    let host_egid = unsafe { libc::getegid() };
+    let host_euid = crate::syscalls::effective_uid();
+    let host_egid = crate::syscalls::effective_gid();
 
     let slave = pty_pair.as_ref().map_or(-1, |p| p.slave);
     let child_spec = spec.clone();

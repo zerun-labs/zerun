@@ -5,6 +5,7 @@
 //! every namespace member in the host `/proc` mount, so membership is decided
 //! by comparing `/proc/<pid>/ns/pid` link targets with the container init's.
 
+use crate::syscalls;
 use std::fs;
 use std::io;
 
@@ -144,14 +145,7 @@ fn tty_name(tty_nr: u32) -> String {
 }
 
 fn clock_ticks_per_sec() -> u64 {
-    // libc::sysconf is a plain libc query, not a raw syscall, so it stays
-    // outside the syscalls.rs concentration rule.
-    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if hz > 0 {
-        hz as u64
-    } else {
-        100
-    }
+    syscalls::clock_ticks_per_second()
 }
 
 /// Render cumulative CPU ticks like `ps` TIME: `MM:SS`, hours prefixed.

@@ -1,6 +1,7 @@
 //! OCI / Docker v2 manifest and manifest-list (index) parsing, plus the
 //! platform model used to select a single-architecture image.
 use crate::error::ZResult;
+use crate::syscalls;
 use serde::Deserialize;
 
 /// Accept header for manifest requests: modern schema2 manifests/indexes only
@@ -102,13 +103,7 @@ pub fn host_platform() -> Platform {
 
 /// Best-effort ARM variant from the kernel's machine string (`armv7l` -> v7).
 fn arm_variant() -> Option<String> {
-    let mut u: libc::utsname = unsafe { std::mem::zeroed() };
-    if unsafe { libc::uname(&mut u) } != 0 {
-        return None;
-    }
-    let machine = unsafe { std::ffi::CStr::from_ptr(u.machine.as_ptr()) }
-        .to_string_lossy()
-        .to_string();
+    let machine = syscalls::kernel_machine()?;
     let v = machine
         .strip_prefix("armv")
         .and_then(|rest| rest.chars().next())

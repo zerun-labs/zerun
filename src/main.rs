@@ -671,7 +671,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         }
     };
     if !a.net_specified {
-        a.net = default_net(unsafe { libc::geteuid() });
+        a.net = default_net(syscalls::effective_uid());
     }
     if a.no_overlay && a.tmpfs_upper {
         eprintln!("zerun run: --tmpfs-upper requires the writable overlay; remove --no-overlay");
@@ -864,7 +864,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
                 let cwd = a.workdir.clone().or_else(|| {
                     (!cfg.config.working_dir.is_empty()).then(|| cfg.config.working_dir.clone())
                 });
-                let rootless = unsafe { libc::geteuid() } != 0;
+                let rootless = syscalls::effective_uid() != 0;
                 let image_user = if cfg.config.user.is_empty() {
                     None
                 } else {
@@ -1348,7 +1348,7 @@ fn run_detached(
         created: state::now_rfc3339(),
         started: None,
         finished: None,
-        rootless: unsafe { libc::geteuid() } != 0,
+        rootless: syscalls::effective_uid() != 0,
         net: net_label(spec.net),
         ports: Vec::new(),
         port_protocols: None,
@@ -1382,7 +1382,7 @@ fn run_detached(
     st.started = None;
     st.finished = None;
     st.ip = None;
-    st.rootless = unsafe { libc::geteuid() } != 0;
+    st.rootless = syscalls::effective_uid() != 0;
     st.net = net_label(spec.net);
     st.ports = spec.ports.iter().map(|p| (p.host, p.container)).collect();
     st.port_protocols = if spec.ports.is_empty() {
@@ -2945,7 +2945,7 @@ fn cmd_generate_service(args: &[String]) -> i32 {
     // Keep the generated command explicit so behavior does not depend on the
     // effective UID of the systemd service versus the generating user.
     if !a.net_specified {
-        a.net = default_net(unsafe { libc::geteuid() });
+        a.net = default_net(syscalls::effective_uid());
     }
     match service::generate(&a, &mut std::io::stdout().lock()) {
         Ok(()) => 0,
@@ -2958,12 +2958,8 @@ fn cmd_generate_service(args: &[String]) -> i32 {
 
 fn cmd_doctor() -> i32 {
     println!("== Zerun environment doctor ==");
-    unsafe {
-        let mut u: libc::utsname = std::mem::zeroed();
-        if libc::uname(&mut u) == 0 {
-            let rel = syscalls::cstr_to_string(u.release.as_ptr());
-            println!("kernel release : {rel}  (baseline recommendation >= 5.10 LTS)");
-        }
+    if let Some(rel) = syscalls::kernel_release() {
+        println!("kernel release : {rel}  (baseline recommendation >= 5.10 LTS)");
     }
     match cgroup::detect_cgroup2_root() {
         Ok(root) => {
@@ -2998,7 +2994,7 @@ fn cmd_doctor() -> i32 {
     println!("data root      : {data}");
     println!(
         "uid            : {} (rootful isolation needs uid=0; non-root goes rootless via NEWUSER)",
-        unsafe { libc::geteuid() }
+        syscalls::effective_uid()
     );
     0
 }

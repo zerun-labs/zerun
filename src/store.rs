@@ -47,12 +47,12 @@ impl Store {
     pub fn detect() -> ZResult<Self> {
         let data_root = match std::env::var_os("ZERUN_DATA_ROOT") {
             Some(v) => PathBuf::from(v),
-            None if unsafe { libc::geteuid() } == 0 => PathBuf::from("/var/lib/zerun"),
+            None if crate::syscalls::effective_uid() == 0 => PathBuf::from("/var/lib/zerun"),
             None => xdg_data_home()?.join("zerun"),
         };
         let run_root = match std::env::var_os("ZERUN_RUNTIME_ROOT") {
             Some(v) => PathBuf::from(v),
-            None if unsafe { libc::geteuid() } == 0 => PathBuf::from("/run/zerun"),
+            None if crate::syscalls::effective_uid() == 0 => PathBuf::from("/run/zerun"),
             None => xdg_runtime_dir()?.join("zerun"),
         };
         Ok(Store {
@@ -208,7 +208,7 @@ fn xdg_runtime_dir() -> ZResult<PathBuf> {
             return Ok(PathBuf::from(v));
         }
     }
-    let uid = unsafe { libc::geteuid() };
+    let uid = crate::syscalls::effective_uid();
     Ok(PathBuf::from(format!("/run/user/{uid}")))
 }
 

@@ -7,6 +7,61 @@ use std::ffi::{CStr, CString};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
+// ---------- process identity / host queries ----------
+
+/// Return the effective UID without exposing libc's unsafe query to callers.
+pub fn effective_uid() -> libc::uid_t {
+    unsafe { libc::geteuid() }
+}
+
+/// Return the effective GID without exposing libc's unsafe query to callers.
+pub fn effective_gid() -> libc::gid_t {
+    unsafe { libc::getegid() }
+}
+
+/// Probe whether a PID currently exists. EPERM still means that the process
+/// exists but is not inspectable by this user.
+pub fn pid_exists(pid: libc::pid_t) -> bool {
+    (unsafe { libc::kill(pid, 0) }) == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Acquire an advisory file lock. The descriptor stays locked until close.
+pub fn flock(fd: RawFd, operation: c_int) -> ZResult<()> {
+    if unsafe { libc::flock(fd, operation) } != 0 {
+        return Err(last_err("flock"));
+    }
+    Ok(())
+}
+
+/// Read the system clock tick frequency used by `/proc/<pid>/stat`.
+pub fn clock_ticks_per_second() -> u64 {
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz > 0 {
+        hz as u64
+    } else {
+        100
+    }
+}
+
+/// Return the running kernel release, if `uname(2)` succeeds.
+pub fn kernel_release() -> Option<String> {
+    kernel_uname().map(|uts| cstr_to_string(uts.release.as_ptr()))
+}
+
+/// Return the kernel machine identifier used for ARM image variants.
+pub fn kernel_machine() -> Option<String> {
+    kernel_uname().map(|uts| cstr_to_string(uts.machine.as_ptr()))
+}
+
+fn kernel_uname() -> Option<libc::utsname> {
+    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut uts) } != 0 {
+        return None;
+    }
+    Some(uts)
+}
+
 // ---------- mounts ----------
 
 pub fn mount<S: AsRef<str>>(
@@ -547,6 +602,17 @@ pub fn cstr_to_string(p: *const libc::c_char) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_query_wrappers_are_safe_and_sane() {
+        let _uid = effective_uid();
+        let _gid = effective_gid();
+        assert!(pid_exists(std::process::id() as libc::pid_t));
+        assert!(!pid_exists(i32::MAX));
+        assert!(clock_ticks_per_second() > 0);
+        assert!(kernel_release().is_some());
+        assert!(kernel_machine().is_some());
+    }
 
     #[test]
     fn pidfd_can_open_and_probe_current_process() {
