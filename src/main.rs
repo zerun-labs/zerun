@@ -1477,7 +1477,7 @@ fn run_detached(
                     options: info.log,
                 },
             );
-            unsafe { libc::_exit(code) }
+            crate::syscalls::exit_process(code)
         }
         _ => {
             // --- foreground CLI: wait for the start signal ---

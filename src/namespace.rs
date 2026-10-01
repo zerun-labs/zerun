@@ -553,7 +553,7 @@ fn child_stage(
     if spec.use_init {
         let code =
             crate::mini_init::run(&argv, env.as_deref(), spec.hostname.as_deref(), &spec.id)?;
-        unsafe { libc::_exit(code) };
+        crate::syscalls::exit_process(code);
     }
 
     use std::os::unix::process::CommandExt;

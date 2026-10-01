@@ -81,7 +81,7 @@ pub fn run_detached(
             eprintln!("zerun: install log collector: {e}");
             let msg = format!("1: install log collector: {e}\n");
             let _ = write_all(started_w, msg.as_bytes());
-            let _ = unsafe { libc::close(started_w) };
+            crate::syscalls::close(started_w);
             return 1;
         }
     };
@@ -93,7 +93,7 @@ pub fn run_detached(
         persist_started_state(&store, &id, info)?;
         signaled = true;
         let _ = write_all(started_w, b"0\n");
-        let _ = unsafe { libc::close(started_w) };
+        crate::syscalls::close(started_w);
         Ok(())
     });
     let mut metrics = None;
@@ -108,7 +108,7 @@ pub fn run_detached(
             // own details for post-clone failures; this is the pre-clone kind.
             let msg = format!("1: {e}\n");
             let _ = write_all(started_w, msg.as_bytes());
-            let _ = unsafe { libc::close(started_w) };
+            crate::syscalls::close(started_w);
             eprintln!("zerun: {e}");
         }
     }
@@ -118,7 +118,7 @@ pub fn run_detached(
     if !signaled {
         let msg = b"1: container setup failed (see console.log)\n";
         let _ = write_all(started_w, msg);
-        let _ = unsafe { libc::close(started_w) };
+        crate::syscalls::close(started_w);
     }
 
     // Close the pipe write ends and flush the final partial line before the

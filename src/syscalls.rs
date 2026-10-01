@@ -450,6 +450,13 @@ pub fn close(fd: RawFd) {
     }
 }
 
+/// Terminate the current process immediately without running Rust destructors.
+/// This is required in forked children that must not unwind through inherited
+/// parent state or flush buffers a second time.
+pub fn exit_process(code: i32) -> ! {
+    unsafe { libc::_exit(code) }
+}
+
 /// Open a stable handle for a process. Unlike a bare PID, a pidfd continues
 /// to refer to the same process even if the numeric PID is later reused.
 pub fn pidfd_open(pid: libc::pid_t) -> ZResult<OwnedFd> {

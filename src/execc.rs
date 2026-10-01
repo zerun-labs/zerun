@@ -91,7 +91,7 @@ pub fn run(
         )),
         0 => {
             let code = joiner(state, pid, cgroup_path.as_deref(), env_extra, workdir, argv);
-            unsafe { libc::_exit(code) }
+            crate::syscalls::exit_process(code)
         }
         parent => {
             // Wait for C, which exits with D's code.
@@ -183,7 +183,7 @@ fn joiner(
         }
         0 => {
             let code = worker(state, cgroup_path, env_extra, workdir, argv);
-            unsafe { libc::_exit(code) }
+            crate::syscalls::exit_process(code)
         }
         d => {
             // C waits for D and mirrors its exit code to the CLI.
