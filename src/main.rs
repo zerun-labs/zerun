@@ -4906,14 +4906,7 @@ fn copy_between(src: &Path, dst: &Path) -> crate::error::ZResult<()> {
     } else if meta.is_dir() {
         fsutil::copy_dir_all(src, dst)
     } else {
-        std::fs::copy(src, dst)
-            .map_err(|e| crate::zerr!("copy {} -> {}: {e}", src.display(), dst.display()))?;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            dst,
-            std::fs::Permissions::from_mode(meta.permissions().mode() & 0o7777),
-        )
-        .map_err(|e| crate::zerr!("chmod {}: {e}", dst.display()))
+        fsutil::copy_file(src, dst)
     }
 }
 

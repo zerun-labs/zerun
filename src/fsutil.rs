@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// - symlinks are recreated, never followed;
 /// - file modes are preserved;
 /// - sockets, fifos and device nodes are skipped with a warning (unprivileged
-///   users cannot create them and images rarely contain them).
+///   users cannot create them and images rarely contain them);
+/// - existing destination symlinks are replaced, never followed.
 pub fn copy_dir_all(src: &Path, dst: &Path) -> ZResult<()> {
     if !src.is_dir() {
         return Err(crate::zerr!(
@@ -20,6 +21,7 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> ZResult<()> {
             src.display()
         ));
     }
+    prepare_destination(dst, true)?;
     fs::create_dir_all(dst).map_err(|e| crate::zerr!("create {}: {e}", dst.display()))?;
     let meta = fs::symlink_metadata(src)?;
     set_mode(dst, meta.mode() & 0o7777)?;
@@ -35,25 +37,69 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> ZResult<()> {
         if ft.is_dir() {
             copy_dir_all(&from, &to)?;
         } else if ft.is_symlink() {
+            prepare_destination(&to, false)?;
             let target = fs::read_link(&from)?;
-            if let Err(e) = std::os::unix::fs::symlink(&target, &to) {
-                eprintln!(
-                    "zerun: warn: skip symlink {} -> {}: {e}",
-                    from.display(),
-                    target.display()
-                );
-            }
+            std::os::unix::fs::symlink(&target, &to).map_err(|e| {
+                crate::zerr!("symlink {} -> {}: {e}", to.display(), target.display())
+            })?;
         } else if ft.is_file() {
-            fs::copy(&from, &to)
-                .map_err(|e| crate::zerr!("copy {} -> {}: {e}", from.display(), to.display()))?;
-            let m = fs::symlink_metadata(&from)?;
-            set_mode(&to, m.mode() & 0o7777)?;
+            copy_file(&from, &to)?;
         } else {
             eprintln!(
                 "zerun: warn: skip special file {} (not a regular file/symlink/dir)",
                 from.display()
             );
         }
+    }
+    Ok(())
+}
+
+/// Copy one regular file without following a destination symlink.
+///
+/// Existing regular files are replaced in place; an existing destination
+/// symlink is removed and recreated as a regular file. A race that inserts a
+/// symlink after that removal fails closed because `O_NOFOLLOW` is used.
+pub fn copy_file(src: &Path, dst: &Path) -> ZResult<()> {
+    let meta = fs::symlink_metadata(src)
+        .map_err(|e| crate::zerr!("stat copy source {}: {e}", src.display()))?;
+    if !meta.file_type().is_file() {
+        return Err(crate::zerr!(
+            "copy source is not a regular file: {}",
+            src.display()
+        ));
+    }
+    prepare_destination(dst, false)?;
+    let mut input = File::open(src).map_err(|e| crate::zerr!("open {}: {e}", src.display()))?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dst)
+        .map_err(|e| crate::zerr!("open copy destination {}: {e}", dst.display()))?;
+    std::io::copy(&mut input, &mut output)
+        .map_err(|e| crate::zerr!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+    output
+        .sync_all()
+        .map_err(|e| crate::zerr!("sync copy destination {}: {e}", dst.display()))?;
+    set_mode(dst, meta.mode() & 0o7777)
+}
+
+/// Remove an incompatible existing destination entry without following it.
+fn prepare_destination(path: &Path, want_directory: bool) -> ZResult<()> {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    let compatible = want_directory && meta.file_type().is_dir();
+    if compatible {
+        return Ok(());
+    }
+    if meta.file_type().is_dir() {
+        fs::remove_dir_all(path)
+            .map_err(|e| crate::zerr!("remove destination directory {}: {e}", path.display()))?;
+    } else {
+        fs::remove_file(path)
+            .map_err(|e| crate::zerr!("remove destination {}: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -267,6 +313,40 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("missing"), dir.join("broken")).unwrap();
 
         assert_eq!(dir_size(&dir), 25);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_helpers_replace_destination_symlinks_without_following_them() {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-copy-safe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("source/nested")).unwrap();
+        fs::write(dir.join("source/nested/file"), b"copied").unwrap();
+        fs::write(dir.join("outside"), b"must survive").unwrap();
+        fs::write(dir.join("single"), b"single").unwrap();
+
+        let dir_destination = dir.join("destination");
+        std::os::unix::fs::symlink(dir.join("outside"), &dir_destination).unwrap();
+        copy_dir_all(&dir.join("source"), &dir_destination).unwrap();
+        assert!(dir_destination.join("nested/file").is_file());
+        assert_eq!(fs::read(dir.join("outside")).unwrap(), b"must survive");
+
+        let file_destination = dir.join("file-destination");
+        std::os::unix::fs::symlink(dir.join("outside"), &file_destination).unwrap();
+        copy_file(&dir.join("single"), &file_destination).unwrap();
+        assert!(!fs::symlink_metadata(&file_destination)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&file_destination).unwrap(), b"single");
+        assert_eq!(fs::read(dir.join("outside")).unwrap(), b"must survive");
         let _ = fs::remove_dir_all(&dir);
     }
 
