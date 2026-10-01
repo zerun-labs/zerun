@@ -1449,9 +1449,9 @@ fn run_detached(
     // Double purpose of the fork: the reaper becomes the container's parent and
     // survives this CLI; setsid() detaches it from the terminal so closing the
     // terminal cannot kill the container.
-    match unsafe { libc::fork() } {
-        -1 => {
-            eprintln!("zerun: fork: {}", std::io::Error::last_os_error());
+    match syscalls::fork_process() {
+        Err(error) => {
+            eprintln!("zerun: fork: {error}");
             syscalls::close(started_r);
             syscalls::close(started_w);
             if !resuming {
@@ -1459,7 +1459,7 @@ fn run_detached(
             }
             1
         }
-        0 => {
+        Ok(0) => {
             // --- reaper child ---
             syscalls::close(started_r);
             unsafe {
@@ -1479,7 +1479,7 @@ fn run_detached(
             );
             crate::syscalls::exit_process(code)
         }
-        _ => {
+        Ok(_) => {
             // --- foreground CLI: wait for the start signal ---
             drop(log_fd);
             syscalls::close(started_w);

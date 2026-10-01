@@ -83,16 +83,13 @@ pub fn run(
     };
 
     // The joiner C.
-    match unsafe { libc::fork() } {
-        -1 => Err(crate::zerr!(
-            "exec: fork: {}",
-            std::io::Error::last_os_error()
-        )),
-        0 => {
+    match crate::syscalls::fork_process() {
+        Err(error) => Err(crate::zerr!("exec: fork: {error}")),
+        Ok(0) => {
             let code = joiner(state, pid, cgroup_path.as_deref(), env_extra, workdir, argv);
             crate::syscalls::exit_process(code)
         }
-        parent => {
+        Ok(parent) => {
             // Wait for C, which exits with D's code.
             let mut status: libc::c_int = 0;
             loop {
@@ -175,16 +172,16 @@ fn joiner(
     // point on all future children are members of the container's PID ns.
 
     // Second fork: D is born inside the container's PID namespace.
-    match unsafe { libc::fork() } {
-        -1 => {
-            eprintln!("zerun exec: fork: {}", std::io::Error::last_os_error());
+    match crate::syscalls::fork_process() {
+        Err(error) => {
+            eprintln!("zerun exec: fork: {error}");
             1
         }
-        0 => {
+        Ok(0) => {
             let code = worker(state, cgroup_path, env_extra, workdir, argv);
             crate::syscalls::exit_process(code)
         }
-        d => {
+        Ok(d) => {
             // C waits for D and mirrors its exit code to the CLI.
             let mut status: libc::c_int = 0;
             loop {

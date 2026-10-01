@@ -7,7 +7,7 @@
 //! 3. exit with the workload's exit code.
 //!
 //! The `zerun __init -- cmd` re-exec entry is retained for manual/legacy use.
-use crate::error::{last_err, ZResult};
+use crate::error::ZResult;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
@@ -47,10 +47,8 @@ pub fn run(
         // decides how to handle them.
     }
 
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return Err(last_err("fork in mini-init"));
-    }
+    let pid = crate::syscalls::fork_process()
+        .map_err(|error| crate::zerr!("fork in mini-init: {error}"))?;
     if pid == 0 {
         // Workload child (container PID 2): restore default signal handling, then exec.
         unsafe {

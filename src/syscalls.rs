@@ -433,6 +433,14 @@ pub fn cap_last_cap() -> u32 {
 
 // ---------- processes / pipes ----------
 
+pub fn fork_process() -> ZResult<libc::pid_t> {
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(last_err("fork"));
+    }
+    Ok(pid)
+}
+
 pub fn pipe2_cloexec() -> ZResult<(RawFd, RawFd)> {
     // Blocking pipe: the parent treats read()==EOF as "child reached execve"
     // (the write end carries O_CLOEXEC, so the kernel closes it on successful
