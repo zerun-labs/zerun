@@ -307,7 +307,7 @@ jobs:
           fi
 
   rootful-integration:
-    name: rootful integration (overlay/cgroup/bridge/ports)
+    name: rootful integration (runtime/storage/network)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -330,7 +330,7 @@ jobs:
           rootfs="$RUNNER_TEMP/zerun-integration-rootfs"
           mkdir -p "$rootfs/bin" "$rootfs/srv"
           install -m 0755 /usr/bin/busybox "$rootfs/bin/busybox"
-          for applet in sh httpd ip grep; do
+          for applet in sh httpd ip grep cat sleep; do
             ln -s busybox "$rootfs/bin/$applet"
           done
           printf 'zerun-port-ok\n' >"$rootfs/srv/index.html"

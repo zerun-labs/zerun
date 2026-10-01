@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Exercise runtime paths that ordinary unit tests cannot cover because they
 # need a real rootful Linux host: overlayfs, cgroups v2, bridge networking,
-# and the in-process published-port proxy.
+# lifecycle introspection, rootfs export/import, and the in-process published-port proxy.
 set -Eeuo pipefail
 
 if [[ $# -ne 4 ]]; then
@@ -38,9 +38,20 @@ fi
 # fails. The runner is ephemeral, but explicit cleanup makes repeated local
 # runs deterministic and prevents leaked bridge listeners between checks.
 cleanup_ids=()
+cleanup_paths=()
+remove_cleanup_path() {
+  if (( EUID == 0 )); then
+    rm -f -- "$1"
+  else
+    sudo rm -f -- "$1"
+  fi
+}
 cleanup() {
   for id in "${cleanup_ids[@]}"; do
     "${zerun[@]}" rm -f "$id" >/dev/null 2>&1 || true
+  done
+  for path in "${cleanup_paths[@]}"; do
+    remove_cleanup_path "$path" >/dev/null 2>&1 || true
   done
 }
 trap cleanup EXIT
@@ -150,6 +161,68 @@ done
 "${zerun[@]}" kill --signal TERM "$restart_id" >/dev/null
 "${zerun[@]}" wait "$restart_id" >/dev/null
 "${zerun[@]}" rm "$restart_id" >/dev/null
+
+# M7 lifecycle and storage commands operate on a live writable container.
+# Keep this workload alive while inspect/stats/top/cp/diff/export/commit run,
+# then import the exported tar and execute it as a local image.
+m7_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --net none --pids 32 \
+  --name ci-m7 --label ci.m7=ok --init -- /bin/sh -c \
+  'printf "m7-running\\n"; printf "overlay-data\\n" >/run/m7-file; sleep 30')
+cleanup_ids+=("$m7_id")
+for attempt in $(seq 1 50); do
+  m7_logs=$("${zerun[@]}" logs "$m7_id" 2>/dev/null || true)
+  if grep -Fxq m7-running <<<"$m7_logs"; then
+    break
+  fi
+  if (( attempt == 50 )); then
+    echo "M7 workload did not start" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+inspect_output=$("${zerun[@]}" inspect "$m7_id")
+grep -q '"status": "running"' <<<"$inspect_output"
+grep -q '"ci.m7": "ok"' <<<"$inspect_output"
+stats_output=$("${zerun[@]}" stats "$m7_id")
+grep -q 'ci-m7' <<<"$stats_output"
+top_output=$("${zerun[@]}" top "$m7_id")
+grep -q 'CMD' <<<"$top_output"
+
+cp_source="/tmp/zerun-cp-source-${BASHPID}"
+cp_copy="/tmp/zerun-cp-copy-${BASHPID}"
+export_tar="/tmp/zerun-export-${BASHPID}.tar"
+cleanup_paths+=("$cp_source" "$cp_copy" "$export_tar")
+printf 'host-to-container\n' >"$cp_source"
+"${zerun[@]}" cp "$cp_source" "$m7_id:/run/host-file"
+cp_in_container=$("${zerun[@]}" exec "$m7_id" /bin/sh -c 'cat /run/host-file')
+grep -Fxq host-to-container <<<"$cp_in_container"
+"${zerun[@]}" cp "$m7_id:/run/host-file" "$cp_copy"
+grep -Fxq host-to-container "$cp_copy"
+
+diff_output=$("${zerun[@]}" diff "$m7_id")
+grep -q '/run/host-file' <<<"$diff_output"
+"${zerun[@]}" export -o "$export_tar" "$m7_id"
+if (( EUID == 0 )); then
+  test -s "$export_tar"
+else
+  sudo test -s "$export_tar"
+fi
+"${zerun[@]}" kill --signal TERM "$m7_id" >/dev/null
+"${zerun[@]}" wait "$m7_id" >/dev/null
+# Commit the retained overlay after exit so this check exercises the stable
+# persisted-upper path and remains portable to nested hosts whose live
+# /proc/<pid>/root mount view cannot be archived reliably.
+commit_digest=$("${zerun[@]}" commit -m ci-m7 "$m7_id" ci-commit:test)
+grep -Eq '^sha256:[0-9a-f]{64}$' <<<"$commit_digest"
+"${zerun[@]}" rm "$m7_id" >/dev/null
+m7_id=''
+
+import_digest=$("${zerun[@]}" import -m ci-m7 "$export_tar" ci-import:test)
+grep -Eq '^sha256:[0-9a-f]{64}$' <<<"$import_digest"
+import_output=$("${zerun[@]}" run --net none ci-import:test /bin/sh -c 'cat /run/m7-file')
+grep -Fxq overlay-data <<<"$import_output"
+echo "rootful-m7-ok"
 
 # Bridge setup covers the netlink/veth path and the child-side eth0 setup.
 bridge_output=$("${zerun[@]}" run --rootfs "$rootfs" --net bridge --no-overlay --init -- \
