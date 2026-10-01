@@ -623,8 +623,15 @@ fn write_etc_hosts(spec: &RunSpec) {
 /// euid/egid (single mapping; values captured by the parent before clone).
 /// setgroups must be denied before gid_map can be written.
 fn write_self_id_mapping(host_euid: u32, host_egid: u32) -> ZResult<()> {
-    // Ignore setgroups write failures (some kernels deny it by default already).
-    let _ = std::fs::write("/proc/self/setgroups", "deny");
+    // Kernels that pre-deny setgroups report EPERM, and older layouts may not
+    // expose the file at all. Ignore only those expected cases; unexpected
+    // failures should not be hidden before writing gid_map.
+    if let Err(error) = std::fs::write("/proc/self/setgroups", "deny") {
+        match error.raw_os_error() {
+            Some(libc::EPERM) | Some(libc::ENOENT) => {}
+            _ => return Err(crate::zerr!("write setgroups deny failed: {error}")),
+        }
+    }
     std::fs::write("/proc/self/uid_map", format!("0 {host_euid} 1"))
         .map_err(|e| crate::zerr!("write uid_map failed: {e}"))?;
     std::fs::write("/proc/self/gid_map", format!("0 {host_egid} 1"))
