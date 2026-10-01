@@ -267,12 +267,15 @@ jobs:
           sudo chown -R "$ci_user:" "$rootfs" "$data" "$runtime" "$home"
           sudo chown "$ci_user:" "$binary"
 
+          # Direct exec keeps this smoke focused on rootless namespace and
+          # pivot behavior; PID-1/mini-init semantics are covered by the
+          # rootful lifecycle smoke tests.
           set +e
           timeout --foreground 30s sudo -u "$ci_user" env \
             HOME="$home" \
             ZERUN_DATA_ROOT="$data" \
             ZERUN_RUNTIME_ROOT="$runtime" \
-            "$binary" run --rootfs "$rootfs" --net none --no-overlay --init -- \
+            "$binary" run --rootfs "$rootfs" --net none --no-overlay -- \
             /bin/sh -c 'printf "rootless-smoke-ok\n"; printf "container-uid=%s\n" "$(/bin/busybox id -u)"' \
             >"$base/output" 2>&1
           status=$?
