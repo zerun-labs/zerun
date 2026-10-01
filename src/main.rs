@@ -611,6 +611,16 @@ fn state_env(entries: &[String]) -> Result<Vec<(String, String)>, String> {
         .collect()
 }
 
+/// Reconcile a dead detached reaper and require the terminal state to be
+/// persisted before a lifecycle command continues. A best-effort reconcile is
+/// unsafe: callers could otherwise act on an in-memory Exited record while the
+/// filesystem still advertises Running.
+fn reconcile_stale_state(store: &Store, st: &mut ContainerState) -> Result<(), String> {
+    lifecycle::reconcile_stale_and_save(store, st)
+        .map(|_| ())
+        .map_err(|e| format!("failed to persist reconciled state for {}: {e}", st.id))
+}
+
 fn state_environment(st: &ContainerState) -> Result<Option<Vec<(String, String)>>, String> {
     // Legacy --rootfs runs inherited the host environment and persisted no
     // explicit entries. Do not turn an empty record into an empty envp.
@@ -1097,9 +1107,7 @@ fn set_container_paused(store: &Store, target: &str, paused: bool) -> Result<Str
             if paused { "pause" } else { "unpause" }
         )
     })?;
-    if lifecycle::reconcile_stale(store, &mut st) {
-        st.save(store).map_err(|e| e.to_string())?;
-    }
+    reconcile_stale_state(store, &mut st)?;
     let name = display_name(&st);
     if st.status != state::Status::Running || !st.pid_alive() {
         return Err(format!(
@@ -1195,9 +1203,7 @@ fn start_one(store: &Store, target: &str) -> Result<String, String> {
             return Err(format!("container {name} is already running"));
         }
         state::Status::Running => {
-            if lifecycle::reconcile_stale(store, &mut st) {
-                st.save(store).map_err(|e| e.to_string())?;
-            }
+            reconcile_stale_state(store, &mut st)?;
         }
         state::Status::Created | state::Status::Exited => {}
     }
@@ -3084,8 +3090,9 @@ fn cmd_ps(args: &[String]) -> i32 {
         // Crash reconcile: a record that says Running for a dead PID belongs
         // to a reaper that never got to clean up; mark it exited and reclaim
         // its host-side resources (nft table, veth, cgroup, IPAM, overlay).
-        if lifecycle::reconcile_stale(&store, &mut st) {
-            let _ = st.save(&store);
+        if let Err(e) = reconcile_stale_state(&store, &mut st) {
+            eprintln!("zerun ps: {e}");
+            return 1;
         }
         if !all && !filter.widens_status() && st.status != state::Status::Running {
             continue;
@@ -3256,9 +3263,7 @@ fn wait_one(store: &Store, target: &str) -> Result<i32, String> {
             return Ok(st.exit_code.unwrap_or(-1));
         }
         if st.status == state::Status::Running && !st.pid_alive() {
-            if lifecycle::reconcile_stale(store, &mut st) {
-                let _ = st.save(store);
-            }
+            reconcile_stale_state(store, &mut st)?;
             if st.status == state::Status::Exited {
                 return Ok(st.exit_code.unwrap_or(-1));
             }
@@ -3456,9 +3461,7 @@ fn kill_one(store: &Store, target: &str, signal: libc::c_int) -> Result<String, 
         state::Status::Running => {}
     }
     if !st.pid_alive() {
-        if lifecycle::reconcile_stale(store, &mut st) {
-            let _ = st.save(store);
-        }
+        reconcile_stale_state(store, &mut st)?;
         return Ok(name);
     }
     if st.paused && signal_requires_thaw(signal) {
@@ -3468,7 +3471,7 @@ fn kill_one(store: &Store, target: &str, signal: libc::c_int) -> Result<String, 
     // Give a terminating signal a brief chance to take effect, without making
     // control signals such as STOP/CONT feel like `stop`.
     if wait_pid_gone(&st, Duration::from_millis(500)) {
-        lifecycle::settle_exit(store, &st.id);
+        lifecycle::settle_exit(store, &st.id).map_err(|e| e.to_string())?;
     }
     Ok(name)
 }
@@ -3554,9 +3557,7 @@ fn stop_one(store: &Store, target: &str, timeout_secs: u64) -> Result<String, St
     }
     if !st.pid_alive() {
         let mut s = st.clone();
-        if lifecycle::reconcile_stale(store, &mut s) {
-            let _ = s.save(store);
-        }
+        reconcile_stale_state(store, &mut s)?;
         return Ok(name);
     }
     // A frozen task cannot service SIGTERM; thaw first so the grace period is
@@ -3567,7 +3568,7 @@ fn stop_one(store: &Store, target: &str, timeout_secs: u64) -> Result<String, St
         signal_container(&st, libc::SIGKILL)?;
         wait_pid_gone(&st, Duration::from_secs(5));
     }
-    lifecycle::settle_exit(store, &st.id);
+    lifecycle::settle_exit(store, &st.id).map_err(|e| e.to_string())?;
     Ok(name)
 }
 
@@ -3640,8 +3641,9 @@ fn cmd_system_df(args: &[String]) -> i32 {
     let mut container_bytes = 0;
     let mut reclaimable_bytes = 0;
     for mut st in state::list(&store) {
-        if lifecycle::reconcile_stale(&store, &mut st) {
-            let _ = st.save(&store);
+        if let Err(e) = reconcile_stale_state(&store, &mut st) {
+            eprintln!("zerun system df: {e}");
+            return 1;
         }
         let state_dir = state::ContainerState::dir(&store, &st.id);
         let overlay_bytes = if st.overlay.is_some() {
@@ -3728,11 +3730,9 @@ fn cmd_prune(args: &[String]) -> i32 {
     let states = state::list(&store);
     let mut targets = Vec::new();
     for mut st in states {
-        if st.status == state::Status::Running
-            && !st.pid_alive()
-            && lifecycle::reconcile_stale(&store, &mut st)
-        {
-            let _ = st.save(&store);
+        if let Err(e) = reconcile_stale_state(&store, &mut st) {
+            eprintln!("zerun prune: {e}");
+            return 1;
         }
         if st.status == state::Status::Exited {
             targets.push((st.id.clone(), display_name(&st)));
@@ -3888,7 +3888,7 @@ fn rm_one(store: &Store, target: &str, force: bool) -> Result<String, String> {
         // Let the reaper record the exit (or reconcile when it is gone), so the
         // state directory is not deleted underneath a reaper that is about to
         // write its final record.
-        lifecycle::settle_exit(store, &st.id);
+        lifecycle::settle_exit(store, &st.id).map_err(|e| e.to_string())?;
         if let Some(fresh) = state::ContainerState::load(store, &st.id) {
             st = fresh;
         }
@@ -4173,8 +4173,9 @@ fn cmd_stats(args: &[String]) -> i32 {
     let mut states: Vec<state::ContainerState> = Vec::new();
     if all {
         for mut st in state::list(&store) {
-            if lifecycle::reconcile_stale(&store, &mut st) {
-                let _ = st.save(&store);
+            if let Err(e) = reconcile_stale_state(&store, &mut st) {
+                eprintln!("zerun stats: {e}");
+                return 1;
             }
             states.push(st);
         }
@@ -4182,8 +4183,9 @@ fn cmd_stats(args: &[String]) -> i32 {
         for target in &targets {
             match state::resolve(&store, target) {
                 Ok(mut st) => {
-                    if lifecycle::reconcile_stale(&store, &mut st) {
-                        let _ = st.save(&store);
+                    if let Err(e) = reconcile_stale_state(&store, &mut st) {
+                        eprintln!("zerun stats: {e}");
+                        return 1;
                     }
                     states.push(st);
                 }
@@ -4433,8 +4435,9 @@ fn cmd_update(args: &[String]) -> i32 {
             return 1;
         }
     };
-    if lifecycle::reconcile_stale(&store, &mut st) {
-        let _ = st.save(&store);
+    if let Err(e) = reconcile_stale_state(&store, &mut st) {
+        eprintln!("zerun update: {e}");
+        return 1;
     }
     if st.status != state::Status::Running || !st.pid_alive() {
         eprintln!(
@@ -4512,8 +4515,9 @@ fn cmd_inspect(args: &[String]) -> i32 {
                 return 1;
             }
         };
-        if lifecycle::reconcile_stale(&store, &mut st) {
-            let _ = st.save(&store);
+        if let Err(e) = reconcile_stale_state(&store, &mut st) {
+            eprintln!("zerun inspect: {e}");
+            return 1;
         }
         match serde_json::to_string_pretty(&st) {
             Ok(json) => println!("{json}"),
@@ -4560,8 +4564,9 @@ fn cmd_port(args: &[String]) -> i32 {
             return 1;
         }
     };
-    if lifecycle::reconcile_stale(&store, &mut st) {
-        let _ = st.save(&store);
+    if let Err(e) = reconcile_stale_state(&store, &mut st) {
+        eprintln!("zerun port: {e}");
+        return 1;
     }
     for (i, (host, container)) in st.ports.iter().enumerate() {
         let protocol = st
@@ -4704,8 +4709,9 @@ fn cmd_top(args: &[String]) -> i32 {
             return 1;
         }
     };
-    if lifecycle::reconcile_stale(&store, &mut st) {
-        let _ = st.save(&store);
+    if let Err(e) = reconcile_stale_state(&store, &mut st) {
+        eprintln!("zerun top: {e}");
+        return 1;
     }
     if st.status != state::Status::Running || !st.pid_alive() {
         eprintln!("zerun top: container {} is not running", display_name(&st));
@@ -4829,8 +4835,9 @@ fn cmd_cp(args: &[String]) -> i32 {
             return 1;
         }
     };
-    if lifecycle::reconcile_stale(&store, &mut st) {
-        let _ = st.save(&store);
+    if let Err(e) = reconcile_stale_state(&store, &mut st) {
+        eprintln!("zerun cp: {e}");
+        return 1;
     }
     if st.status != state::Status::Running || !st.pid_alive() {
         eprintln!(
@@ -5144,8 +5151,9 @@ fn cmd_export(args: &[String]) -> i32 {
             return 1;
         }
     };
-    if lifecycle::reconcile_stale(&store, &mut st) {
-        let _ = st.save(&store);
+    if let Err(e) = reconcile_stale_state(&store, &mut st) {
+        eprintln!("zerun export: {e}");
+        return 1;
     }
     if st.status != state::Status::Running || !st.pid_alive() {
         eprintln!(
@@ -5490,8 +5498,9 @@ fn cmd_attach(args: &[String]) -> i32 {
             return 1;
         }
     };
-    if lifecycle::reconcile_stale(&store, &mut st) {
-        let _ = st.save(&store);
+    if let Err(e) = reconcile_stale_state(&store, &mut st) {
+        eprintln!("zerun attach: {e}");
+        return 1;
     }
     if st.status != state::Status::Running || !st.pid_alive() {
         eprintln!(

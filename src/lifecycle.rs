@@ -133,7 +133,12 @@ pub fn run_detached(
         st.paused = false;
         st.exit_code = Some(code);
         st.finished = Some(state::now_rfc3339());
-        let _ = st.save(&store);
+        if let Err(error) = st.save(&store) {
+            eprintln!(
+                "zerun: warning: failed to persist final state for container {}: {error}",
+                st.id
+            );
+        }
     }
     // Keep the writable layer for an addressable exited container so it can be
     // committed or inspected later. `--rm` retains Docker's remove-on-exit
@@ -486,25 +491,40 @@ pub fn reconcile_stale(store: &Store, st: &mut ContainerState) -> bool {
     true
 }
 
+/// Reconcile a dead reaper and durably persist the resulting terminal state.
+///
+/// Callers must not silently discard the save error: until this write succeeds,
+/// the filesystem still advertises the container as running and every later
+/// lifecycle command may repeat resource cleanup or make the stale record
+/// appear live.
+pub fn reconcile_stale_and_save(store: &Store, st: &mut ContainerState) -> ZResult<bool> {
+    if !reconcile_stale(store, st) {
+        return Ok(false);
+    }
+    st.save(store)?;
+    Ok(true)
+}
+
 /// After `stop`/`rm -f` has killed a container's PID: normally the live reaper
 /// observes the death and persists "exited" itself within milliseconds. Wait a
 /// short grace period for that write; when the reaper is gone too (crash), do
 /// the reconcile in its place so no stale "running" record survives.
-pub fn settle_exit(store: &Store, id: &str) {
+pub fn settle_exit(store: &Store, id: &str) -> ZResult<()> {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         match ContainerState::load(store, id) {
-            None => return, // --rm already removed the record
-            Some(st) if st.status != Status::Running => return,
+            None => return Ok(()), // --rm already removed the record
+            Some(st) if st.status != Status::Running => return Ok(()),
             Some(_) => {}
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     if let Some(mut st) = ContainerState::load(store, id) {
-        if st.status == Status::Running && !st.pid_alive() && reconcile_stale(store, &mut st) {
-            let _ = st.save(store);
+        if st.status == Status::Running && !st.pid_alive() {
+            reconcile_stale_and_save(store, &mut st)?;
         }
     }
+    Ok(())
 }
 
 /// Reclaim host-side resources for an exited container that still holds them
@@ -682,6 +702,69 @@ mod attach_tests {
         assert!(!bytes.windows(b"second".len()).any(|w| w == b"second"));
         assert!(!dir.join("console.log.1").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_reconcile_persists_the_terminal_state() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-stale-reconcile-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.join("data"), root.join("run"));
+        store.ensure_dirs().unwrap();
+        let id = "0123456789ab";
+        let state = ContainerState {
+            version: 1,
+            id: id.to_string(),
+            name: None,
+            image: "rootfs:/tmp/rootfs".to_string(),
+            pid: Some(i32::MAX),
+            pid_start_time: None,
+            status: Status::Running,
+            paused: false,
+            exit_code: None,
+            created: state::now_rfc3339(),
+            started: Some(state::now_rfc3339()),
+            finished: None,
+            rootless: false,
+            net: "none".to_string(),
+            ports: Vec::new(),
+            port_protocols: None,
+            port_ips: None,
+            ip: None,
+            cmd: vec!["/bin/sh".to_string()],
+            env: Vec::new(),
+            cwd: None,
+            user: None,
+            capabilities: None,
+            seccomp: Some(crate::seccomp::SeccompMode::Unconfined),
+            log: String::new(),
+            log_max_size: None,
+            log_max_file: None,
+            lower: None,
+            rootfs: "/tmp/rootfs".to_string(),
+            overlay: None,
+            tmpfs_upper: false,
+            labels: std::collections::BTreeMap::new(),
+            launch_args: None,
+            table: None,
+            veth: None,
+            cgroup: None,
+            metrics: None,
+        };
+        state.save(&store).unwrap();
+
+        let mut loaded = ContainerState::load(&store, id).unwrap();
+        assert!(reconcile_stale_and_save(&store, &mut loaded).unwrap());
+        let persisted = ContainerState::load(&store, id).unwrap();
+        assert_eq!(persisted.status, Status::Exited);
+        assert_eq!(persisted.exit_code, Some(137));
+        assert!(persisted.finished.is_some());
+        assert!(!persisted.pid_alive());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
