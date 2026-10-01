@@ -281,9 +281,18 @@ jobs:
           status=$?
           set -e
           cat "$base/output"
-          test "$status" -eq 0
-          grep -Fx rootless-smoke-ok "$base/output"
-          grep -Fx container-uid=0 "$base/output"
+          if test "$status" -ne 0; then
+            echo "rootless workload exited with status $status" >&2
+            exit 90
+          fi
+          if ! grep -Fx rootless-smoke-ok "$base/output"; then
+            echo "rootless workload marker is missing" >&2
+            exit 91
+          fi
+          if ! grep -Fx container-uid=0 "$base/output"; then
+            echo "rootless container did not map uid 0" >&2
+            exit 92
+          fi
 
   rootful-integration:
     name: rootful integration (overlay/cgroup/bridge/ports)
