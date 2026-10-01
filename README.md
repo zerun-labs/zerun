@@ -42,6 +42,20 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   `ps [-a] [-q] [--format table|json] [--filter KEY=VALUE]`, `start`, `pause`, `unpause`, `stop`, `restart`,
   `rm`, `prune [-f] [--images]`, `logs [--since/--until/-f]`, `stats`, `exec`, `attach`, and `commit` address containers by id/name with crash reconcile
   of stale records; file-based IPAM; `--rm` for auto-removal (see AGENTS.md).
+- **M6 — operations and distribution (done)**: `generate-service` emits declarative foreground
+  systemd units; `install.sh` verifies checksums, detects architectures, supports rootless
+  installation, and creates the `ze` alias; Arch and Homebrew source packaging is included.
+- **M7 — introspection and storage controls (done)**: `inspect`, `port`, `rename`, `top`, `diff`,
+  `cp`, `export`, `import`, `events`, `update`, `system df`, live/rootfs `commit`, persisted
+  labels and user identity, OCI save/load/tag/push flows, and hardened state/resource cleanup.
+
+## Continuous integration
+
+Every push and pull request runs formatting, Clippy, the serialized unit/integration suite on
+Ubuntu 22.04 and 24.04, and the release-profile test suite. Dedicated rootful jobs exercise
+namespace isolation, OverlayFS, cgroups v2, bridge/veth networking, and TCP/UDP published-port
+proxies; static GNU and musl builds plus ARM64, ARMv7, and RISC-V64 cross-builds are checked as
+well. Tagged releases are gated on the source test suite before artifacts are published.
 
 ## Highlights
 
