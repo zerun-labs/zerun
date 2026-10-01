@@ -454,37 +454,38 @@ impl RegistryClient {
             url.push_str(&encode_query(default_scope));
         }
 
-        let resp = (0..3)
-            .find_map(|attempt| {
-                let mut request = self.agent.get(&url).set("User-Agent", USER_AGENT);
-                if let Some(credential) = credential {
-                    request = request.set("Authorization", &credential.authorization());
-                }
-                match request.call() {
-                    Ok(resp) => Some(Ok(resp)),
-                    Err(ureq::Error::Status(code, resp)) => {
-                        let retry_after = retry_after(&resp);
-                        let body = resp.into_string().unwrap_or_default();
-                        let err = crate::zerr!("token endpoint {url}: HTTP {code}: {body}");
-                        if is_retryable_status(code) && attempt < 2 {
-                            thread::sleep(retry_delay(attempt, retry_after));
-                            None
-                        } else {
-                            Some(Err(err))
-                        }
-                    }
-                    Err(other) => {
-                        let err = crate::zerr!("token endpoint {url}: {other}");
-                        if attempt < 2 {
-                            thread::sleep(retry_delay(attempt, None));
-                            None
-                        } else {
-                            Some(Err(err))
-                        }
+        let resp = match (0..3).find_map(|attempt| {
+            let mut request = self.agent.get(&url).set("User-Agent", USER_AGENT);
+            if let Some(credential) = credential {
+                request = request.set("Authorization", &credential.authorization());
+            }
+            match request.call() {
+                Ok(resp) => Some(Ok(resp)),
+                Err(ureq::Error::Status(code, resp)) => {
+                    let retry_after = retry_after(&resp);
+                    let body = resp.into_string().unwrap_or_default();
+                    let err = crate::zerr!("token endpoint {url}: HTTP {code}: {body}");
+                    if is_retryable_status(code) && attempt < 2 {
+                        thread::sleep(retry_delay(attempt, retry_after));
+                        None
+                    } else {
+                        Some(Err(err))
                     }
                 }
-            })
-            .expect("retry loop always returns a final result")?;
+                Err(other) => {
+                    let err = crate::zerr!("token endpoint {url}: {other}");
+                    if attempt < 2 {
+                        thread::sleep(retry_delay(attempt, None));
+                        None
+                    } else {
+                        Some(Err(err))
+                    }
+                }
+            }
+        }) {
+            Some(result) => result?,
+            None => return Err(crate::zerr!("token endpoint retry loop exhausted: {url}")),
+        };
         let body = resp
             .into_string()
             .map_err(|e| crate::zerr!("read token response: {e}"))?;
