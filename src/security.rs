@@ -296,27 +296,11 @@ pub fn switch_user(spec: Option<&str>, rootless: bool) -> ZResult<()> {
     }
     // Clear supplementary groups, then set gid before uid (the classic order:
     // after setgid, the effective uid is still root, so setuid is still allowed).
-    let rc = unsafe { libc::setgroups(0, std::ptr::null()) };
-    if rc != 0 {
-        return Err(crate::zerr!(
-            "setgroups failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    if unsafe { libc::setgid(resolved.gid) } != 0 {
-        return Err(crate::zerr!(
-            "setgid({}) failed: {}",
-            resolved.gid,
-            std::io::Error::last_os_error()
-        ));
-    }
-    if unsafe { libc::setuid(resolved.uid) } != 0 {
-        return Err(crate::zerr!(
-            "setuid({}) failed: {}",
-            resolved.uid,
-            std::io::Error::last_os_error()
-        ));
-    }
+    syscalls::clear_supplementary_groups()?;
+    syscalls::set_gid(resolved.gid)
+        .map_err(|e| crate::zerr!("setgid({}) failed: {e}", resolved.gid))?;
+    syscalls::set_uid(resolved.uid)
+        .map_err(|e| crate::zerr!("setuid({}) failed: {e}", resolved.uid))?;
     Ok(())
 }
 
@@ -426,44 +410,7 @@ fn apply_capabilities(keep: &CapabilitySet) -> ZResult<()> {
             syscalls::prctl_drop_cap(cap)?;
         }
     }
-    // glibc has no capset wrapper; use the raw syscall with the kernel ABI structs.
-    #[repr(C)]
-    struct CapUserHeader {
-        version: u32,
-        pid: libc::c_int,
-    }
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct CapUserData {
-        effective: u32,
-        permitted: u32,
-        inheritable: u32,
-    }
-    // _LINUX_CAPABILITY_VERSION_3
-    let header = CapUserHeader {
-        version: 0x2008_0522,
-        pid: 0,
-    };
-    let mut data = [
-        CapUserData {
-            effective: lo,
-            permitted: lo,
-            inheritable: lo,
-        },
-        CapUserData {
-            effective: hi,
-            permitted: hi,
-            inheritable: hi,
-        },
-    ];
-    let rc = unsafe { libc::syscall(libc::SYS_capset, &header, data.as_mut_ptr()) };
-    if rc != 0 {
-        return Err(crate::zerr!(
-            "capset failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(())
+    syscalls::set_capabilities(lo, hi)
 }
 
 /// Split a capability list into the two 32-bit words of the v3 ABI.

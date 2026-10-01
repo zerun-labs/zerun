@@ -362,6 +362,68 @@ pub fn prctl_drop_cap(cap: c_int) -> ZResult<()> {
     Ok(())
 }
 
+/// Clear supplementary groups before changing the primary group/UID.
+pub fn clear_supplementary_groups() -> ZResult<()> {
+    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+        return Err(last_err("setgroups"));
+    }
+    Ok(())
+}
+
+/// Set the effective and saved group identity for the workload.
+pub fn set_gid(gid: u32) -> ZResult<()> {
+    if unsafe { libc::setgid(gid as libc::gid_t) } != 0 {
+        return Err(last_err("setgid"));
+    }
+    Ok(())
+}
+
+/// Set the effective and saved user identity for the workload.
+pub fn set_uid(uid: u32) -> ZResult<()> {
+    if unsafe { libc::setuid(uid as libc::uid_t) } != 0 {
+        return Err(last_err("setuid"));
+    }
+    Ok(())
+}
+
+/// Set effective, permitted, and inheritable capabilities using the Linux
+/// v3 capability ABI.
+pub fn set_capabilities(low: u32, high: u32) -> ZResult<()> {
+    #[repr(C)]
+    struct CapUserHeader {
+        version: u32,
+        pid: libc::c_int,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CapUserData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    let header = CapUserHeader {
+        version: 0x2008_0522, // _LINUX_CAPABILITY_VERSION_3
+        pid: 0,
+    };
+    let mut data = [
+        CapUserData {
+            effective: low,
+            permitted: low,
+            inheritable: low,
+        },
+        CapUserData {
+            effective: high,
+            permitted: high,
+            inheritable: high,
+        },
+    ];
+    if unsafe { libc::syscall(libc::SYS_capset, &header, data.as_mut_ptr()) } != 0 {
+        return Err(last_err("capset"));
+    }
+    Ok(())
+}
+
 pub fn cap_last_cap() -> u32 {
     std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
         .ok()
