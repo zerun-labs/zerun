@@ -10,9 +10,12 @@
 //!   * C then setns(pid): a process cannot change its own PID namespace, but
 //!     every child born *after* that call is a member of the container's PID
 //!     namespace, so C forks the worker (D) next;
-//!   * D joins the container's cgroup (best effort), applies the same
-//!     no_new_privs -> caps -> seccomp hardening as the container, chdir()s to
-//!     the container working directory and execve()s the requested command.
+//!   * before joining the mount namespace, C opens the host cgroup's
+//!     `cgroup.procs` file; its descriptor remains valid after `/sys` becomes
+//!     the container view;
+//!   * D joins the container's cgroup through that retained descriptor, applies
+//!     the same no_new_privs -> caps -> seccomp hardening as the container,
+//!     chdir()s to the container working directory and execve()s the requested command.
 //!
 //! Joining the mount namespace means D shares the container's live rootfs and
 //! its /proc /dev /sys mounts — exactly what `docker exec` shows. D is born as
@@ -22,7 +25,7 @@
 use crate::error::ZResult;
 use crate::state::{ContainerState, Status};
 use crate::workload;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::path::Path;
 
 /// Join the running container described by `state` and run `argv` with the
@@ -134,6 +137,21 @@ fn joiner(
         }
     }
 
+    // After `setns(mnt)`, `/sys/fs/cgroup` resolves inside the container's
+    // mount namespace, where the host cgroup path in lifecycle state is not
+    // visible. Open the already-validated host cgroup file now and retain its
+    // descriptor across every setns call.
+    let cgroup_procs = match cgroup_path {
+        Some(path) => match open_cgroup_procs(path) {
+            Ok(file) => Some(file),
+            Err(error) => {
+                eprintln!("zerun exec: open cgroup {}: {error}", path.display());
+                return 1;
+            }
+        },
+        None => None,
+    };
+
     for (f, name) in ns.iter() {
         if *name == "pid" {
             continue; // handled below, right before the second fork
@@ -162,7 +180,7 @@ fn joiner(
             1
         }
         Ok(0) => {
-            let code = worker(state, cgroup_path, env_extra, workdir, argv);
+            let code = worker(state, cgroup_procs.as_ref(), env_extra, workdir, argv);
             crate::syscalls::exit_process(code)
         }
         Ok(d) => {
@@ -192,7 +210,7 @@ fn setns(f: &File, what: &str) -> Result<(), String> {
 /// The in-container worker: cgroup join, cwd, env, hardening, exec.
 fn worker(
     state: &ContainerState,
-    cgroup_path: Option<&Path>,
+    cgroup_procs: Option<&File>,
     env_extra: &[String],
     workdir: Option<&str>,
     argv: &[String],
@@ -201,9 +219,9 @@ fn worker(
     // against the same memory/cpu/pids limits. If the persisted cgroup has
     // disappeared or cannot be written, fail closed instead of running the
     // command outside the container's resource policy.
-    if let Some(cg) = cgroup_path {
-        if let Err(error) = join_cgroup(cg, std::process::id()) {
-            eprintln!("zerun exec: join cgroup {}: {error}", cg.display());
+    if let Some(procs) = cgroup_procs {
+        if let Err(error) = join_cgroup(procs, std::process::id()) {
+            eprintln!("zerun exec: join cgroup: {error}");
             return 1;
         }
     }
@@ -301,8 +319,17 @@ fn worker(
     1
 }
 
-fn join_cgroup(path: &Path, pid: u32) -> std::io::Result<()> {
-    std::fs::write(path.join("cgroup.procs"), pid.to_string())
+fn open_cgroup_procs(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .open(path.join("cgroup.procs"))
+}
+
+fn join_cgroup(procs: &File, pid: u32) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut procs = procs;
+    procs.write_all(pid.to_string().as_bytes())
 }
 
 fn upsert(env: &mut Vec<(String, String)>, key: &str, value: &str) {
@@ -315,7 +342,7 @@ fn upsert(env: &mut Vec<(String, String)>, key: &str, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::join_cgroup;
+    use super::{join_cgroup, open_cgroup_procs};
 
     #[test]
     fn join_cgroup_writes_the_worker_pid() {
@@ -326,7 +353,9 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        join_cgroup(&dir, 1234).unwrap();
+        std::fs::write(dir.join("cgroup.procs"), b"").unwrap();
+        let procs = open_cgroup_procs(&dir).unwrap();
+        join_cgroup(&procs, 1234).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("cgroup.procs")).unwrap(),
             "1234"
@@ -343,7 +372,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::write(&dir, b"not a directory").unwrap();
-        assert!(join_cgroup(&dir, 1234).is_err());
+        assert!(open_cgroup_procs(&dir).is_err());
         let _ = std::fs::remove_file(&dir);
     }
 }
