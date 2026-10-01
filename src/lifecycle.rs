@@ -540,25 +540,7 @@ pub fn reclaim_resources(store: &Store, st: &ContainerState) {
 
 /// Write all of `buf` to `fd`, tolerating EINTR (best effort).
 fn write_all(fd: RawFd, buf: &[u8]) -> ZResult<()> {
-    let mut off = 0;
-    while off < buf.len() {
-        let n = unsafe {
-            libc::write(
-                fd,
-                buf[off..].as_ptr() as *const libc::c_void,
-                buf.len() - off,
-            )
-        };
-        if n < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(e.into());
-        }
-        off += n as usize;
-    }
-    Ok(())
+    crate::syscalls::write_all_fd(fd, buf)
 }
 
 #[cfg(test)]
