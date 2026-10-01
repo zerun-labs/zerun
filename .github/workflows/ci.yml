@@ -251,11 +251,15 @@ jobs:
           fi
           test "$(sudo -u "$ci_user" id -u)" -ne 0
 
-          rootfs="$RUNNER_TEMP/zerun-rootless-rootfs"
-          data="$RUNNER_TEMP/zerun-rootless-data"
-          runtime="$RUNNER_TEMP/zerun-rootless-runtime"
-          home="$RUNNER_TEMP/zerun-rootless-home"
-          binary="$RUNNER_TEMP/zerun-rootless-bin"
+          # RUNNER_TEMP may be inaccessible to a newly-created account on
+          # hosted images; /tmp is intentionally traversable by unprivileged
+          # users, so keep every executable and runtime path below it.
+          base="/tmp/zerun-rootless-${GITHUB_RUN_ID:-$$}"
+          rootfs="$base/rootfs"
+          data="$base/data"
+          runtime="$base/runtime"
+          home="$base/home"
+          binary="$base/zerun"
           mkdir -p "$rootfs/bin" "$data" "$runtime" "$home"
           install -m 0755 /usr/bin/busybox "$rootfs/bin/busybox"
           install -m 0755 "$GITHUB_WORKSPACE/target/debug/zerun" "$binary"
