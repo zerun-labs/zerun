@@ -26,6 +26,12 @@ jobs:
       - name: Run all tests
         run: cargo test --locked --all-targets -- --test-threads=1
 
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit --version 0.22.2
+
+      - name: Audit locked dependencies
+        run: cargo audit
+
       - name: Run all tests in release mode
         run: cargo test --locked --release --all-targets -- --test-threads=1
 
