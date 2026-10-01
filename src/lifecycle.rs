@@ -461,19 +461,28 @@ pub fn reconcile_stale(store: &Store, st: &mut ContainerState) -> bool {
     if let Some(veth) = st.veth.as_deref() {
         crate::network::teardown_named(&st.id, veth, st.table.as_deref());
     }
+    let mut cgroup_reclaimed = true;
     if let Some(cg) = st.cgroup.as_deref() {
         let path = Path::new(cg);
         if crate::cgroup::CgroupV2::is_container_path(&st.id, path) {
             if path.exists() {
                 st.metrics = Some(state::ContainerMetrics::from_cgroup_path(path));
             }
-            let _ = std::fs::remove_dir(path);
+            if let Err(error) = crate::cgroup::CgroupV2::remove_for_container(&st.id, path) {
+                eprintln!(
+                    "zerun: warn: failed to reclaim cgroup {} for container {}: {error}",
+                    path.display(),
+                    st.id
+                );
+                cgroup_reclaimed = false;
+            }
         } else {
             eprintln!(
                 "zerun: warn: refusing to reclaim unexpected cgroup path {} for container {}",
                 path.display(),
                 st.id
             );
+            cgroup_reclaimed = false;
         }
     }
     if st.net == "bridge" {
@@ -485,7 +494,9 @@ pub fn reconcile_stale(store: &Store, st: &mut ContainerState) -> bool {
     st.finished = Some(state::now_rfc3339());
     st.table = None;
     st.veth = None;
-    st.cgroup = None;
+    if cgroup_reclaimed {
+        st.cgroup = None;
+    }
     // The per-run overlay may survive when the reaper died so the record can
     // still be committed/inspected; `rm` is the authoritative cleanup path.
     true
@@ -532,6 +543,16 @@ pub fn settle_exit(store: &Store, id: &str) -> ZResult<()> {
 pub fn reclaim_resources(store: &Store, st: &ContainerState) {
     if let Some(veth) = st.veth.as_deref() {
         crate::network::teardown_named(&st.id, veth, st.table.as_deref());
+    }
+    if let Some(cg) = st.cgroup.as_deref() {
+        let path = Path::new(cg);
+        if let Err(error) = crate::cgroup::CgroupV2::remove_for_container(&st.id, path) {
+            eprintln!(
+                "zerun: warn: failed to reclaim cgroup {} for container {}: {error}",
+                path.display(),
+                st.id
+            );
+        }
     }
     if st.net == "bridge" {
         crate::network::release_ip(store.run_root(), &st.id);

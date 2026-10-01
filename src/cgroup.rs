@@ -87,6 +87,38 @@ impl CgroupV2 {
         Self::container_path(id).is_ok_and(|expected| expected == persisted)
     }
 
+    /// Remove a lifecycle cgroup only when its persisted path is exactly the
+    /// path derived from the validated container id. Missing leaves are
+    /// already reconciled; an occupied leaf returns the kernel error so the
+    /// caller can retain the path and retry instead of losing the cleanup
+    /// authority from state.
+    pub fn remove_for_container(id: &str, persisted: &Path) -> ZResult<()> {
+        let expected = Self::container_path(id)?;
+        if persisted != expected {
+            return Err(crate::zerr!(
+                "refusing to remove cgroup {} for container {} (expected {})",
+                persisted.display(),
+                id,
+                expected.display()
+            ));
+        }
+        match fs::remove_dir(&expected) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(crate::zerr!(
+                    "remove cgroup {} failed: {e}",
+                    expected.display()
+                ))
+            }
+        }
+        // The parent is shared by all containers; remove it only when empty.
+        if let Some(parent) = expected.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+        Ok(())
+    }
+
     /// Create the sub-hierarchy <cgroup2>/zerun/<id>.
     ///
     /// cgroups v2 requires every controller to be enabled in the parent's
@@ -703,6 +735,13 @@ mod tests {
             "../outside",
             Path::new("/sys/fs/cgroup/zerun/../outside")
         ));
+    }
+
+    #[test]
+    fn remove_for_container_rejects_untrusted_paths() {
+        let err = CgroupV2::remove_for_container("0123456789ab", Path::new("/tmp/elsewhere"))
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing to remove cgroup"));
     }
 
     #[test]
