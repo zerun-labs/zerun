@@ -56,6 +56,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use store::Store;
 
+static EXPORT_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let code = match args.get(1).map(|s| s.as_str()) {
@@ -5182,13 +5184,7 @@ fn cmd_export(args: &[String]) -> i32 {
     };
     use std::io::Write as _;
     let result = if let Some(path) = output {
-        std::fs::File::create(&path)
-            .map_err(|e| crate::zerr!("create {}: {e}", path.display()))
-            .and_then(|mut f| {
-                archive_tree(&mut f, &root, &mounts)?;
-                f.flush()
-                    .map_err(|e| crate::zerr!("flush {}: {e}", path.display()))
-            })
+        export_to_file(&path, &root, &mounts)
     } else {
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
@@ -5200,6 +5196,46 @@ fn cmd_export(args: &[String]) -> i32 {
         return 1;
     }
     0
+}
+
+/// Write an export beside the requested destination and install it atomically.
+///
+/// The destination itself may already exist or be a symlink; rename replaces
+/// that directory entry rather than following it. The temporary file is
+/// created exclusively in the same directory so a concurrent writer cannot
+/// redirect the archive or expose a partial tarball.
+fn export_to_file(
+    output: &Path,
+    root: &Path,
+    mounts: &std::collections::HashSet<PathBuf>,
+) -> crate::error::ZResult<()> {
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = output
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("export.tar");
+    let sequence = EXPORT_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(".{name}.tmp-{}-{sequence}", std::process::id()));
+    fsutil::remove_dir_all_quiet(&temporary);
+    let guard = fsutil::TempFileGuard::new(temporary.clone());
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|e| crate::zerr!("create {}: {e}", temporary.display()))?;
+    archive_tree(&mut file, root, mounts)?;
+    file.flush()
+        .map_err(|e| crate::zerr!("flush {}: {e}", temporary.display()))?;
+    file.sync_all()
+        .map_err(|e| crate::zerr!("sync {}: {e}", temporary.display()))?;
+    std::fs::rename(&temporary, output)
+        .map_err(|e| crate::zerr!("install export {}: {e}", output.display()))?;
+    let _ = guard.persist();
+    Ok(())
 }
 
 /// Mount points below the container root, read from `/proc/<pid>/mountinfo`.
@@ -6080,6 +6116,41 @@ mod tests {
                 ("proc".to_string(), "dir".to_string()),
             ]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_to_file_replaces_symlink_without_following_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-export-atomic-{}-{}",
+            std::process::id(),
+            EXPORT_TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("root")).unwrap();
+        std::fs::write(dir.join("root/marker"), b"exported").unwrap();
+        let outside = dir.join("outside");
+        std::fs::write(&outside, b"must survive").unwrap();
+        let output = dir.join("result.tar");
+        std::os::unix::fs::symlink(&outside, &output).unwrap();
+
+        export_to_file(
+            &output,
+            &dir.join("root"),
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+
+        assert!(!std::fs::symlink_metadata(&output)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"must survive");
+        let mut archive = tar::Archive::new(std::fs::File::open(&output).unwrap());
+        assert!(archive
+            .entries()
+            .unwrap()
+            .any(|entry| entry.unwrap().path().unwrap() == Path::new("marker")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
