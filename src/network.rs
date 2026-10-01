@@ -41,7 +41,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// Transport protocol for a published port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,51 +203,139 @@ fn accept_loop(listener: TcpListener, container_ip: Ipv4Addr, container: u16) {
     }
 }
 
+const UDP_CLIENT_LIMIT: usize = 256;
+const UDP_CLIENT_IDLE: Duration = Duration::from_secs(60);
+const UDP_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+struct UdpClient {
+    upstream: UdpSocket,
+    last_seen: Instant,
+    stop: Arc<AtomicBool>,
+}
+
+fn stop_udp_client(client: UdpClient) {
+    client.stop.store(true, Ordering::Release);
+    // Dropping the map-owned clone does not close the worker's socket, but the
+    // worker uses a short receive timeout and observes the stop flag.
+    drop(client);
+}
+
+fn prune_udp_clients(clients: &mut HashMap<SocketAddr, UdpClient>, now: Instant) {
+    let stale: Vec<SocketAddr> = clients
+        .iter()
+        .filter_map(|(address, client)| {
+            (now.duration_since(client.last_seen) >= UDP_CLIENT_IDLE).then_some(*address)
+        })
+        .collect();
+    for address in stale {
+        if let Some(client) = clients.remove(&address) {
+            stop_udp_client(client);
+        }
+    }
+}
+
 /// Receive datagrams from all clients and forward them to the container.
-/// Replies are sent from a per-client connected socket so multiple clients can
-/// use the same published host port independently.
+/// Replies are sent through a clone of the published host socket so clients
+/// observe the published host port as the source. Idle client mappings are
+/// reclaimed, and a hard limit prevents a source-port flood from creating an
+/// unbounded number of worker threads and sockets.
 fn udp_loop(listener: UdpSocket, container_ip: Ipv4Addr, container: u16) {
-    let mut clients: HashMap<SocketAddr, UdpSocket> = HashMap::new();
+    let _ = listener.set_read_timeout(Some(UDP_POLL_INTERVAL));
+    let mut clients: HashMap<SocketAddr, UdpClient> = HashMap::new();
+    let mut warned_full = false;
     let mut buf = [0u8; 65535];
-    while let Ok((len, client)) = listener.recv_from(&mut buf) {
-        let upstream = if let Some(upstream) = clients.get(&client) {
-            upstream
-        } else {
-            let (Ok(upstream), Ok(reply)) = (
-                UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)),
-                UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)),
-            ) else {
-                continue;
-            };
-            if upstream.connect((container_ip, container)).is_err()
-                || reply.connect(client).is_err()
+
+    loop {
+        let (len, client) = match listener.recv_from(&mut buf) {
+            Ok(packet) => packet,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
             {
+                prune_udp_clients(&mut clients, Instant::now());
                 continue;
             }
-            let Ok(registered) = upstream.try_clone() else {
-                continue;
-            };
-            if let Err(error) = thread::Builder::new()
-                .name("zerun-port-udp-client".to_string())
-                .spawn(move || {
-                    let mut buf = [0u8; 65535];
-                    while let Ok(len) = upstream.recv(&mut buf) {
-                        if reply.send(&buf[..len]).is_err() {
-                            break;
-                        }
-                    }
-                })
-            {
-                eprintln!("zerun: warn: failed to spawn UDP port client proxy: {error}");
-                continue;
-            }
-            clients.insert(client, registered);
-            let Some(upstream) = clients.get(&client) else {
-                continue;
-            };
-            upstream
+            Err(_) => break,
         };
-        let _ = upstream.send(&buf[..len]);
+        let now = Instant::now();
+        prune_udp_clients(&mut clients, now);
+
+        if let Some(existing) = clients.get_mut(&client) {
+            existing.last_seen = now;
+            if existing.upstream.send(&buf[..len]).is_err() {
+                if let Some(dead) = clients.remove(&client) {
+                    stop_udp_client(dead);
+                }
+            }
+            continue;
+        }
+
+        if clients.len() >= UDP_CLIENT_LIMIT {
+            if !warned_full {
+                eprintln!(
+                    "zerun: warn: UDP publish client limit ({UDP_CLIENT_LIMIT}) reached; dropping new clients"
+                );
+                warned_full = true;
+            }
+            continue;
+        }
+        warned_full = false;
+
+        let Ok(upstream) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+            continue;
+        };
+        let Ok(reply) = listener.try_clone() else {
+            continue;
+        };
+        if upstream.connect((container_ip, container)).is_err()
+            || upstream.set_read_timeout(Some(UDP_POLL_INTERVAL)).is_err()
+        {
+            continue;
+        }
+        let Ok(registered) = upstream.try_clone() else {
+            continue;
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        if let Err(error) = thread::Builder::new()
+            .name("zerun-port-udp-client".to_string())
+            .spawn(move || {
+                let mut buf = [0u8; 65535];
+                while !worker_stop.load(Ordering::Acquire) {
+                    match upstream.recv(&mut buf) {
+                        Ok(len) => {
+                            if reply.send_to(&buf[..len], client).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                            ) => {}
+                        Err(_) => break,
+                    }
+                }
+            })
+        {
+            eprintln!("zerun: warn: failed to spawn UDP port client proxy: {error}");
+            continue;
+        }
+        let _ = registered.send(&buf[..len]);
+        clients.insert(
+            client,
+            UdpClient {
+                upstream: registered,
+                last_seen: now,
+                stop,
+            },
+        );
+    }
+
+    for (_, client) in clients.drain() {
+        stop_udp_client(client);
     }
 }
 
@@ -615,6 +706,25 @@ fn enable_ip_forward() -> ZResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn udp_client_expiry_signals_worker_stop() {
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut clients = HashMap::new();
+        clients.insert(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 12345)),
+            UdpClient {
+                upstream: socket,
+                last_seen: Instant::now() - UDP_CLIENT_IDLE,
+                stop: Arc::clone(&stop),
+            },
+        );
+
+        prune_udp_clients(&mut clients, Instant::now());
+        assert!(clients.is_empty());
+        assert!(stop.load(Ordering::Acquire));
+    }
 
     #[test]
     fn legacy_resource_names_are_container_specific() {
