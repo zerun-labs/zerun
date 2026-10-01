@@ -125,18 +125,25 @@ fetch "$base/$archive.sha256" "$tmpdir/$archive.sha256"
 
 cd "$tmpdir"
 $CHECKSUM -c "$archive.sha256" >/dev/null
-tar -xzf "$archive"
 
-[ -f zerun ] || die "downloaded archive did not contain a `zerun` binary"
-chmod 0755 zerun
+# Release archives are produced by the repository workflow and must contain
+# exactly one regular entry. Reject extra or path-traversal entries before
+# extraction so a compromised archive cannot write outside the temporary tree.
+entries=$(tar -tzf "$archive") || die "cannot inspect downloaded archive"
+[ "$entries" = "zerun" ] || die "downloaded archive contains unexpected entries"
+tar -xzf "$archive" -C "$tmpdir" -o --no-same-permissions -- zerun
+
+[ -f "$tmpdir/zerun" ] && [ ! -L "$tmpdir/zerun" ] || \
+die "downloaded archive did not contain a regular `zerun` binary"
+chmod 0755 "$tmpdir/zerun"
 
 if [ -n "$SUDO" ]; then
     $SUDO mkdir -p "$PREFIX/bin"
-    $SUDO install -m 0755 zerun "$PREFIX/bin/zerun"
+    $SUDO install -m 0755 "$tmpdir/zerun" "$PREFIX/bin/zerun"
     $SUDO ln -sfn zerun "$PREFIX/bin/ze"
 else
     mkdir -p "$PREFIX/bin"
-    install -m 0755 zerun "$PREFIX/bin/zerun"
+    install -m 0755 "$tmpdir/zerun" "$PREFIX/bin/zerun"
     ln -sfn zerun "$PREFIX/bin/ze"
 fi
 
