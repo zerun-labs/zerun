@@ -339,7 +339,10 @@ impl Nftables {
             match self.sock.recv(&mut buf, 0) {
                 Ok(n) => {
                     if first_error.is_none() {
-                        first_error = parse_nlmsg_error(&storage[..n]);
+                        match parse_nlmsg_error(&storage[..n]) {
+                            Ok(error) => first_error = error,
+                            Err(()) => first_error = Some(libc::EPROTO),
+                        }
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -368,15 +371,35 @@ fn parse_rule_dump(
     out: &mut Vec<RuleRecord>,
 ) -> ZResult<bool> {
     let mut off = 0;
-    while off + 16 <= buf.len() {
-        let len = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
-        if len < 16 || off + len > buf.len() {
+    while off < buf.len() {
+        if buf.len() - off < 16 {
+            return Err(crate::zerr!(
+                "nftables: truncated rule dump header at offset {off}"
+            ));
+        }
+        let len = u32::from_ne_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
+        let end = off.checked_add(len).ok_or_else(|| {
+            crate::zerr!("nftables: rule dump length overflows at offset {off}: len={len}")
+        })?;
+        if len < 16 || end > buf.len() {
             return Err(crate::zerr!(
                 "nftables: malformed rule dump header at offset {off}: len={len}, packet={}",
                 buf.len()
             ));
         }
-        let msg_type = u16::from_ne_bytes(buf[off + 4..off + 6].try_into().unwrap());
+        let aligned_len = len.checked_add(3).map(|value| value & !3).ok_or_else(|| {
+            crate::zerr!("nftables: rule dump alignment overflows at offset {off}: len={len}")
+        })?;
+        let next = off.checked_add(aligned_len).ok_or_else(|| {
+            crate::zerr!("nftables: rule dump offset overflows at offset {off}: len={len}")
+        })?;
+        if next > buf.len() {
+            return Err(crate::zerr!(
+                "nftables: malformed rule dump padding at offset {off}: len={len}, packet={}",
+                buf.len()
+            ));
+        }
+        let msg_type = u16::from_ne_bytes([buf[off + 4], buf[off + 5]]);
         if msg_type == NLMSG_DONE {
             return Ok(true);
         }
@@ -384,12 +407,16 @@ fn parse_rule_dump(
             if len < 20 {
                 return Err(crate::zerr!("nftables: malformed rule dump error"));
             }
-            let err = i32::from_ne_bytes(buf[off + 16..off + 20].try_into().unwrap());
+            let err =
+                i32::from_ne_bytes([buf[off + 16], buf[off + 17], buf[off + 18], buf[off + 19]]);
             if err != 0 {
-                return Err(nft_errno("dump NAT rules", -err));
+                let code = err
+                    .checked_neg()
+                    .ok_or_else(|| crate::zerr!("nftables: invalid negative errno {err}"))?;
+                return Err(nft_errno("dump NAT rules", code));
             }
         } else if len >= 20 {
-            let attrs = parse_attrs(&buf[off + 20..off + len])?;
+            let attrs = parse_attrs(&buf[off + 20..end])?;
             let mut rule_table = None;
             let mut rule_chain = None;
             let mut handle = None;
@@ -399,7 +426,10 @@ fn parse_rule_dump(
                     NFTA_RULE_TABLE => rule_table = parse_string(value),
                     NFTA_RULE_CHAIN => rule_chain = parse_string(value),
                     NFTA_RULE_HANDLE if value.len() == 8 => {
-                        handle = Some(u64::from_be_bytes(value.try_into().unwrap()));
+                        handle = Some(u64::from_be_bytes([
+                            value[0], value[1], value[2], value[3], value[4], value[5], value[6],
+                            value[7],
+                        ]));
                     }
                     NFTA_RULE_USERDATA => userdata = Some(value.to_vec()),
                     _ => {}
@@ -409,7 +439,7 @@ fn parse_rule_dump(
                 out.push(RuleRecord { handle, userdata });
             }
         }
-        off += (len + 3) & !3;
+        off = next;
     }
     Ok(false)
 }
@@ -436,39 +466,60 @@ fn parse_attrs(buf: &[u8]) -> ZResult<Vec<(u16, &[u8])>> {
         if buf.len() - off < 4 {
             return Err(crate::zerr!("nftables: malformed attribute header"));
         }
-        let len = u16::from_ne_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
-        if len < 4 || off + len > buf.len() {
+        let len = u16::from_ne_bytes([buf[off], buf[off + 1]]) as usize;
+        let end = off.checked_add(len).ok_or_else(|| {
+            crate::zerr!("nftables: attribute length overflows at offset {off}: len={len}")
+        })?;
+        if len < 4 || end > buf.len() {
             return Err(crate::zerr!("nftables: malformed attribute"));
         }
-        let aligned_len = (len + 3) & !3;
-        if off + aligned_len > buf.len() {
+        let aligned_len = len.checked_add(3).map(|value| value & !3).ok_or_else(|| {
+            crate::zerr!("nftables: attribute alignment overflows at offset {off}: len={len}")
+        })?;
+        let next = off.checked_add(aligned_len).ok_or_else(|| {
+            crate::zerr!("nftables: attribute offset overflows at offset {off}: len={len}")
+        })?;
+        if next > buf.len() {
             return Err(crate::zerr!("nftables: malformed attribute padding"));
         }
-        let typ = u16::from_ne_bytes(buf[off + 2..off + 4].try_into().unwrap()) & NLA_TYPE_MASK;
-        attrs.push((typ, &buf[off + 4..off + len]));
-        off += aligned_len;
+        let typ = u16::from_ne_bytes([buf[off + 2], buf[off + 3]]) & NLA_TYPE_MASK;
+        attrs.push((typ, &buf[off + 4..end]));
+        off = next;
     }
     Ok(attrs)
 }
 
-/// First `NLMSG_ERROR` in `buf`: returns the (negative) errno, if any.
-fn parse_nlmsg_error(buf: &[u8]) -> Option<i32> {
+/// First `NLMSG_ERROR` in `buf`: returns the positive errno, if any.
+fn parse_nlmsg_error(buf: &[u8]) -> Result<Option<i32>, ()> {
     let mut off = 0;
-    while off + 16 <= buf.len() {
-        let len = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
-        if len < 16 || off + len > buf.len() {
-            break;
+    while off < buf.len() {
+        if buf.len() - off < 16 {
+            return Err(());
         }
-        let msg_type = u16::from_ne_bytes(buf[off + 4..off + 6].try_into().unwrap());
-        if msg_type == NLMSG_ERROR && off + 20 <= buf.len() {
-            let err = i32::from_ne_bytes(buf[off + 16..off + 20].try_into().unwrap());
+        let len = u32::from_ne_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
+        let end = off.checked_add(len).ok_or(())?;
+        if len < 16 || end > buf.len() {
+            return Err(());
+        }
+        let aligned_len = len.checked_add(3).map(|value| value & !3).ok_or(())?;
+        let next = off.checked_add(aligned_len).ok_or(())?;
+        if next > buf.len() {
+            return Err(());
+        }
+        let msg_type = u16::from_ne_bytes([buf[off + 4], buf[off + 5]]);
+        if msg_type == NLMSG_ERROR {
+            if len < 20 {
+                return Err(());
+            }
+            let err =
+                i32::from_ne_bytes([buf[off + 16], buf[off + 17], buf[off + 18], buf[off + 19]]);
             if err < 0 {
-                return Some(-err);
+                return err.checked_neg().map(Some).ok_or(());
             }
         }
-        off += (len + 3) & !3;
+        off = next;
     }
-    None
+    Ok(None)
 }
 
 // --- low-level encoders -------------------------------------------------------
@@ -757,6 +808,26 @@ mod tests {
         assert!(parse_attrs(&[0, 0, 0]).is_err());
         // nla_len says five bytes, but the four-byte alignment needs eight.
         assert!(parse_attrs(&[5, 0, 1, 0, 1, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn netlink_parsers_reject_trailing_and_overflowing_frames() {
+        let mut rules = Vec::new();
+        assert!(parse_rule_dump(&[0; 15], "zerun-nat", "postrouting", &mut rules).is_err());
+        assert!(parse_nlmsg_error(&[0; 15]).is_err());
+
+        let mut message = nlmsg(NLMSG_DONE, 0, &[]);
+        message[..4].copy_from_slice(&u32::MAX.to_ne_bytes());
+        assert!(parse_rule_dump(&message, "zerun-nat", "postrouting", &mut rules).is_err());
+        assert!(parse_nlmsg_error(&message).is_err());
+
+        let mut error_message = nlmsg(NLMSG_ERROR, 0, &[0; 4]);
+        error_message[16..20].copy_from_slice(&i32::MIN.to_ne_bytes());
+        assert!(parse_nlmsg_error(&error_message).is_err());
+
+        let mut attribute = vec![0; 4];
+        attribute[..2].copy_from_slice(&u16::MAX.to_ne_bytes());
+        assert!(parse_attrs(&attribute).is_err());
     }
 
     #[test]
