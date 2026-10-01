@@ -96,9 +96,7 @@ static TARGET_CHILD: AtomicI32 = AtomicI32::new(0);
 extern "C" fn forward_to_child(sig: libc::c_int) {
     let pid = TARGET_CHILD.load(Ordering::Relaxed);
     if pid > 0 {
-        unsafe {
-            libc::kill(pid, sig);
-        }
+        crate::syscalls::signal_process(pid, sig);
     }
 }
 

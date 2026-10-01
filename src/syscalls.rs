@@ -559,6 +559,17 @@ pub fn kill(pid: libc::pid_t, signal: c_int) -> ZResult<()> {
     Ok(())
 }
 
+/// Best-effort signal delivery for an async signal handler.
+///
+/// The handler must not allocate or format an error, so this intentionally
+/// discards the return value. Ordinary lifecycle code should use [`kill`]
+/// instead so failures remain visible to the caller.
+pub fn signal_process(pid: libc::pid_t, signal: c_int) {
+    unsafe {
+        libc::kill(pid, signal);
+    }
+}
+
 /// Duplicate a file descriptor (`new` replaces it and is not CLOEXEC).
 pub fn dup2(old: RawFd, new: RawFd) -> ZResult<()> {
     if unsafe { libc::dup2(old, new) } < 0 {
