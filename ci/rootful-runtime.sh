@@ -162,4 +162,49 @@ wait_status=$("${zerun[@]}" wait "$container_id")
 test "$wait_status" -ne 0
 "${zerun[@]}" rm "$container_id" >/dev/null
 
+# UDP publishing uses the same in-binary proxy, but replies must retain the
+# published host port as their source. The CI fixture includes a tiny static
+# UDP echo helper; local callers with older fixtures skip this optional check.
+if [[ -x "$rootfs/bin/udp-echo" ]]; then
+  command -v python3 >/dev/null || {
+    echo "UDP published-port check requires python3 on the host" >&2
+    exit 1
+  }
+  udp_port=$(find_free_tcp_port)
+  udp_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net bridge \
+    -p "$udp_port:8081/udp" --init -- /bin/udp-echo 8081)
+  cleanup_ids+=("$udp_id")
+  python3 - "$udp_port" <<'PY'
+import socket
+import sys
+import time
+
+port = int(sys.argv[1])
+payload = b"zerun-udp-ok"
+last_error = None
+for _ in range(25):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(0.4)
+    try:
+        sock.sendto(payload, ("127.0.0.1", port))
+        response, peer = sock.recvfrom(65535)
+        if response == payload and peer[1] == port:
+            break
+        last_error = f"unexpected UDP response={response!r} peer={peer!r}"
+    except OSError as error:
+        last_error = error
+    finally:
+        sock.close()
+    time.sleep(0.2)
+else:
+    raise SystemExit(f"published UDP port did not become ready: {last_error}")
+PY
+  "${zerun[@]}" kill --signal TERM "$udp_id" >/dev/null
+  udp_wait_status=$("${zerun[@]}" wait "$udp_id")
+  test "$udp_wait_status" -ne 0
+  "${zerun[@]}" rm "$udp_id" >/dev/null
+else
+  echo "skipping optional UDP published-port check: $rootfs/bin/udp-echo is missing" >&2
+fi
+
 echo "rootful-runtime-ok"
