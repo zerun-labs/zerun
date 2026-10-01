@@ -267,16 +267,20 @@ jobs:
           sudo chown -R "$ci_user:" "$rootfs" "$data" "$runtime" "$home"
           sudo chown "$ci_user:" "$binary"
 
-          output=$(
-            sudo -u "$ci_user" env \
+          set +e
+          timeout --foreground 30s sudo -u "$ci_user" env \
             HOME="$home" \
             ZERUN_DATA_ROOT="$data" \
             ZERUN_RUNTIME_ROOT="$runtime" \
             "$binary" run --rootfs "$rootfs" --net none --no-overlay --init -- \
-            /bin/sh -c 'printf "rootless-smoke-ok\n"; test "$(/bin/busybox id -u)" -eq 0'
-          )
-          printf '%s\n' "$output"
-          grep -Fx rootless-smoke-ok <<<"$output"
+            /bin/sh -c 'printf "rootless-smoke-ok\n"; printf "container-uid=%s\n" "$(/bin/busybox id -u)"' \
+            >"$base/output" 2>&1
+          status=$?
+          set -e
+          cat "$base/output"
+          test "$status" -eq 0
+          grep -Fx rootless-smoke-ok "$base/output"
+          grep -Fx container-uid=0 "$base/output"
 
   rootful-integration:
     name: rootful integration (overlay/cgroup/bridge/ports)
