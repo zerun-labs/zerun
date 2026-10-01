@@ -292,9 +292,11 @@ where
     }
 
     // Forward terminal signals to the container PID 1.
-    install_forward(libc::SIGINT);
-    install_forward(libc::SIGTERM);
-    install_forward(libc::SIGHUP);
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        if let Err(error) = install_forward(signal) {
+            eprintln!("zerun: warning: install signal forwarder: {error}");
+        }
+    }
 
     // Block on the error pipe: EOF means the child successfully exec'd
     // (CLOEXEC closes the write end).
@@ -645,13 +647,8 @@ fn net_sync_wait(fd: RawFd) -> ZResult<()> {
     }
 }
 
-fn install_forward(sig: libc::c_int) {
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = forward_to_child as extern "C" fn(libc::c_int) as usize;
-        libc::sigemptyset(&mut sa.sa_mask as *mut libc::sigset_t);
-        libc::sigaction(sig, &sa, std::ptr::null_mut());
-    }
+fn install_forward(sig: libc::c_int) -> ZResult<()> {
+    syscalls::install_signal_handler(sig, forward_to_child)
 }
 
 fn read_all(fd: RawFd, buf: &mut [u8]) -> ZResult<usize> {

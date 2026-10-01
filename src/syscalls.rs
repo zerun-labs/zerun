@@ -309,6 +309,20 @@ pub fn install_signal_handler(sig: c_int, handler: extern "C" fn(c_int)) -> ZRes
     Ok(())
 }
 
+/// Restore the default disposition for a signal in a forked child.
+pub fn reset_signal_handler(sig: c_int) -> ZResult<()> {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        if libc::sigaction(sig, &sa, std::ptr::null_mut()) != 0 {
+            return Err(last_err("sigaction"));
+        }
+    }
+    Ok(())
+}
+
 pub fn poll_fds(fds: &mut [libc::pollfd], timeout: c_int) -> ZResult<usize> {
     loop {
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };

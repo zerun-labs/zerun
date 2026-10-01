@@ -36,25 +36,17 @@ pub fn run(
         return Err(crate::zerr!("__init: missing business command"));
     }
 
-    // Install forwarding handlers.
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = forward_signal as extern "C" fn(libc::c_int) as usize;
-        libc::sigemptyset(&mut sa.sa_mask as *mut libc::sigset_t);
-        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
-        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
-        // init itself ignores SIGPIPE/SIGHUP termination semantics; the workload
-        // decides how to handle them.
-    }
+    // Install forwarding handlers. Init itself ignores SIGPIPE/SIGHUP
+    // termination semantics; the workload decides how to handle them.
+    crate::syscalls::install_signal_handler(libc::SIGTERM, forward_signal)?;
+    crate::syscalls::install_signal_handler(libc::SIGINT, forward_signal)?;
 
     let pid = crate::syscalls::fork_process()
         .map_err(|error| crate::zerr!("fork in mini-init: {error}"))?;
     if pid == 0 {
         // Workload child (container PID 2): restore default signal handling, then exec.
-        unsafe {
-            libc::signal(libc::SIGTERM, libc::SIG_DFL);
-            libc::signal(libc::SIGINT, libc::SIG_DFL);
-        }
+        crate::syscalls::reset_signal_handler(libc::SIGTERM)?;
+        crate::syscalls::reset_signal_handler(libc::SIGINT)?;
         exec_business(business, env, hostname, id)?;
         unreachable!("exec failure is returned as Err");
     }
