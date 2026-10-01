@@ -91,6 +91,16 @@ readonly_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
 grep -Fx tmpfs-ok <<<"$readonly_output" >/dev/null
 test ! -e "$rootfs/readonly-marker"
 
+# Managed named volumes must persist independently of the container rootfs.
+# The first run writes through the volume and the second run reads it back.
+volume_write=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+  -v ci-volume:/mnt/data:rw --init -- /bin/sh -c \
+  'printf "volume-ok\n" >/mnt/data/marker; cat /mnt/data/marker')
+grep -Fx volume-ok <<<"$volume_write" >/dev/null
+volume_read=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+  -v ci-volume:/mnt/data:ro --init -- /bin/sh -c 'cat /mnt/data/marker')
+grep -Fx volume-ok <<<"$volume_read" >/dev/null
+
 # Resource limits require an actual cgroup v2 hierarchy and exercise the
 # parent-side cgroup creation/attach path.
 cgroup_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
