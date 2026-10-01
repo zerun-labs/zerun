@@ -361,6 +361,13 @@ pub fn write_all_fd(fd: RawFd, data: &[u8]) -> ZResult<()> {
             }
             return Err(e.into());
         }
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write returned zero bytes",
+            )
+            .into());
+        }
         written += n as usize;
     }
     Ok(())
@@ -783,6 +790,7 @@ pub fn cstr_to_string(p: *const libc::c_char) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn host_query_wrappers_are_safe_and_sane() {
@@ -802,6 +810,24 @@ mod tests {
         let pid = std::process::id() as libc::pid_t;
         let pidfd = pidfd_open(pid).expect("pidfd_open should be available on supported Linux");
         pidfd_send_signal(pidfd.as_raw_fd(), 0).expect("pidfd signal 0 should probe the process");
+    }
+
+    #[test]
+    fn write_all_fd_writes_the_complete_buffer() {
+        let (read_fd, write_fd) = pipe2_cloexec().expect("pipe2 should succeed");
+        let reader = unsafe { OwnedFd::from_raw_fd(read_fd) };
+        let writer = unsafe { OwnedFd::from_raw_fd(write_fd) };
+        let expected = b"zerun syscall write";
+
+        write_all_fd(writer.as_raw_fd(), expected).expect("pipe write should succeed");
+        drop(writer);
+
+        let mut reader = std::fs::File::from(reader);
+        let mut actual = Vec::new();
+        reader
+            .read_to_end(&mut actual)
+            .expect("pipe read should succeed");
+        assert_eq!(actual, expected);
     }
 
     #[test]
