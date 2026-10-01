@@ -7,8 +7,9 @@
 //! (see `pull::spool_layer`).
 use crate::error::ZResult;
 use crate::fsutil;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
 const WHITEOUT_PREFIX: &str = ".wh.";
@@ -111,7 +112,12 @@ fn apply_entry<R: Read>(
                     let _ = fs::remove_file(&dest); // file or symlink replaced by a file
                 }
             }
-            let mut f = fs::File::create(&dest)
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&dest)
                 .map_err(|e| crate::zerr!("create {}: {e}", dest.display()))?;
             io::copy(entry, &mut f).map_err(|e| crate::zerr!("write {}: {e}", dest.display()))?;
             set_mode_if_possible(&dest, header.mode()?);

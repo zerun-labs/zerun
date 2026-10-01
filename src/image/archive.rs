@@ -19,7 +19,7 @@ use crate::image::pull::materialize_local_rootfs;
 use crate::image::store::{digest_hex, ImageRecord, ImageStore};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read};
 use std::path::{Component, Path, PathBuf};
 
@@ -103,7 +103,10 @@ pub fn save_images(
         )?;
         fsutil::atomic_write(&layout.join("index.json"), index.to_string().as_bytes())?;
 
-        let file = File::create(&tmp_tar)
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_tar)
             .map_err(|e| crate::zerr!("create {}: {e}", tmp_tar.display()))?;
         let mut builder = tar::Builder::new(file);
         builder

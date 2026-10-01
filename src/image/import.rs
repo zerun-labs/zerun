@@ -11,6 +11,7 @@ use crate::fsutil;
 use crate::image::commit::{commit_image, CommitOptions};
 use crate::image::pull::open_layer_reader;
 use crate::image::store::ImageStore;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 
@@ -36,8 +37,11 @@ pub fn import_image(
         fsutil::remove_dir_all_quiet(&tmp);
         let _ = std::fs::remove_file(&tmp);
         let spool_guard = fsutil::TempFileGuard::new(tmp.clone());
-        let mut file =
-            std::fs::File::create(&tmp).map_err(|e| crate::zerr!("create import spool: {e}"))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| crate::zerr!("create import spool: {e}"))?;
         std::io::copy(&mut std::io::stdin().lock(), &mut file)
             .map_err(|e| crate::zerr!("read import stream from stdin: {e}"))?;
         file.flush()

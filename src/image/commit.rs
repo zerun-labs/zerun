@@ -15,7 +15,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -221,7 +221,10 @@ fn copy_dir_mode(from: &Path, to: &Path) {
 }
 
 fn create_layer(source_rootfs: &Path, compressed_path: &Path) -> ZResult<(String, u64)> {
-    let file = File::create(compressed_path)
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(compressed_path)
         .map_err(|e| crate::zerr!("create committed layer temp: {e}"))?;
     let encoder = GzEncoder::new(file, Compression::new(6));
     let mut hash_writer = HashWriter::new(encoder);
