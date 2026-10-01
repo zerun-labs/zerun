@@ -4,7 +4,7 @@
 //! Besides hard limits it applies `memory.high` (soft reservation) and
 //! `memory.oom.group` for all-at-once OOM behavior. A systemd-scope driver and
 //! a cgroups v1 fallback belong to later milestones.
-use crate::error::{last_err, ZResult};
+use crate::error::ZResult;
 use crate::trace;
 use std::collections::BTreeMap;
 use std::fs;
@@ -250,7 +250,11 @@ impl CgroupV2 {
             Ok(_) => Ok(()),
             Err(e) => match e.raw_os_error() {
                 Some(libc::ESRCH) | Some(libc::ENOENT) => Ok(()),
-                _ => Err(last_err("write cgroup.procs")),
+                _ => Err(crate::zerr!(
+                    "write {} = {} failed: {e}",
+                    self.path.join("cgroup.procs").display(),
+                    pid
+                )),
             },
         }
     }
