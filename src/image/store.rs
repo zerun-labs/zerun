@@ -65,8 +65,14 @@ impl ImageStore {
     }
 
     fn ensure_dirs(&self) -> ZResult<()> {
-        fsutil::mkdir_p(&self.data_root.join("blobs").join("sha256"))?;
-        fsutil::mkdir_p(&self.data_root.join("rootfs"))?;
+        // Image configs and layers may come from private registries. Keep the
+        // entire image store owner-only, including trees created by older
+        // versions that used the process umask alone.
+        let blobs = self.data_root.join("blobs");
+        fsutil::mkdir_p_mode(&self.data_root, 0o700)?;
+        fsutil::mkdir_p_mode(&blobs, 0o700)?;
+        fsutil::mkdir_p_mode(&blobs.join("sha256"), 0o700)?;
+        fsutil::mkdir_p_mode(&self.data_root.join("rootfs"), 0o700)?;
         Ok(())
     }
 
@@ -783,6 +789,31 @@ mod tests {
         assert!(protected.join("marker").is_file());
         assert!(!orphan.exists());
         let _ = fs::remove_dir_all(&s.data_root);
+    }
+
+    #[test]
+    fn image_store_directories_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-image-store-mode-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let store = ImageStore::at(&dir).unwrap();
+        for path in [
+            dir.clone(),
+            dir.join("blobs"),
+            dir.join("blobs/sha256"),
+            store.rootfs_dir(),
+        ] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
