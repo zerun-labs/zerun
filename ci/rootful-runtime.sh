@@ -45,6 +45,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Pick a high, currently unused TCP port instead of assuming a shared runner
+# has 18080 available. The check is intentionally only a race-avoidance hint:
+# Zerun still binds the published port before cloning the container, so its
+# own bind remains the authoritative conflict check.
+find_free_tcp_port() {
+  local candidate=$((18080 + (BASHPID % 1000)))
+  local attempt
+  for attempt in $(seq 1 1000); do
+    if ! (echo >/dev/tcp/127.0.0.1/"$candidate") 2>/dev/null; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    candidate=$((candidate + 1))
+  done
+  echo "could not find a free TCP port for the published-port check" >&2
+  return 1
+}
+
 # A foreground run proves the namespace/pivot/init path and preserves the
 # workload exit code instead of treating a non-zero workload status as a
 # runtime failure.
@@ -121,7 +139,7 @@ grep -Fx bridge-ok <<<"$bridge_output" >/dev/null
 
 # Published ports use Zerun's built-in proxy. Keep the workload in a
 # detached container so the listener remains alive while curl connects.
-port=18080
+port=$(find_free_tcp_port)
 container_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net bridge \
   -p "$port:8080" --init -- /bin/httpd -f -p 8080 -h /srv)
 cleanup_ids+=("$container_id")
