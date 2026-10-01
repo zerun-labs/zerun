@@ -2989,10 +2989,22 @@ fn cmd_doctor() -> i32 {
         Err(_) => println!("overlayfs      : unknown"),
     }
     println!("cap_last_cap   : {}", syscalls::cap_last_cap());
-    let data = Store::detect()
-        .map(|s| s.data_root().display().to_string())
-        .unwrap_or_else(|e| format!("<error: {e}>"));
-    println!("data root      : {data}");
+    match Store::detect() {
+        Ok(store) => {
+            println!("data root      : {}", store.data_root().display());
+            println!("runtime root   : {}", store.run_root().display());
+            match network::check_ipam_state(store.run_root()) {
+                Ok(false) => println!("bridge IPAM    : not initialized"),
+                Ok(true) => println!("bridge IPAM    : OK"),
+                Err(error) => println!("bridge IPAM    : INVALID ({error})"),
+            }
+        }
+        Err(error) => {
+            println!("data root      : <error: {error}>");
+            println!("runtime root   : <error>");
+            println!("bridge IPAM    : unknown");
+        }
+    }
     println!(
         "uid            : {} (rootful isolation needs uid=0; non-root goes rootless via NEWUSER)",
         syscalls::effective_uid()

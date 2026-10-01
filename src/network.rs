@@ -329,6 +329,18 @@ fn write_ipam(path: &Path, map: &BTreeMap<String, Ipv4Addr>) -> ZResult<()> {
     crate::fsutil::atomic_write(path, &json)
 }
 
+/// Validate the persisted IPAM state without creating runtime directories.
+///
+/// The doctor command uses this read-only probe to distinguish a missing state
+/// file from a corrupted one before the next bridge run encounters it.
+pub fn check_ipam_state(run_root: &Path) -> ZResult<bool> {
+    let path = ipam_file(run_root);
+    if !path.exists() {
+        return Ok(false);
+    }
+    read_ipam(&path).map(|_| true)
+}
+
 /// Acquire an exclusive advisory lock on the IPAM file (blocking).
 fn lock_ipam(run_root: &Path) -> std::io::Result<std::fs::File> {
     let lock = ipam_lock(run_root);
@@ -608,5 +620,21 @@ mod tests {
         let mut duplicate = valid.clone();
         duplicate.insert("abcdef".to_string(), Ipv4Addr::new(10, 88, 0, 42));
         assert!(validate_ipam(&duplicate).is_err());
+    }
+
+    #[test]
+    fn ipam_probe_distinguishes_missing_and_invalid_state() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-network-ipam-probe-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let net = root.join("net");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&net).unwrap();
+        assert!(!check_ipam_state(&root).unwrap());
+        std::fs::write(net.join("ipam.json"), b"not json").unwrap();
+        assert!(check_ipam_state(&root).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
