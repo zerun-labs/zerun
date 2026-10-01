@@ -37,7 +37,7 @@ use crate::error::ZResult;
 use crate::netlink::Netlink;
 use crate::nfnetlink::{NatConfig, Nftables};
 use crate::trace;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::path::Path;
@@ -218,9 +218,10 @@ fn udp_loop(listener: UdpSocket, container_ip: Ipv4Addr, container: u16) {
                     }
                 }
             });
-            clients
-                .get(&client)
-                .expect("client UDP proxy was just inserted")
+            let Some(upstream) = clients.get(&client) else {
+                continue;
+            };
+            upstream
         };
         let _ = upstream.send(&buf[..len]);
     }
@@ -287,11 +288,40 @@ fn ipam_lock(run_root: &Path) -> std::path::PathBuf {
     run_root.join("net").join("ipam.lock")
 }
 
-fn read_ipam(path: &Path) -> BTreeMap<String, Ipv4Addr> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return BTreeMap::new();
+fn read_ipam(path: &Path) -> ZResult<BTreeMap<String, Ipv4Addr>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(crate::zerr!("read IPAM state {}: {error}", path.display())),
     };
-    serde_json::from_str(&text).unwrap_or_default()
+    let map: BTreeMap<String, Ipv4Addr> = serde_json::from_str(&text)
+        .map_err(|error| crate::zerr!("parse IPAM state {}: {error}", path.display()))?;
+    validate_ipam(&map)?;
+    Ok(map)
+}
+
+fn validate_ipam_id(id: &str) -> ZResult<()> {
+    if !(1..=64).contains(&id.len()) || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(crate::zerr!("invalid container id '{id}' in IPAM state"));
+    }
+    Ok(())
+}
+
+fn validate_ipam(map: &BTreeMap<String, Ipv4Addr>) -> ZResult<()> {
+    let mut addresses = BTreeSet::new();
+    for (id, ip) in map {
+        validate_ipam_id(id)?;
+        let octets = ip.octets();
+        if octets[..3] != [10, 88, 0] || !(2..=254).contains(&octets[3]) {
+            return Err(crate::zerr!(
+                "IPAM address {ip} for {id} is outside 10.88.0.0/24"
+            ));
+        }
+        if !addresses.insert(*ip) {
+            return Err(crate::zerr!("duplicate IPAM address {ip}"));
+        }
+    }
+    Ok(())
 }
 
 fn write_ipam(path: &Path, map: &BTreeMap<String, Ipv4Addr>) -> ZResult<()> {
@@ -319,9 +349,10 @@ fn lock_ipam(run_root: &Path) -> std::io::Result<std::fs::File> {
 
 /// Allocate this container's bridge IP (idempotent per id).
 pub fn allocate_ip(run_root: &Path, id: &str) -> ZResult<Ipv4Addr> {
+    validate_ipam_id(id)?;
     let _guard = lock_ipam(run_root).map_err(|e| crate::zerr!("ipam lock: {e}"))?;
     let path = ipam_file(run_root);
-    let mut map = read_ipam(&path);
+    let mut map = read_ipam(&path)?;
     if let Some(ip) = map.get(id) {
         return Ok(*ip);
     }
@@ -346,7 +377,13 @@ pub fn release_ip(run_root: &Path, id: &str) {
         return;
     };
     let path = ipam_file(run_root);
-    let mut map = read_ipam(&path);
+    let mut map = match read_ipam(&path) {
+        Ok(map) => map,
+        Err(error) => {
+            eprintln!("zerun: warning: cannot release IPAM entry for {id}: {error}");
+            return;
+        }
+    };
     if map.remove(id).is_none() {
         return;
     }
@@ -552,5 +589,24 @@ mod tests {
             assert_eq!(container_ip(id), ip, "must be deterministic");
         }
         assert_ne!(container_ip("000000000001"), container_ip("000000000002"));
+    }
+
+    #[test]
+    fn ipam_validation_rejects_corrupt_or_unsafe_state() {
+        let mut valid = BTreeMap::new();
+        valid.insert("0123456789ab".to_string(), Ipv4Addr::new(10, 88, 0, 42));
+        assert!(validate_ipam(&valid).is_ok());
+
+        let mut invalid_id = valid.clone();
+        invalid_id.insert("not-a-container".to_string(), Ipv4Addr::new(10, 88, 0, 43));
+        assert!(validate_ipam(&invalid_id).is_err());
+
+        let mut invalid_subnet = valid.clone();
+        invalid_subnet.insert("abcdef".to_string(), Ipv4Addr::new(10, 89, 0, 2));
+        assert!(validate_ipam(&invalid_subnet).is_err());
+
+        let mut duplicate = valid.clone();
+        duplicate.insert("abcdef".to_string(), Ipv4Addr::new(10, 88, 0, 42));
+        assert!(validate_ipam(&duplicate).is_err());
     }
 }
