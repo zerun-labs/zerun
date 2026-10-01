@@ -82,6 +82,15 @@ overlay_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --init -- \
 grep -Fx overlay-ok <<<"$overlay_output" >/dev/null
 test ! -e "$rootfs/overlay-marker"
 
+# A read-only root must reject writes while an explicitly requested tmpfs stays
+# writable. This exercises the ordering of /etc/hosts setup, extra tmpfs
+# mounts, and the final root remount.
+readonly_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+  --read-only --tmpfs /run:size=16m --init -- /bin/sh -c \
+  'if printf "unexpected\n" >/readonly-marker; then exit 41; fi; printf "tmpfs-ok\n" >/run/zerun-marker; cat /run/zerun-marker')
+grep -Fx tmpfs-ok <<<"$readonly_output" >/dev/null
+test ! -e "$rootfs/readonly-marker"
+
 # Resource limits require an actual cgroup v2 hierarchy and exercise the
 # parent-side cgroup creation/attach path.
 cgroup_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
