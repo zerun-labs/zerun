@@ -794,4 +794,11 @@ mod tests {
         let pidfd = pidfd_open(pid).expect("pidfd_open should be available on supported Linux");
         pidfd_send_signal(pidfd.as_raw_fd(), 0).expect("pidfd signal 0 should probe the process");
     }
+
+    #[test]
+    fn wait_status_decodes_exit_and_signal_results() {
+        assert_eq!(wait_status_code(23 << 8), Some(23));
+        assert_eq!(wait_status_code(libc::SIGTERM), Some(128 + libc::SIGTERM));
+        assert_eq!(wait_status_code((libc::SIGSTOP << 8) | 0x7f), None);
+    }
 }
