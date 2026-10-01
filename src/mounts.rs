@@ -342,7 +342,7 @@ pub fn setup_rootfs(cfg: &RootfsConfig) -> ZResult<()> {
 
     mount_pseudo_fs(cfg.rootless)?;
     populate_dev(cfg.rootless)?;
-    apply_masked_and_readonly()?;
+    apply_masked_and_readonly(cfg.rootless)?;
 
     if let Some(h) = cfg.hostname {
         syscalls::sethostname(h)?;
@@ -649,16 +649,35 @@ fn populate_dev(rootless: bool) -> ZResult<()> {
     Ok(())
 }
 
-fn apply_masked_and_readonly() -> ZResult<()> {
+fn apply_masked_and_readonly(rootless: bool) -> ZResult<()> {
     for p in MASKED_PATHS {
-        if Path::new(p).exists() {
-            // Bind /dev/null over the sensitive path to mask it; skip if absent.
-            let _ = syscalls::mount(Some("/dev/null"), p, None, MS_BIND, None);
+        let path = Path::new(p);
+        if !path.exists() {
+            continue;
         }
+        // Mask regular proc files with /dev/null. Directory masks need a
+        // private empty tmpfs; binding a character device over a directory
+        // fails and would otherwise leave /sys/firmware visible.
+        let result = if path.is_dir() {
+            syscalls::mount(
+                Some("tmpfs"),
+                p,
+                Some("tmpfs"),
+                MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                Some("mode=000"),
+            )
+        } else {
+            syscalls::mount(Some("/dev/null"), p, None, MS_BIND, None)
+        };
+        require_or_warn(rootless, result, &format!("mask {p}"))?;
     }
     for p in READONLY_PATHS {
         if Path::new(p).exists() {
-            let _ = syscalls::mount(Some(p), p, None, MS_BIND | MS_REC | MS_RDONLY, None);
+            require_or_warn(
+                rootless,
+                syscalls::mount(Some(p), p, None, MS_BIND | MS_REC | MS_RDONLY, None),
+                &format!("readonly {p}"),
+            )?;
         }
     }
     Ok(())
