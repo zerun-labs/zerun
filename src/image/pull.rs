@@ -607,7 +607,8 @@ mod tests {
         .unwrap();
         let index_digest = format!("sha256:{}", sha256_hex(&index));
 
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = RegistryClient::test_local_address();
+        let listener = TcpListener::bind((address, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let (done_tx, done_rx) = channel();
         let server = std::thread::spawn(move || {
@@ -623,7 +624,8 @@ mod tests {
         });
 
         let reference = Reference::parse(&format!("localhost:{port}/org/app:v1")).unwrap();
-        let mut client = RegistryClient::new();
+        let mut client =
+            RegistryClient::new().with_test_endpoints(vec![format!("http://{address}:{port}")]);
         pull_image(&store, &mut client, &reference, &PullOptions::default()).unwrap();
         server.join().unwrap();
         done_rx.recv().unwrap();

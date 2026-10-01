@@ -399,7 +399,8 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&source).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = RegistryClient::test_local_address();
+        let listener = TcpListener::bind((address, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let (done_tx, done_rx) = channel();
         let server = std::thread::spawn(move || serve_registry(listener, done_tx));
@@ -407,7 +408,8 @@ mod tests {
         let target = format!("localhost:{port}/org/app:v1");
         commit_image(&store, &source, &target, Default::default()).unwrap();
         let reference = Reference::parse(&target).unwrap();
-        let mut client = RegistryClient::new();
+        let mut client =
+            RegistryClient::new().with_test_endpoints(vec![format!("http://{address}:{port}")]);
         let result = push_image(&store, &mut client, &reference).unwrap();
         assert!(result.digest.starts_with("sha256:"));
         server.join().unwrap();
@@ -476,7 +478,8 @@ mod tests {
     #[test]
     fn pushes_multi_arch_index_and_all_children() {
         let store = test_store();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = RegistryClient::test_local_address();
+        let listener = TcpListener::bind((address, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let (done_tx, done_rx) = channel();
         let server = std::thread::spawn(move || serve_registry(listener, done_tx));
@@ -484,7 +487,8 @@ mod tests {
             create_multi_arch_record(&store, port);
 
         let reference = Reference::parse(&format!("localhost:{port}/org/app:v1")).unwrap();
-        let mut client = RegistryClient::new();
+        let mut client =
+            RegistryClient::new().with_test_endpoints(vec![format!("http://{address}:{port}")]);
         let result = push_image(&store, &mut client, &reference).unwrap();
         assert_eq!(result.digest, index_digest);
         server.join().unwrap();

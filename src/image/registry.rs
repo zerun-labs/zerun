@@ -26,6 +26,8 @@ pub struct RegistryClient {
     pub mirrors: Vec<String>,
     credentials: BTreeMap<String, Credential>,
     tokens: HashMap<String, CachedToken>,
+    #[cfg(test)]
+    test_endpoints: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -56,7 +58,37 @@ impl RegistryClient {
             mirrors: discover_mirrors(),
             credentials,
             tokens: HashMap::new(),
+            #[cfg(test)]
+            test_endpoints: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_endpoints(mut self, endpoints: Vec<String>) -> Self {
+        self.test_endpoints = Some(endpoints);
+        self
+    }
+
+    /// Select a local address usable by in-process HTTP fixtures.
+    ///
+    /// Some sandboxed Linux environments reject connections to 127.0.0.1 from
+    /// test processes even though loopback listeners can be created. Prefer
+    /// the address selected by the normal IPv4 route and fall back to loopback
+    /// on hosts without a usable non-loopback route.
+    #[cfg(test)]
+    pub(crate) fn test_local_address() -> std::net::Ipv4Addr {
+        use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+        let Ok(socket) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+            return Ipv4Addr::LOCALHOST;
+        };
+        if socket.connect((Ipv4Addr::new(1, 1, 1, 1), 80)).is_ok() {
+            if let Ok(SocketAddr::V4(address)) = socket.local_addr() {
+                if !address.ip().is_unspecified() {
+                    return *address.ip();
+                }
+            }
+        }
+        Ipv4Addr::LOCALHOST
     }
 
     /// API endpoints for a registry, in priority order: configured mirrors for
@@ -64,6 +96,10 @@ impl RegistryClient {
     /// then the official endpoint. Explicit localhost dev registries try plain
     /// HTTP first; remote registries are HTTPS-only.
     pub fn endpoints(&self, registry: &str) -> Vec<String> {
+        #[cfg(test)]
+        if let Some(endpoints) = &self.test_endpoints {
+            return endpoints.clone();
+        }
         if registry == "docker.io" {
             let mut v = self.mirrors.clone();
             v.push(DOCKER_HUB_API.to_string());
