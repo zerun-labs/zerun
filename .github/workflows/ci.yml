@@ -242,18 +242,33 @@ jobs:
       - name: Run rootless namespace smoke test
         run: |
           set -euo pipefail
-          test "$(id -u)" -ne 0
+          # Some hosted runner images execute jobs as root. Create a dedicated
+          # unprivileged account so this job always exercises the real rootless
+          # path instead of merely checking the runner's default identity.
+          ci_user=zerun-ci
+          if ! id "$ci_user" >/dev/null 2>&1; then
+            sudo useradd --create-home --user-group --shell /usr/sbin/nologin "$ci_user"
+          fi
+          test "$(sudo -u "$ci_user" id -u)" -ne 0
+
           rootfs="$RUNNER_TEMP/zerun-rootless-rootfs"
           data="$RUNNER_TEMP/zerun-rootless-data"
           runtime="$RUNNER_TEMP/zerun-rootless-runtime"
-          mkdir -p "$rootfs/bin" "$data" "$runtime"
+          home="$RUNNER_TEMP/zerun-rootless-home"
+          binary="$RUNNER_TEMP/zerun-rootless-bin"
+          mkdir -p "$rootfs/bin" "$data" "$runtime" "$home"
           install -m 0755 /usr/bin/busybox "$rootfs/bin/busybox"
+          install -m 0755 "$GITHUB_WORKSPACE/target/debug/zerun" "$binary"
           ln -s busybox "$rootfs/bin/sh"
+          sudo chown -R "$ci_user:" "$rootfs" "$data" "$runtime" "$home"
+          sudo chown "$ci_user:" "$binary"
 
           output=$(
+            sudo -u "$ci_user" env \
+            HOME="$home" \
             ZERUN_DATA_ROOT="$data" \
             ZERUN_RUNTIME_ROOT="$runtime" \
-            target/debug/zerun run --rootfs "$rootfs" --net none --no-overlay --init -- \
+            "$binary" run --rootfs "$rootfs" --net none --no-overlay --init -- \
             /bin/sh -c 'printf "rootless-smoke-ok\n"; test "$(/bin/busybox id -u)" -eq 0'
           )
           printf '%s\n' "$output"

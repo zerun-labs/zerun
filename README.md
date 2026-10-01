@@ -56,10 +56,10 @@ advisory auditing, Clippy, the serialized unit/integration suite on Ubuntu 22.04
 24.04, and the release-profile test suite. Dedicated rootful jobs exercise namespace
 isolation, OverlayFS, read-only roots with tmpfs mounts, named-volume persistence,
 cgroups v2, bridge/veth networking, and TCP/UDP published-port proxies. A separate
-rootless smoke job verifies unprivileged user-namespace execution; static GNU and musl
-builds plus ARM64, ARMv7, and RISC-V64 cross-builds are checked as well. Tagged
-releases are gated on both debug and release-profile source tests before artifacts are
-published.
+rootless smoke job creates a dedicated unprivileged runner account and verifies
+user-namespace execution; static GNU and musl builds plus ARM64, ARMv7, and RISC-V64
+cross-builds are checked as well. Tagged releases are gated on both debug and release-profile
+source tests before artifacts are published.
 
 ## Highlights
 
