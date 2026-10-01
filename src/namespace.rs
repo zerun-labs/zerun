@@ -350,13 +350,34 @@ where
         return Err(error);
     }
 
-    let pty_pump = pty_pair.as_mut().map(|pair| {
+    let pty_pump = if let Some(pair) = pty_pair.as_mut() {
         // Transfer master ownership to the pump for the wait period. It either
         // closes it on host-stdin EOF, or the short-lived CLI exits right after
         // the container closes the PTY.
         let master = pair.take_master();
-        crate::pty::attach(master, spec.tty && spec.interactive)
-    });
+        match crate::pty::attach(master, spec.tty && spec.interactive) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                // The pump never took ownership when thread creation failed;
+                // close the master before following the failed-start cleanup.
+                syscalls::close(master);
+                // The workload is already running, so a failed pump startup
+                // must follow the same cleanup path as a failed start hook.
+                let _ = syscalls::kill(pid, libc::SIGKILL);
+                let _ = wait_pid(pid);
+                if let Some(net) = &host_net {
+                    crate::network::teardown_host_side(net);
+                }
+                if let Some(cg) = cg {
+                    cg.cleanup();
+                }
+                release_bridge_ip(&spec);
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     let code = wait_pid(pid)?;
     if let Some(net) = &host_net {
         crate::network::teardown_host_side(net);

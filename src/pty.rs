@@ -62,7 +62,10 @@ fn install_resize_handler(master: RawFd) {
 /// Interactive mode pumps both directions and switches the host terminal to
 /// raw mode. Output-only mode leaves stdin alone, matching `run -t` without
 /// `-i`; the pump stops when the container closes its PTY.
-pub fn attach(master: RawFd, interactive: bool) -> std::thread::JoinHandle<()> {
+pub fn attach(
+    master: RawFd,
+    interactive: bool,
+) -> crate::error::ZResult<std::thread::JoinHandle<()>> {
     let guard = if interactive {
         match RawTerminalGuard::attach(master, interactive) {
             Ok(g) => Some(g),
@@ -82,7 +85,7 @@ pub fn attach(master: RawFd, interactive: bool) -> std::thread::JoinHandle<()> {
             pump(master, interactive);
             drop(guard); // restore before the parent reports the container exit
         })
-        .expect("spawn zerun-pty")
+        .map_err(|error| crate::zerr!("spawn zerun-pty: {error}"))
 }
 
 fn pump(master: RawFd, interactive: bool) {
