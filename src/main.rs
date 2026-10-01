@@ -1462,8 +1462,9 @@ fn run_detached(
         Ok(0) => {
             // --- reaper child ---
             syscalls::close(started_r);
-            unsafe {
-                libc::setsid();
+            if let Err(error) = syscalls::new_session() {
+                eprintln!("zerun: setsid: {error}");
+                crate::syscalls::exit_process(1);
             }
             let code = lifecycle::run_detached(
                 store.clone(),
