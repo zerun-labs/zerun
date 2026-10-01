@@ -198,6 +198,44 @@ jobs:
           "${zerun[@]}" rm "$id"
           test -z "$("${zerun[@]}" ps -a -q)"
 
+  rootless-smoke:
+    name: rootless runtime smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build test binary
+        run: cargo build --locked
+
+      - name: Install static BusyBox
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y busybox-static
+
+      - name: Run rootless namespace smoke test
+        run: |
+          set -euo pipefail
+          test "$(id -u)" -ne 0
+          rootfs="$RUNNER_TEMP/zerun-rootless-rootfs"
+          data="$RUNNER_TEMP/zerun-rootless-data"
+          runtime="$RUNNER_TEMP/zerun-rootless-runtime"
+          mkdir -p "$rootfs/bin" "$data" "$runtime"
+          install -m 0755 /usr/bin/busybox "$rootfs/bin/busybox"
+          ln -s busybox "$rootfs/bin/sh"
+
+          output=$(
+            ZERUN_DATA_ROOT="$data" \
+            ZERUN_RUNTIME_ROOT="$runtime" \
+            target/debug/zerun run --rootfs "$rootfs" --net none --no-overlay --init -- \
+            /bin/sh -c 'printf "rootless-smoke-ok\n"; test "$(/bin/busybox id -u)" -eq 0'
+          )
+          printf '%s\n' "$output"
+          grep -Fx rootless-smoke-ok <<<"$output"
+
   rootful-integration:
     name: rootful integration (overlay/cgroup/bridge/ports)
     runs-on: ubuntu-24.04
