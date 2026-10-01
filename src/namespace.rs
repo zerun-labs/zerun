@@ -280,7 +280,7 @@ where
                 v
             }
         };
-        syscalls::write_fd(net_w, &msg); // EPIPE: child already failed
+        let _ = syscalls::write_all_fd(net_w, &msg); // EPIPE: child already failed
         syscalls::close(net_w);
     }
 
@@ -431,7 +431,7 @@ fn child_main(spec: RunSpec, ipc: ChildIpc, identity: ChildIdentity) -> ZResult<
     let result = child_stage(&spec, &identity, ipc.err_w, net_r, ipc.tty_slave);
     if let Err(e) = result {
         let msg = format!("{e}");
-        syscalls::write_fd(ipc.err_w, msg.as_bytes());
+        let _ = syscalls::write_all_fd(ipc.err_w, msg.as_bytes());
         syscalls::close(ipc.err_w);
         return Err(e);
     }

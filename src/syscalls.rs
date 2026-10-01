@@ -642,12 +642,6 @@ pub fn read_fd(fd: RawFd, buf: &mut [u8]) -> ZResult<isize> {
     }
 }
 
-pub fn write_fd(fd: RawFd, data: &[u8]) {
-    unsafe {
-        libc::write(fd, data.as_ptr() as *const c_void, data.len());
-    }
-}
-
 // ---------- clone: the only entry point into new namespaces ----------
 
 const CLONE_STACK_SIZE: usize = 8 * 1024 * 1024;
