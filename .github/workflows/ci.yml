@@ -280,6 +280,7 @@ jobs:
           install -m 0755 /usr/bin/busybox "$rootfs/bin/busybox"
           install -m 0755 "$GITHUB_WORKSPACE/target/debug/zerun" "$binary"
           ln -s busybox "$rootfs/bin/sh"
+          ln -s busybox "$rootfs/bin/sleep"
           sudo chown -R "$ci_user:" "$rootfs" "$data" "$runtime" "$home"
           sudo chown "$ci_user:" "$binary"
 
