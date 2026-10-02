@@ -9,7 +9,7 @@ use crate::error::ZResult;
 use crate::fsutil;
 use crate::image::manifest::host_platform;
 use crate::image::name::Reference;
-use crate::image::store::ImageStore;
+use crate::image::store::{ImageStore, ImageStoreLease};
 use crate::image::unpack::unpack_layer;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -48,7 +48,22 @@ pub fn commit_image(
     target: &str,
     options: CommitOptions,
 ) -> ZResult<crate::image::store::ImageRecord> {
-    let _lease = store.lock_operations()?;
+    let lease = store.lock_operations()?;
+    commit_image_with_lease(store, source_rootfs, target, options, &lease)
+}
+
+/// Commit an image while the caller holds the transaction lease.
+///
+/// This is used by compound operations such as `import`, which must protect
+/// their staging files from GC before the commit stage begins.
+pub(crate) fn commit_image_with_lease(
+    store: &ImageStore,
+    source_rootfs: &Path,
+    target: &str,
+    options: CommitOptions,
+    lease: &ImageStoreLease,
+) -> ZResult<crate::image::store::ImageRecord> {
+    store.validate_operation_lease(lease)?;
     commit_image_in_transaction(store, source_rootfs, target, options)
 }
 

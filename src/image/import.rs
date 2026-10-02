@@ -8,7 +8,7 @@
 
 use crate::error::ZResult;
 use crate::fsutil;
-use crate::image::commit::{commit_image, CommitOptions};
+use crate::image::commit::{commit_image_with_lease, CommitOptions};
 use crate::image::pull::open_layer_reader;
 use crate::image::store::ImageStore;
 use std::fs::OpenOptions;
@@ -30,6 +30,11 @@ pub fn import_image(
     target: &str,
     options: ImportOptions,
 ) -> ZResult<crate::image::store::ImageRecord> {
+    // Hold the shared store lease from before any temporary files or staging
+    // directories are created through the final index update. GC takes this
+    // lock exclusively and otherwise could delete these `.tmp-*` paths.
+    let lease = store.lock_operations()?;
+
     // Spool the (possibly non-seekable) input so compression sniffing and
     // unpacking always operate on a regular file.
     let (spool, _spool_guard) = if source == Path::new("-") {
@@ -79,7 +84,7 @@ pub fn import_image(
             }
         })
         .and_then(|()| {
-            commit_image(
+            commit_image_with_lease(
                 store,
                 &staging,
                 target,
@@ -88,6 +93,7 @@ pub fn import_image(
                     author: options.author,
                     ..Default::default()
                 },
+                &lease,
             )
         });
     fsutil::remove_dir_all_quiet(&staging);
@@ -153,6 +159,59 @@ mod tests {
             assert_eq!(std::fs::read(rootfs.join("bin/hello")).unwrap(), b"world");
             let _ = std::fs::remove_dir_all(&data_dir);
         }
+    }
+
+    #[test]
+    fn gc_waits_for_the_operation_lease_while_an_import_spool_exists() {
+        use std::fs::OpenOptions;
+        use std::sync::mpsc;
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "zerun-import-gc-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let store = ImageStore::at(&data_dir).unwrap();
+        let spool = store.blob_tmp("import-stdin");
+        std::fs::write(&spool, b"in-progress import stream").unwrap();
+        let lease = store.lock_operations().unwrap();
+        let (entered_gc_tx, entered_gc_rx) = mpsc::channel();
+        let gc_data_dir = data_dir.clone();
+        let gc = std::thread::spawn(move || {
+            let gc_store = ImageStore::at(&gc_data_dir).unwrap();
+            gc_store
+                .gc_with_protected_from(|| {
+                    entered_gc_tx.send(()).unwrap();
+                    std::collections::BTreeSet::new()
+                })
+                .unwrap();
+        });
+
+        // The callback runs only after GC acquired its exclusive lease. It
+        // must not get there while import owns the shared lease, and the
+        // in-progress spool must remain available to the importer.
+        assert!(entered_gc_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        assert!(spool.is_file());
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(data_dir.join("image-operations.lock"))
+            .unwrap();
+        assert!(matches!(
+            probe.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+
+        drop(lease);
+        entered_gc_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("GC should proceed after the import lease is released");
+        gc.join().unwrap();
+        assert!(!spool.exists());
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[test]
