@@ -188,6 +188,18 @@ stats_output=$("${zerun[@]}" stats "$m7_id")
 grep -q 'ci-m7' <<<"$stats_output"
 top_output=$("${zerun[@]}" top "$m7_id")
 grep -q 'CMD' <<<"$top_output"
+"${zerun[@]}" pause "$m7_id" >/dev/null
+paused_inspect=$("${zerun[@]}" inspect "$m7_id")
+grep -q '"paused": true' <<<"$paused_inspect"
+"${zerun[@]}" unpause "$m7_id" >/dev/null
+unpaused_inspect=$("${zerun[@]}" inspect "$m7_id")
+grep -q '"paused": false' <<<"$unpaused_inspect"
+"${zerun[@]}" update --pids 16 "$m7_id" >/dev/null
+"${zerun[@]}" rename "$m7_id" ci-m7-renamed
+renamed_inspect=$("${zerun[@]}" inspect ci-m7-renamed)
+grep -q '"name": "ci-m7-renamed"' <<<"$renamed_inspect"
+df_output=$("${zerun[@]}" system df)
+grep -q '^Containers' <<<"$df_output"
 # A bounded event replay must emit the current record and terminate at the
 # requested wall-clock boundary instead of remaining an unbounded poll.
 events_until=$(date -u -d '1 second' '+%Y-%m-%dT%H:%M:%SZ')
@@ -229,6 +241,28 @@ grep -Eq '^sha256:[0-9a-f]{64}$' <<<"$import_digest"
 import_output=$("${zerun[@]}" run --net none ci-import:test /bin/sh -c 'cat /run/m7-file')
 grep -Fxq overlay-data <<<"$import_output"
 echo "rootful-m7-ok"
+
+# Attach must stream the reaper's live output and return the workload exit code.
+attach_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
+  --pids 16 --init -- /bin/sh -c 'sleep 1; printf "attach-ok\n"; sleep 2')
+cleanup_ids+=("$attach_id")
+attach_output=$("${zerun[@]}" attach "$attach_id")
+grep -Fxq attach-ok <<<"$attach_output"
+"${zerun[@]}" rm "$attach_id" >/dev/null
+
+# Prune should remove retained exited records without touching live containers.
+prune_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
+  --name ci-prune --init -- /bin/sh -c 'exit 0')
+cleanup_ids+=("$prune_id")
+"${zerun[@]}" wait "$prune_id" >/dev/null
+prune_output=$("${zerun[@]}" prune -f)
+grep -q 'ci-prune' <<<"$prune_output"
+if "${zerun[@]}" inspect "$prune_id" >/dev/null 2>&1; then
+  echo "prune left an exited container behind" >&2
+  exit 1
+fi
+
+echo "rootful-lifecycle-controls-ok"
 
 # Bridge setup covers the netlink/veth path and the child-side eth0 setup.
 bridge_output=$("${zerun[@]}" run --rootfs "$rootfs" --net bridge --no-overlay --init -- \
