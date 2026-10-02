@@ -23,7 +23,9 @@
 //! exactly why Docker excludes 127.0.0.0/8 from OUTPUT DNAT and runs
 //! docker-proxy for host-loopback access. Zerun ships that proxy built in:
 //! `bind_port_proxies` opens one listener per published port on 0.0.0.0 and
-//! forwards accepted TCP connections to the container IP. The listeners live
+//! forwards accepted TCP connections to the container IP. Active TCP proxy
+//! connections are bounded per container across all published ports so a
+//! connection flood cannot create unbounded pump threads. The listeners live
 //! exactly as long as the parent (foreground CLI or detached reaper) waits on
 //! the container, so they disappear with the run.
 //!
@@ -41,7 +43,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -103,6 +105,8 @@ impl HostNet {
     }
 }
 
+const TCP_PROXY_CONNECTION_LIMIT: usize = 64;
+
 /// One listening host port forwarded to the container (userland `-p` proxy).
 /// Dropping the proxy closes the listener; pump threads are detached and die
 /// with the owning process, which never outlives the container run.
@@ -123,6 +127,7 @@ impl PortProxy {
         container_ip: Ipv4Addr,
         container: u16,
         protocol: PortProtocol,
+        tcp_connections: Arc<AtomicUsize>,
     ) -> ZResult<Self> {
         let host_label = host_ip_label(host_ip);
         match protocol {
@@ -137,7 +142,9 @@ impl PortProxy {
                     .map_err(|e| crate::zerr!("clone listener for {host_label}:{host}: {e}"))?;
                 thread::Builder::new()
                     .name("zerun-port-tcp".to_string())
-                    .spawn(move || accept_loop(thread_listener, container_ip, container))
+                    .spawn(move || {
+                        accept_loop(thread_listener, container_ip, container, tcp_connections)
+                    })
                     .map_err(|e| {
                         crate::zerr!("spawn TCP port proxy for {host_label}:{host}: {e}")
                     })?;
@@ -174,9 +181,19 @@ pub fn bind_port_proxies(
     container_ip: Ipv4Addr,
     published: &[PublishedPort],
 ) -> ZResult<Vec<PortProxy>> {
+    let tcp_connections = Arc::new(AtomicUsize::new(0));
     published
         .iter()
-        .map(|p| PortProxy::bind(p.host_ip, p.host, container_ip, p.container, p.protocol))
+        .map(|p| {
+            PortProxy::bind(
+                p.host_ip,
+                p.host,
+                container_ip,
+                p.container,
+                p.protocol,
+                Arc::clone(&tcp_connections),
+            )
+        })
         .collect()
 }
 
@@ -188,13 +205,48 @@ pub fn host_ip_label(ip: IpAddr) -> String {
     }
 }
 
+/// RAII slot held for the entire lifetime of one TCP proxy connection.
+struct TcpProxySlot(Arc<AtomicUsize>);
+
+impl Drop for TcpProxySlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_tcp_proxy_slot(connections: &Arc<AtomicUsize>) -> Option<TcpProxySlot> {
+    connections
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < TCP_PROXY_CONNECTION_LIMIT).then_some(active + 1)
+        })
+        .ok()
+        .map(|_| TcpProxySlot(Arc::clone(connections)))
+}
+
 /// Accept connections until the listener is dropped, then forward each one.
-fn accept_loop(listener: TcpListener, container_ip: Ipv4Addr, container: u16) {
+fn accept_loop(
+    listener: TcpListener,
+    container_ip: Ipv4Addr,
+    container: u16,
+    connections: Arc<AtomicUsize>,
+) {
+    let mut warned_full = false;
     for conn in listener.incoming() {
         let Ok(client) = conn else { break }; // listener closed -> shutdown
+        let Some(slot) = try_acquire_tcp_proxy_slot(&connections) else {
+            if !warned_full {
+                eprintln!(
+                    "zerun: warn: TCP port proxy connection limit ({TCP_PROXY_CONNECTION_LIMIT}) reached; dropping new connections"
+                );
+                warned_full = true;
+            }
+            continue;
+        };
+        warned_full = false;
         if let Err(error) = thread::Builder::new()
             .name("zerun-port-client".to_string())
             .spawn(move || {
+                let _slot = slot;
                 let _ = forward(client, container_ip, container);
             })
         {
@@ -706,6 +758,29 @@ fn enable_ip_forward() -> ZResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcp_proxy_connection_slots_enforce_limit_and_release() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut slots: Vec<_> = (0..TCP_PROXY_CONNECTION_LIMIT)
+            .map(|_| try_acquire_tcp_proxy_slot(&active).expect("slot within configured limit"))
+            .collect();
+        assert_eq!(active.load(Ordering::Acquire), TCP_PROXY_CONNECTION_LIMIT);
+        assert!(try_acquire_tcp_proxy_slot(&active).is_none());
+
+        drop(slots.pop());
+        assert_eq!(
+            active.load(Ordering::Acquire),
+            TCP_PROXY_CONNECTION_LIMIT - 1
+        );
+        let replacement = try_acquire_tcp_proxy_slot(&active).expect("released slot is reusable");
+        assert_eq!(active.load(Ordering::Acquire), TCP_PROXY_CONNECTION_LIMIT);
+        drop(replacement);
+        assert_eq!(
+            active.load(Ordering::Acquire),
+            TCP_PROXY_CONNECTION_LIMIT - 1
+        );
+    }
 
     #[test]
     fn udp_client_expiry_signals_worker_stop() {
