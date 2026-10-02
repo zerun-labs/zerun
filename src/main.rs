@@ -5344,6 +5344,7 @@ fn export_to_file(
     std::fs::rename(&temporary, output)
         .map_err(|e| crate::zerr!("install export {}: {e}", output.display()))?;
     let _ = guard.persist();
+    fsutil::sync_directory(parent)?;
     Ok(())
 }
 

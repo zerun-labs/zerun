@@ -179,15 +179,20 @@ pub fn atomic_write_mode(path: &Path, data: &[u8], mode: u32) -> ZResult<()> {
             .map_err(|e| crate::zerr!("sync {}: {e}", tmp.display()))?;
         fs::rename(&tmp, path)
             .map_err(|e| crate::zerr!("rename {} -> {}: {e}", tmp.display(), path.display()))?;
-        File::open(dir)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|e| crate::zerr!("sync directory {}: {e}", dir.display()))?;
+        sync_directory(dir)?;
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// Flush directory-entry changes after installing or removing durable files.
+pub fn sync_directory(dir: &Path) -> ZResult<()> {
+    File::open(dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| crate::zerr!("sync directory {}: {e}", dir.display()))
 }
 
 /// Remove a directory tree, tolerating a missing root (used for container fs

@@ -113,6 +113,7 @@ pub fn save_images(
         if let Some(guard) = tmp_guard.take() {
             let _installed_path = guard.persist();
         }
+        fsutil::sync_directory(parent)?;
         Ok(exported)
     })();
 
