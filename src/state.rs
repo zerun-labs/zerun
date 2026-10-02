@@ -72,6 +72,41 @@ impl Drop for ContainerOperationLock {
     }
 }
 
+/// Cross-process lock serializing creation and reassignment of container names.
+///
+/// Name availability is a property of the whole state directory, so per-id
+/// operation locks alone cannot prevent two different containers acquiring
+/// the same name concurrently. Hold this lock until the updated state record
+/// is visible, and release it before detached runs fork their reaper.
+pub struct ContainerNameLock {
+    file: File,
+}
+
+impl ContainerNameLock {
+    /// Try to serialize a name check-and-write operation without waiting.
+    pub fn try_acquire(store: &Store) -> Result<Self, String> {
+        let dir = store.run_root().join("locks");
+        fsutil::mkdir_p(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join("names.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| format!("open container-name lock {}: {e}", path.display()))?;
+        file.try_lock()
+            .map_err(|e| format!("container names are busy with another operation: {e}"))?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for ContainerNameLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 /// Final cgroup metrics captured by the reaper before cleanup.
 ///
 /// Running containers are read directly from the live cgroup; exited
@@ -742,6 +777,24 @@ mod tests {
         assert!(ContainerOperationLock::try_acquire(&store, "abc123").is_err());
         drop(first);
         assert!(ContainerOperationLock::try_acquire(&store, "abc123").is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn container_name_lock_is_global_and_exclusive_until_dropped() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-state-name-lock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.join("data"), root.join("run"));
+        store.ensure_dirs().unwrap();
+
+        let first = ContainerNameLock::try_acquire(&store).unwrap();
+        assert!(ContainerNameLock::try_acquire(&store).is_err());
+        drop(first);
+        assert!(ContainerNameLock::try_acquire(&store).is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

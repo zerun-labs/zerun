@@ -276,6 +276,73 @@ fi
 
 echo "rootful-lifecycle-controls-ok"
 
+# Concurrent detached launches cannot both claim the same user-facing name.
+name_race_a="/tmp/zerun-name-race-a-${BASHPID}"
+name_race_b="/tmp/zerun-name-race-b-${BASHPID}"
+name_race_err_a="/tmp/zerun-name-race-a-${BASHPID}.err"
+name_race_err_b="/tmp/zerun-name-race-b-${BASHPID}.err"
+cleanup_paths+=("$name_race_a" "$name_race_b" "$name_race_err_a" "$name_race_err_b")
+set +e
+"${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
+  --name ci-name-race --init -- /bin/sh -c 'sleep 30' >"$name_race_a" 2>"$name_race_err_a" &
+name_race_pid_a=$!
+"${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
+  --name ci-name-race --init -- /bin/sh -c 'sleep 30' >"$name_race_b" 2>"$name_race_err_b" &
+name_race_pid_b=$!
+wait "$name_race_pid_a"
+name_race_status_a=$?
+wait "$name_race_pid_b"
+name_race_status_b=$?
+set -e
+if (( (name_race_status_a == 0) == (name_race_status_b == 0) )); then
+  echo "concurrent named runs did not elect exactly one winner" >&2
+  cat "$name_race_err_a" "$name_race_err_b" >&2
+  exit 1
+fi
+if (( name_race_status_a == 0 )); then
+  name_race_winner=$name_race_a
+else
+  name_race_winner=$name_race_b
+fi
+name_race_id=$(<"$name_race_winner")
+[[ "$name_race_id" =~ ^[0-9a-f]{12}$ ]]
+cleanup_ids+=("$name_race_id")
+
+# Rename and a new run must share the same global name reservation, even though
+# their per-container operation locks are different.
+rename_race_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
+  --init -- /bin/sh -c 'sleep 30')
+cleanup_ids+=("$rename_race_id")
+rename_race_output="/tmp/zerun-rename-race-${BASHPID}"
+rename_race_error="/tmp/zerun-rename-race-${BASHPID}.err"
+run_race_output="/tmp/zerun-run-race-${BASHPID}"
+run_race_error="/tmp/zerun-run-race-${BASHPID}.err"
+cleanup_paths+=("$rename_race_output" "$rename_race_error" "$run_race_output" "$run_race_error")
+set +e
+"${zerun[@]}" rename "$rename_race_id" ci-cross-name-race \
+  >"$rename_race_output" 2>"$rename_race_error" &
+rename_race_pid=$!
+"${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
+  --name ci-cross-name-race --init -- /bin/sh -c 'sleep 30' \
+  >"$run_race_output" 2>"$run_race_error" &
+run_race_pid=$!
+wait "$rename_race_pid"
+rename_race_status=$?
+wait "$run_race_pid"
+run_race_status=$?
+set -e
+if (( (rename_race_status == 0) == (run_race_status == 0) )); then
+  echo "concurrent rename and named run did not elect exactly one winner" >&2
+  cat "$rename_race_error" "$run_race_error" >&2
+  exit 1
+fi
+if (( run_race_status == 0 )); then
+  rename_race_new_id=$(<"$run_race_output")
+  [[ "$rename_race_new_id" =~ ^[0-9a-f]{12}$ ]]
+  cleanup_ids+=("$rename_race_new_id")
+fi
+echo "rootful-name-race-ok"
+
 # Bridge setup covers the netlink/veth path and the child-side eth0 setup.
 bridge_output=$("${zerun[@]}" run --rootfs "$rootfs" --net bridge --no-overlay --init -- \
   /bin/sh -c '/bin/busybox ip -4 addr show dev eth0 | /bin/busybox grep -q "10.88.0."; printf "bridge-ok\\n"')

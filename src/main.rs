@@ -1274,6 +1274,20 @@ fn run_detached(
 
     let id = spec.id.clone();
     let resuming = info.resume.is_some();
+    let name_lock = if !resuming && info.name.is_some() {
+        match state::ContainerNameLock::try_acquire(store) {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                eprintln!("zerun run: {error}");
+                if let Some(fs) = container_fs.as_ref() {
+                    store.cleanup_container_fs(fs);
+                }
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
     if !resuming {
         if let Some(n) = &info.name {
             if state::list(store)
@@ -1436,6 +1450,9 @@ fn run_detached(
     if let Some(reservation) = id_reservation.as_mut() {
         reservation.commit();
     }
+    // The name is now persisted and visible to the next serialized creator or
+    // rename. Release before fork so the reaper cannot retain the global lock.
+    drop(name_lock);
 
     let (started_r, started_w) = match syscalls::pipe2_cloexec() {
         Ok(p) => p,
@@ -4645,6 +4662,13 @@ fn cmd_rename(args: &[String]) -> i32 {
         }
     };
     let _lock = match state::ContainerOperationLock::try_acquire(&store, &initial.id) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("zerun rename: {e}");
+            return 1;
+        }
+    };
+    let _name_lock = match state::ContainerNameLock::try_acquire(&store) {
         Ok(lock) => lock,
         Err(e) => {
             eprintln!("zerun rename: {e}");

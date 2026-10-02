@@ -56,6 +56,7 @@ advisory auditing, Clippy, the serialized unit/integration suite on Ubuntu 22.04
 24.04, and the release-profile test suite. Dedicated rootful jobs exercise namespace
 isolation, OverlayFS, read-only roots with tmpfs mounts, named-volume persistence,
 cgroups v2, detached lifecycle controls (`pause`/`unpause`/`update`/`rename`/`attach`/`prune`),
+concurrent name uniqueness across creation and rename,
 `inspect`/`stats`/`top`, `system df`, `cp`, `diff`, `export`/`import`, retained-overlay `commit`,
 bounded `events` replay, bridge/veth networking, and TCP/UDP published-port proxies. A separate
 rootless smoke job creates a dedicated unprivileged runner account and verifies
