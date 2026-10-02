@@ -147,6 +147,11 @@ impl LogTimeFilter {
         self.since.is_none_or(|since| timestamp >= since)
             && self.until.is_none_or(|until| timestamp <= until)
     }
+
+    /// Test a state/event RFC3339 timestamp against this range.
+    pub fn contains_rfc3339(&self, value: &str) -> bool {
+        epoch_nanos_from_rfc3339(value).is_ok_and(|timestamp| self.contains(timestamp))
+    }
 }
 
 /// Apply an optional time filter to newline-oriented log bytes.
@@ -506,6 +511,14 @@ mod tests {
     fn detects_when_follow_until_boundary_has_passed() {
         assert!(filter(None, Some("2000-01-01T00:00:00Z")).until_reached());
         assert!(!filter(None, Some("3000-01-01T00:00:00Z")).until_reached());
+    }
+
+    #[test]
+    fn matches_rfc3339_timestamps_against_bounds() {
+        let filter = filter(Some("2026-01-01T00:00:01Z"), Some("2026-01-01T00:00:02Z"));
+        assert!(filter.contains_rfc3339("2026-01-01T00:00:01.500000000Z"));
+        assert!(!filter.contains_rfc3339("2025-12-31T23:59:59Z"));
+        assert!(!filter.contains_rfc3339("not-a-timestamp"));
     }
 
     #[test]

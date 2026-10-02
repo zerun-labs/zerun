@@ -101,24 +101,20 @@ impl EventFilter {
     }
 }
 
-/// Include only events whose timestamp is in `[since, until]`. State
-/// timestamps are normalized RFC3339 UTC, so lexical order matches time order.
-fn in_time_range(event: &Event, since: Option<&str>, until: Option<&str>) -> bool {
-    since.is_none_or(|since| event.at.as_str() >= since)
-        && until.is_none_or(|until| event.at.as_str() <= until)
-}
-
-/// Apply every filter (AND) and the inclusive timestamp range.
-pub fn select_events(
+/// Apply filters using the parsed time range shared with `zerun logs`.
+///
+/// Command-line callers should use this function so relative durations, numeric
+/// epoch values, offsets, and fractional seconds have one consistent parser.
+pub fn select_events_with_time_filter(
     events: Vec<Event>,
     filters: &[EventFilter],
-    since: Option<&str>,
-    until: Option<&str>,
+    time_filter: &crate::logs::LogTimeFilter,
 ) -> Vec<Event> {
     events
         .into_iter()
         .filter(|event| {
-            in_time_range(event, since, until) && filters.iter().all(|filter| filter.matches(event))
+            time_filter.contains_rfc3339(&event.at)
+                && filters.iter().all(|filter| filter.matches(event))
         })
         .collect()
 }
@@ -388,13 +384,23 @@ mod tests {
         filter.set("action", "die").unwrap();
         filter.set("container", "abc").unwrap();
         assert_eq!(
-            select_events(events.clone(), &[filter], None, None).len(),
+            select_events_with_time_filter(
+                events.clone(),
+                &[filter],
+                &crate::logs::LogTimeFilter::parse(None, None).unwrap(),
+            )
+            .len(),
             1
         );
 
         let mut filter = EventFilter::default();
         filter.set("exitCode", "4").unwrap();
-        assert!(select_events(events.clone(), &[filter], None, None).is_empty());
+        assert!(select_events_with_time_filter(
+            events.clone(),
+            &[filter],
+            &crate::logs::LogTimeFilter::parse(None, None).unwrap(),
+        )
+        .is_empty());
 
         let mut filter = EventFilter::default();
         assert!(filter.set("type", "container").is_err());
@@ -406,10 +412,12 @@ mod tests {
         let events = diff_events(&[], &[st]);
         let die_at = events[2].at.clone();
 
+        let exact = crate::logs::LogTimeFilter::parse(Some(&die_at), Some(&die_at)).unwrap();
         assert_eq!(
-            select_events(events.clone(), &[], Some(&die_at), Some(&die_at)).len(),
+            select_events_with_time_filter(events.clone(), &[], &exact).len(),
             1
         );
-        assert!(select_events(events, &[], Some("9999"), None).is_empty());
+        let before = crate::logs::LogTimeFilter::parse(Some("3000-01-01T00:00:00Z"), None).unwrap();
+        assert!(select_events_with_time_filter(events, &[], &before).is_empty());
     }
 }

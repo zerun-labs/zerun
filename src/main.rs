@@ -5466,6 +5466,13 @@ fn cmd_events(args: &[String]) -> i32 {
         }
         i += 1;
     }
+    let time_filter = match logs::LogTimeFilter::parse(since, until) {
+        Ok(filter) => filter,
+        Err(e) => {
+            eprintln!("zerun events: {e}");
+            return 2;
+        }
+    };
     let store = match Store::detect() {
         Ok(s) => s,
         Err(e) => {
@@ -5476,25 +5483,32 @@ fn cmd_events(args: &[String]) -> i32 {
     use std::io::Write as _;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let mut previous = state::list(&store);
-    if since.is_some() || until.is_some() {
-        // Time-bounded output is deliberately replayable: reconstruct the
-        // history of the current records before entering live-follow mode.
-        previous = Vec::new();
-    }
+    let replay = time_filter.is_active();
+    let mut previous = if replay {
+        Vec::new()
+    } else {
+        state::list(&store)
+    };
     loop {
-        std::thread::sleep(Duration::from_millis(200));
+        // A bounded replay should emit existing records immediately, while an
+        // unbounded invocation keeps the first snapshot silent like Docker's
+        // live event stream.
         let current = state::list(&store);
         for event in events::diff_events(&previous, &current) {
-            let event = events::select_events(vec![event], &filters, since, until);
+            let event = events::select_events_with_time_filter(vec![event], &filters, &time_filter);
             let Some(event) = event.first() else {
                 continue;
             };
             let _ = writeln!(out, "{}", events::format_event(event));
         }
         let _ = out.flush();
+        if time_filter.until_reached() {
+            break;
+        }
         previous = current;
+        std::thread::sleep(Duration::from_millis(200));
     }
+    0
 }
 
 /// `zerun attach CONTAINER` — stream a detached container's live output.
