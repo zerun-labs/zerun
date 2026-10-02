@@ -6,6 +6,8 @@
 //!   rootfs/<hex>         materialized image rootfs, keyed by config digest
 //!   images.json          tag index (name/tag -> manifest digest)
 //!   images.lock          cross-process lock for index mutations
+//!   image-operations.lock shared transaction / exclusive garbage-collection lock
+//!   rootfs-locks/         active-container leases for materialized roots
 //!
 //! Engineering notes (deviations from the design doc are deliberate):
 //! - Layers are materialized into one read-only rootfs per image *config digest*
@@ -26,4 +28,4 @@ pub mod unpack;
 
 mod pull;
 
-pub use pull::{local_image, pull_image, PullOptions};
+pub use pull::{local_image, pull_image, pull_image_with_lease, PullOptions};

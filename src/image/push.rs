@@ -24,6 +24,7 @@ pub fn push_image(
     client: &mut RegistryClient,
     reference: &Reference,
 ) -> ZResult<PushedImage> {
+    let _lease = store.lock_operations()?;
     let Some(tag) = reference.tag.as_deref() else {
         return Err(crate::zerr!(
             "push target must be REPOSITORY[:TAG], not a digest reference"

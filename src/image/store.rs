@@ -5,6 +5,8 @@
 //!   <data>/rootfs/<hex>         materialized image rootfs, keyed by config digest
 //!   <data>/images.json          tag index (name/tag -> manifest digest)
 //!   <data>/images.lock          cross-process lock for index mutations
+//!   <data>/image-operations.lock shared image transactions / exclusive GC
+//!   <data>/rootfs-locks/<hex>   active-container leases for materialized roots
 //!
 //! Everything is plain files + one small JSON index: there is no daemon, and
 //! `rmi` garbage-collects by recomputing what is reachable from the index.
@@ -17,6 +19,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,6 +49,21 @@ pub struct ImageStore {
     data_root: PathBuf,
 }
 
+/// Shared lease protecting a complete image-store operation from garbage
+/// collection. Keep it alive across every blob/rootfs write and the index
+/// update that makes those artifacts reachable.
+pub struct ImageStoreLease {
+    data_root: PathBuf,
+    _file: File,
+}
+
+/// Shared lease for a materialized rootfs actively used by a foreground
+/// container. GC skips that rootfs while continuing to reclaim unrelated
+/// images.
+pub struct ImageRootfsLease {
+    _file: File,
+}
+
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 impl ImageStore {
@@ -64,6 +82,103 @@ impl ImageStore {
         Ok(s)
     }
 
+    /// Acquire a shared lease for a complete image-store transaction. GC
+    /// takes the same lock exclusively, so it cannot sweep in-progress blobs,
+    /// rootfs staging directories, or data being read by an image operation.
+    pub fn lock_operations(&self) -> ZResult<ImageStoreLease> {
+        let path = self.data_root.join("image-operations.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| crate::zerr!("open image operations lock {}: {e}", path.display()))?;
+        file.lock_shared()
+            .map_err(|e| crate::zerr!("lock image operations {}: {e}", path.display()))?;
+        Ok(ImageStoreLease {
+            data_root: self.data_root.clone(),
+            _file: file,
+        })
+    }
+
+    pub(crate) fn validate_operation_lease(&self, lease: &ImageStoreLease) -> ZResult<()> {
+        if lease.data_root != self.data_root {
+            return Err(crate::zerr!(
+                "image-store operation lease belongs to another data root"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Keep an image rootfs alive while a container uses it without holding
+    /// the global transaction lease for the entire workload lifetime. Call
+    /// while holding `lock_operations()` so GC cannot race lease acquisition.
+    pub fn lock_rootfs_path(
+        &self,
+        operation: &ImageStoreLease,
+        rootfs: &Path,
+    ) -> ZResult<ImageRootfsLease> {
+        self.validate_operation_lease(operation)?;
+        if rootfs.parent() != Some(self.rootfs_dir().as_path()) {
+            return Err(crate::zerr!(
+                "rootfs path is outside the image store: {}",
+                rootfs.display()
+            ));
+        }
+        let config_hex = rootfs
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| crate::zerr!("invalid image rootfs path {}", rootfs.display()))?;
+        digest_hex(&format!("sha256:{config_hex}"))?;
+        let lock = self.open_rootfs_lock(config_hex)?;
+        lock.lock_shared()
+            .map_err(|e| crate::zerr!("lock image rootfs {}: {e}", rootfs.display()))?;
+        Ok(ImageRootfsLease { _file: lock })
+    }
+
+    fn open_rootfs_lock(&self, config_hex: &str) -> ZResult<File> {
+        digest_hex(&format!("sha256:{config_hex}"))?;
+        let lock_dir = self.data_root.join("rootfs-locks");
+        fsutil::mkdir_p_mode(&lock_dir, 0o700)?;
+        let path = lock_dir.join(format!("{config_hex}.lock"));
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| crate::zerr!("open image rootfs lock {}: {e}", path.display()))
+    }
+
+    fn try_lock_rootfs_for_gc(&self, config_hex: &str) -> ZResult<Option<File>> {
+        let lock = self.open_rootfs_lock(config_hex)?;
+        match lock.try_lock() {
+            Ok(()) => Ok(Some(lock)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(crate::zerr!(
+                "lock image rootfs {config_hex} for garbage collection: {error}"
+            )),
+        }
+    }
+
+    fn lock_operations_exclusive(&self) -> ZResult<File> {
+        let path = self.data_root.join("image-operations.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| crate::zerr!("open image operations lock {}: {e}", path.display()))?;
+        file.lock()
+            .map_err(|e| crate::zerr!("lock image operations {}: {e}", path.display()))?;
+        Ok(file)
+    }
+
     fn ensure_dirs(&self) -> ZResult<()> {
         // Image configs and layers may come from private registries. Keep the
         // entire image store owner-only, including trees created by older
@@ -73,9 +188,13 @@ impl ImageStore {
         fsutil::mkdir_p_mode(&blobs, 0o700)?;
         fsutil::mkdir_p_mode(&blobs.join("sha256"), 0o700)?;
         fsutil::mkdir_p_mode(&self.data_root.join("rootfs"), 0o700)?;
+        fsutil::mkdir_p_mode(&self.data_root.join("rootfs-locks"), 0o700)?;
         Ok(())
     }
 
+    // Low-level content/index helpers intentionally do not nest operation
+    // locks. Their multi-step callers (pull/load/commit/run/save/push) hold a
+    // shared operation lease; GC holds it exclusively before taking images.lock.
     // --- blobs ------------------------------------------------------------
 
     pub fn blob_path(&self, digest: &str) -> ZResult<PathBuf> {
@@ -353,6 +472,7 @@ impl ImageStore {
         target_name: &str,
         target_tag: Option<&str>,
     ) -> ZResult<ImageRecord> {
+        let _operation = self.lock_operations()?;
         let _lock = self.lock_index()?;
         let mut records = self.records()?;
         let Some(source) = find_record_in(&records, source_name, source_tag, source_digest) else {
@@ -387,6 +507,7 @@ impl ImageStore {
         tag: Option<&str>,
         digest: Option<&str>,
     ) -> ZResult<Option<ImageRecord>> {
+        let _operation = self.lock_operations()?;
         let _lock = self.lock_index()?;
         let mut records = self.records()?;
         let idx = if let Some(d) = digest {
@@ -413,6 +534,9 @@ impl ImageStore {
     /// This stays a read-only dry run so `system df` can report stale pull
     /// artifacts without mutating the store or requiring a privileged caller.
     pub fn reclaimable_bytes_with_protected(&self, protected_rootfs: &BTreeSet<PathBuf>) -> u64 {
+        let Ok(_operation) = self.lock_operations() else {
+            return 0;
+        };
         let Ok(_lock) = self.lock_index() else {
             return 0;
         };
@@ -453,9 +577,19 @@ impl ImageStore {
             for entry in rd.flatten() {
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else { continue };
-                if name.starts_with(".tmp-")
-                    || (!keep_rootfs.contains(name) && !protected_rootfs.contains(&entry.path()))
-                {
+                if name.starts_with(".tmp-") {
+                    total += fsutil::dir_size(&entry.path());
+                    continue;
+                }
+                if keep_rootfs.contains(name) || protected_rootfs.contains(&entry.path()) {
+                    continue;
+                }
+                if name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    let Ok(Some(_rootfs_lock)) = self.try_lock_rootfs_for_gc(name) else {
+                        continue;
+                    };
+                    total += fsutil::dir_size(&entry.path());
+                } else {
                     total += fsutil::dir_size(&entry.path());
                 }
             }
@@ -468,7 +602,16 @@ impl ImageStore {
     ///
     /// Materialized rootfs directories supplied in `protected_rootfs` are kept
     /// even when their image tag is no longer present.
-    pub fn gc_with_protected(&self, protected_rootfs: &BTreeSet<PathBuf>) -> ZResult<()> {
+    /// Recompute external rootfs protections after the GC transaction lock is
+    /// held. This closes races with a detached run that persists its state
+    /// while GC is waiting to start. The callback must not re-enter this image
+    /// store because the exclusive operation lock is already held.
+    pub fn gc_with_protected_from<F>(&self, protected_rootfs: F) -> ZResult<()>
+    where
+        F: FnOnce() -> BTreeSet<PathBuf>,
+    {
+        let _operation = self.lock_operations_exclusive()?;
+        let protected_rootfs = protected_rootfs();
         let _lock = self.lock_index()?;
         let records = self.records()?;
         let mut keep_blobs: BTreeSet<String> = BTreeSet::new(); // "sha256:<hex>"
@@ -514,13 +657,31 @@ impl ImageStore {
             for entry in rd.flatten() {
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else { continue };
-                if name.starts_with(".tmp-")
-                    || keep_rootfs.contains(name)
-                    || protected_rootfs.contains(&entry.path())
-                {
+                if name.starts_with(".tmp-") || protected_rootfs.contains(&entry.path()) {
                     continue;
                 }
-                fsutil::remove_dir_all_quiet(&entry.path());
+                if name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    let Some(rootfs_lock) = self.try_lock_rootfs_for_gc(name)? else {
+                        continue;
+                    };
+                    if !keep_rootfs.contains(name) {
+                        fsutil::remove_dir_all_quiet(&entry.path());
+                    }
+                    // The global exclusive operation lock prevents new lease
+                    // openers. If the per-rootfs lock is uncontended, removing
+                    // this now-idle lock inode is safe and avoids permanent
+                    // metadata growth for every image ever run.
+                    drop(rootfs_lock);
+                    let _ = fs::remove_file(
+                        self.data_root
+                            .join("rootfs-locks")
+                            .join(format!("{name}.lock")),
+                    );
+                } else if !keep_rootfs.contains(name) {
+                    // Legacy or malformed rootfs entries cannot be named by a
+                    // valid config digest and therefore cannot have a lease.
+                    fsutil::remove_dir_all_quiet(&entry.path());
+                }
             }
         }
         Ok(())
@@ -763,11 +924,124 @@ mod tests {
             expected
         );
 
-        s.gc_with_protected(&BTreeSet::new()).unwrap();
+        s.gc_with_protected_from(BTreeSet::new).unwrap();
         assert!(s.verify_blob(&kept_digest).unwrap());
         assert!(!s.verify_blob(&orphan_digest).unwrap());
         assert!(!orphan_rootfs.exists());
         assert_eq!(s.reclaimable_bytes_with_protected(&BTreeSet::new()), 0);
+    }
+
+    #[test]
+    fn garbage_collection_waits_for_store_transactions() {
+        let s = test_store();
+        let lease = s.lock_operations().unwrap();
+        let lock_path = s.data_root.join("image-operations.lock");
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(lease);
+        contender.try_lock().unwrap();
+        let _ = fs::remove_dir_all(&s.data_root);
+    }
+
+    #[test]
+    fn gc_recomputes_container_protections_after_acquiring_its_lock() {
+        let s = test_store();
+        let operation = s.lock_operations().unwrap();
+        let op_lock_path = s.data_root.join("image-operations.lock");
+        let gc_root = s.rootfs_dir().join("container-root");
+        fs::create_dir_all(&gc_root).unwrap();
+        fs::write(gc_root.join("marker"), b"keep me").unwrap();
+        let data_root = s.data_root.clone();
+        let gc_root_for_thread = gc_root.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let gc = std::thread::spawn(move || {
+            let gc_store = ImageStore::at(&data_root).unwrap();
+            started_tx.send(()).unwrap();
+            gc_store
+                .gc_with_protected_from(|| {
+                    let probe = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&op_lock_path)
+                        .unwrap();
+                    assert!(matches!(
+                        probe.try_lock_shared(),
+                        Err(std::fs::TryLockError::WouldBlock)
+                    ));
+                    BTreeSet::from([gc_root_for_thread.clone()])
+                })
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        drop(operation);
+        gc.join().unwrap();
+        assert!(gc_root.join("marker").is_file());
+        let _ = fs::remove_dir_all(&s.data_root);
+    }
+
+    #[test]
+    fn garbage_collection_preserves_an_active_rootfs_lease() {
+        let s = test_store();
+        let config_hex = "a".repeat(64);
+        let rootfs = s.rootfs_dir().join(&config_hex);
+        fs::create_dir_all(&rootfs).unwrap();
+        fs::write(rootfs.join("marker"), b"active rootfs").unwrap();
+
+        // The global lease closes the lookup-to-rootfs-lease race. Once the
+        // rootfs lease is held, unrelated image operations and GC can resume.
+        let operation = s.lock_operations().unwrap();
+        let rootfs_lease = s.lock_rootfs_path(&operation, &rootfs).unwrap();
+        drop(operation);
+        assert_eq!(
+            s.reclaimable_bytes_with_protected(&BTreeSet::new()),
+            0,
+            "active rootfs leases must not be reported as reclaimable"
+        );
+        s.gc_with_protected_from(BTreeSet::new).unwrap();
+        assert!(rootfs.join("marker").is_file());
+
+        drop(rootfs_lease);
+        s.gc_with_protected_from(BTreeSet::new).unwrap();
+        assert!(!rootfs.exists());
+        let _ = fs::remove_dir_all(&s.data_root);
+    }
+
+    #[test]
+    fn gc_cleans_idle_rootfs_lock_files_for_retained_images() {
+        let s = test_store();
+        let config_hex = "b".repeat(64);
+        let config_digest = format!("sha256:{config_hex}");
+        let rootfs = s.rootfs_dir().join(&config_hex);
+        fs::create_dir_all(&rootfs).unwrap();
+        fs::write(rootfs.join("marker"), b"keep me").unwrap();
+        s.add_image(
+            "docker.io/example/retained",
+            Some("latest"),
+            &format!("sha256:{}", "c".repeat(64)),
+            &config_digest,
+            0,
+        )
+        .unwrap();
+        let lock_path = s
+            .data_root
+            .join("rootfs-locks")
+            .join(format!("{config_hex}.lock"));
+        let operation = s.lock_operations().unwrap();
+        drop(s.lock_rootfs_path(&operation, &rootfs).unwrap());
+        drop(operation);
+        assert!(lock_path.exists());
+
+        s.gc_with_protected_from(BTreeSet::new).unwrap();
+        assert!(rootfs.join("marker").is_file());
+        assert!(!lock_path.exists());
+        let _ = fs::remove_dir_all(&s.data_root);
     }
 
     #[test]
@@ -785,7 +1059,7 @@ mod tests {
             s.reclaimable_bytes_with_protected(&protected_set),
             b"remove me".len() as u64
         );
-        s.gc_with_protected(&protected_set).unwrap();
+        s.gc_with_protected_from(|| protected_set.clone()).unwrap();
         assert!(protected.join("marker").is_file());
         assert!(!orphan.exists());
         let _ = fs::remove_dir_all(&s.data_root);
@@ -807,12 +1081,28 @@ mod tests {
             dir.join("blobs"),
             dir.join("blobs/sha256"),
             store.rootfs_dir(),
+            dir.join("rootfs-locks"),
         ] {
             assert_eq!(
                 fs::metadata(path).unwrap().permissions().mode() & 0o777,
                 0o700
             );
         }
+        let operation = store.lock_operations().unwrap();
+        let rootfs = store.rootfs_dir().join("d".repeat(64));
+        fs::create_dir_all(&rootfs).unwrap();
+        let _rootfs_lease = store.lock_rootfs_path(&operation, &rootfs).unwrap();
+        for path in [
+            dir.join("image-operations.lock"),
+            dir.join("rootfs-locks")
+                .join(format!("{}.lock", "d".repeat(64))),
+        ] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(operation);
         let _ = fs::remove_dir_all(&dir);
     }
 

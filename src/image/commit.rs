@@ -48,6 +48,16 @@ pub fn commit_image(
     target: &str,
     options: CommitOptions,
 ) -> ZResult<crate::image::store::ImageRecord> {
+    let _lease = store.lock_operations()?;
+    commit_image_in_transaction(store, source_rootfs, target, options)
+}
+
+fn commit_image_in_transaction(
+    store: &ImageStore,
+    source_rootfs: &Path,
+    target: &str,
+    options: CommitOptions,
+) -> ZResult<crate::image::store::ImageRecord> {
     if !source_rootfs.is_dir() {
         return Err(crate::zerr!(
             "container rootfs does not exist: {}",

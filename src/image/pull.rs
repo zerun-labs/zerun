@@ -10,7 +10,7 @@ use crate::image::config::ImageConfig;
 use crate::image::manifest::{self, ImageDoc, Platform};
 use crate::image::name::Reference;
 use crate::image::registry::RegistryClient;
-use crate::image::store::{sha256_hex, ImageStore};
+use crate::image::store::{sha256_hex, ImageStore, ImageStoreLease};
 use crate::image::unpack::unpack_layer;
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
@@ -71,6 +71,20 @@ pub fn pull_image(
     reference: &Reference,
     opts: &PullOptions,
 ) -> ZResult<PulledImage> {
+    let lease = store.lock_operations()?;
+    pull_image_with_lease(store, client, reference, opts, &lease)
+}
+
+/// Pull an image while the caller holds a store lease. `run` uses this form to
+/// keep the selected rootfs protected until its container state is durable.
+pub fn pull_image_with_lease(
+    store: &ImageStore,
+    client: &mut RegistryClient,
+    reference: &Reference,
+    opts: &PullOptions,
+    lease: &ImageStoreLease,
+) -> ZResult<PulledImage> {
+    store.validate_operation_lease(lease)?;
     let want = opts
         .platform
         .as_deref()

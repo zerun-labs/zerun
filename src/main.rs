@@ -739,6 +739,28 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         return 2;
     }
 
+    // Protect image lookup/pull until a rootfs-scoped lease is established.
+    // Detached state then protects the lower rootfs after it is persisted.
+    let image_store_lease = if resume.is_none() && a.image.is_some() {
+        let imgstore = match image::store::ImageStore::open(&store) {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("zerun: {error}");
+                return 1;
+            }
+        };
+        match imgstore.lock_operations() {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                eprintln!("zerun: {error}");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+    let mut image_rootfs_lease = None;
+
     // One id per run: used for the HOSTNAME default, the per-run overlay, the
     // nft table/veth names and the lifecycle state directory. New runs reserve
     // their directory atomically before any filesystem or kernel resources are
@@ -845,8 +867,35 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
                 return 2;
             }
         };
-        match resolve_run_image(&store, &reference, a.platform.as_deref(), a.pull) {
+        match resolve_run_image(
+            &store,
+            &reference,
+            a.platform.as_deref(),
+            a.pull,
+            image_store_lease
+                .as_ref()
+                .expect("image runs hold an image-store lease"),
+        ) {
             Ok((rootfs, cfg)) => {
+                let imgstore = match image::store::ImageStore::open(&store) {
+                    Ok(store) => store,
+                    Err(error) => {
+                        eprintln!("zerun: {error}");
+                        return 1;
+                    }
+                };
+                image_rootfs_lease = match imgstore.lock_rootfs_path(
+                    image_store_lease
+                        .as_ref()
+                        .expect("image runs hold an image-store lease"),
+                    &rootfs,
+                ) {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        eprintln!("zerun: {error}");
+                        return 1;
+                    }
+                };
                 let env = match build_image_env(
                     &cfg.config.env,
                     &a.env,
@@ -895,6 +944,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         }
     };
 
+    drop(image_store_lease);
     let container_fs = if let Some(st) = &resume {
         if st.overlay.is_some() {
             match store.reopen_container_fs(&id, &rootfs, st.tmpfs_upper) {
@@ -1025,6 +1075,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
                 lower,
                 resume,
                 report_id,
+                image_rootfs_lease,
             },
             id_reservation,
         );
@@ -1259,6 +1310,7 @@ struct DetachedInfo {
     lower: String,
     resume: Option<ContainerState>,
     report_id: bool,
+    image_rootfs_lease: Option<image::store::ImageRootfsLease>,
 }
 
 fn run_detached(
@@ -1450,6 +1502,9 @@ fn run_detached(
     if let Some(reservation) = id_reservation.as_mut() {
         reservation.commit();
     }
+    // The persisted lower-rootfs reference now protects this image from GC.
+    // Drop before fork so the reaper cannot retain a rootfs lease for life.
+    drop(info.image_rootfs_lease.take());
     // The name is now persisted and visible to the next serialized creator or
     // rename. Release before fork so the reaper cannot retain the global lock.
     drop(name_lock);
@@ -1879,10 +1934,27 @@ fn cmd_commit(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let st = match state::resolve(&store, container) {
-        Ok(s) => s,
+    let initial = match state::resolve(&store, container) {
+        Ok(st) => st,
         Err(e) => {
             eprintln!("zerun commit: {e}");
+            return 1;
+        }
+    };
+    let _container_lock = match state::ContainerOperationLock::try_acquire(&store, &initial.id) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("zerun commit: {e}");
+            return 1;
+        }
+    };
+    let st = match state::ContainerState::load(&store, &initial.id) {
+        Some(st) => st,
+        None => {
+            eprintln!(
+                "zerun commit: container {} disappeared",
+                display_name(&initial)
+            );
             return 1;
         }
     };
@@ -2093,6 +2165,7 @@ fn resolve_run_image(
     reference: &Reference,
     platform: Option<&str>,
     pull: PullPolicy,
+    lease: &image::store::ImageStoreLease,
 ) -> Result<(PathBuf, image::config::ImageConfig), error::ZError> {
     let imgstore = image::store::ImageStore::open(store)?;
     let requested = platform
@@ -2144,7 +2217,7 @@ fn resolve_run_image(
     let opts = PullOptions {
         platform: platform.map(str::to_string),
     };
-    let pulled = image::pull_image(&imgstore, &mut client, reference, &opts)?;
+    let pulled = image::pull_image_with_lease(&imgstore, &mut client, reference, &opts, lease)?;
     eprintln!(
         "zerun: pulled {} ({}), rootfs ready",
         reference.canonical(),
@@ -2669,7 +2742,6 @@ fn cmd_rmi(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let protected_rootfs = protected_image_rootfs(&imgstore, &store);
     let mut failed = false;
     let mut removed_any = false;
     for r in args {
@@ -2699,8 +2771,11 @@ fn cmd_rmi(args: &[String]) -> i32 {
         }
     }
     if removed_any {
-        if let Err(e) = imgstore.gc_with_protected(&protected_rootfs) {
+        if let Err(e) =
+            imgstore.gc_with_protected_from(|| protected_image_rootfs(&imgstore, &store))
+        {
             eprintln!("zerun rmi: garbage collection: {e}");
+            failed = true;
         }
     }
     if failed {
@@ -3821,7 +3896,7 @@ fn cmd_prune(args: &[String]) -> i32 {
     }
 
     if images {
-        match imgstore.gc_with_protected(&protected_image_rootfs(&imgstore, &store)) {
+        match imgstore.gc_with_protected_from(|| protected_image_rootfs(&imgstore, &store)) {
             Ok(()) => println!(
                 "Reclaimed image storage: {}",
                 fsutil::human_size(image_reclaimable)
@@ -4966,10 +5041,27 @@ fn cmd_diff(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let st = match state::resolve(&store, target) {
-        Ok(s) => s,
+    let initial = match state::resolve(&store, target) {
+        Ok(st) => st,
         Err(e) => {
             eprintln!("zerun diff: {e}");
+            return 1;
+        }
+    };
+    let _container_lock = match state::ContainerOperationLock::try_acquire(&store, &initial.id) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("zerun diff: {e}");
+            return 1;
+        }
+    };
+    let st = match state::ContainerState::load(&store, &initial.id) {
+        Some(st) => st,
+        None => {
+            eprintln!(
+                "zerun diff: container {} disappeared",
+                display_name(&initial)
+            );
             return 1;
         }
     };

@@ -35,6 +35,7 @@ pub fn save_images(
     images: &[String],
     output: &Path,
 ) -> ZResult<Vec<ImageRecord>> {
+    let _lease = store.lock_operations()?;
     if images.is_empty() {
         return Err(crate::zerr!("at least one IMAGE is required"));
     }
@@ -191,6 +192,7 @@ fn manifest_media_type(bytes: &[u8]) -> ZResult<String> {
 /// trees and re-creating tag index records. Returns every newly imported
 /// record. Existing tags with the same name are replaced (re-load semantics).
 pub fn load_archive(store: &ImageStore, input: &Path) -> ZResult<Vec<ImageRecord>> {
+    let _lease = store.lock_operations()?;
     let file =
         File::open(input).map_err(|e| crate::zerr!("open archive {}: {e}", input.display()))?;
     let mut archive = tar::Archive::new(BufReader::new(file));
@@ -464,7 +466,7 @@ mod tests {
         store
             .remove_record("docker.io/example/zerun-archive", Some("v1"), None)
             .unwrap();
-        store.gc_with_protected(&BTreeSet::new()).unwrap();
+        store.gc_with_protected_from(BTreeSet::new).unwrap();
 
         let imported = load_archive(&store, &archive_path).unwrap();
         assert_eq!(imported.len(), 1);
@@ -558,7 +560,7 @@ mod tests {
         store
             .remove_record("docker.io/example/multi-arm", Some("v1"), None)
             .unwrap();
-        store.gc_with_protected(&BTreeSet::new()).unwrap();
+        store.gc_with_protected_from(BTreeSet::new).unwrap();
         assert!(!store.verify_blob(&index_digest).unwrap());
 
         let imported = load_archive(&store, &archive_path).unwrap();
