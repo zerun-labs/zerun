@@ -2,14 +2,11 @@
 //!
 //! Model (in-process; no re-exec needed):
 //!
-//!   * the CLI forks a joiner (C);
-//!   * C opens every `/proc/<pid>/ns/*` fd of the container's PID 1 **in the
-//!     host context** and keeps the `File`s alive, then setns()es into the
-//!     container's namespaces — the private `user` namespace first (only
-//!     rootless containers have one), then mnt/uts/ipc/net/cgroup;
-//!   * C then setns(pid): a process cannot change its own PID namespace, but
-//!     every child born *after* that call is a member of the container's PID
-//!     namespace, so C forks the worker (D) next;
+//!   * the CLI opens a pidfd for container PID 1, revalidates its persisted
+//!     process identity, then forks a joiner (C) with that stable task handle;
+//!   * C enters the target namespaces through that pidfd — the private `user`
+//!     namespace first (only rootless containers have one), then
+//!     mnt/uts/ipc/net/cgroup/pid in one operation;
 //!   * before joining the mount namespace, C opens the host cgroup's
 //!     `cgroup.procs` file; its descriptor remains valid after `/sys` becomes
 //!     the container view;
@@ -26,6 +23,7 @@ use crate::error::ZResult;
 use crate::state::{ContainerState, Status};
 use crate::workload;
 use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
 use std::path::Path;
 
 /// Join the running container described by `state` and run `argv` with the
@@ -85,11 +83,37 @@ pub fn run(
         None => None,
     };
 
+    // Pin the target process before forking the namespace joiner. Check the
+    // persisted start time again after pidfd_open so a PID reused between the
+    // initial state check and this operation is rejected before any setns.
+    if let Some(expected) = state.pid_start_time {
+        if crate::procinfo::process_start_time(pid) != Some(expected) {
+            return Err(crate::zerr!(
+                "container PID {pid} no longer matches its recorded process"
+            ));
+        }
+    }
+    let pidfd = crate::syscalls::pidfd_open(pid)?;
+    if let Some(expected) = state.pid_start_time {
+        if crate::procinfo::process_start_time(pid) != Some(expected) {
+            return Err(crate::zerr!(
+                "container PID {pid} no longer matches its recorded process"
+            ));
+        }
+    }
+
     // The joiner C.
     match crate::syscalls::fork_process() {
         Err(error) => Err(crate::zerr!("exec: fork: {error}")),
         Ok(0) => {
-            let code = joiner(state, pid, cgroup_path.as_deref(), env_extra, workdir, argv);
+            let code = joiner(
+                state,
+                pidfd.as_raw_fd(),
+                cgroup_path.as_deref(),
+                env_extra,
+                workdir,
+                argv,
+            );
             crate::syscalls::exit_process(code)
         }
         Ok(parent) => {
@@ -101,42 +125,19 @@ pub fn run(
     }
 }
 
-/// Which namespaces `exec` joins, and the order they must be entered in.
-/// Rootless containers have a private `user` namespace that owns the others:
-/// setns() into them is only permitted from inside it, so `user` must come
-/// first. Rootful containers share the initial user namespace (setns into it
-/// fails with EINVAL), so it is skipped entirely. `pid` is joined last and
-/// never takes effect on C itself, only on its children.
+/// Which namespace flags `exec` joins. Rootless containers enter their private
+/// user namespace in a separate operation first; rootful containers skip it.
+/// The remaining namespaces are entered atomically with one pidfd setns call.
+/// Joining the PID namespace only affects children, so the worker is forked
+/// afterward.
 fn joiner(
     state: &ContainerState,
-    container_pid: i32,
+    pidfd: std::os::fd::RawFd,
     cgroup_path: Option<&Path>,
     env_extra: &[String],
     workdir: Option<&str>,
     argv: &[String],
 ) -> i32 {
-    // Open every namespace fd while we are still in the host context: after
-    // setns(mnt) the container's /proc replaces ours and host paths vanish.
-    // The File objects must stay alive (and therefore open) until the last
-    // setns call, hence the explicit vector — dropping them early would close
-    // the fd and make the stored RawFd stale.
-    let mut order: Vec<&str> = Vec::with_capacity(7);
-    if state.rootless {
-        order.push("user");
-    }
-    order.extend(["mnt", "uts", "ipc", "net", "cgroup", "pid"]);
-    let mut ns: Vec<(File, &str)> = Vec::with_capacity(order.len());
-    for name in order {
-        let path = format!("/proc/{container_pid}/ns/{name}");
-        match File::open(&path) {
-            Ok(f) => ns.push((f, name)),
-            Err(e) => {
-                eprintln!("zerun exec: open {path}: {e}");
-                return 1;
-            }
-        }
-    }
-
     // After `setns(mnt)`, `/sys/fs/cgroup` resolves inside the container's
     // mount namespace, where the host cgroup path in lifecycle state is not
     // visible. Open the already-validated host cgroup file now and retain its
@@ -152,26 +153,19 @@ fn joiner(
         None => None,
     };
 
-    for (f, name) in ns.iter() {
-        if *name == "pid" {
-            continue; // handled below, right before the second fork
-        }
-        if let Err(e) = setns(f, name) {
-            eprintln!("zerun exec: {e}");
+    let (user_namespace, namespaces) = namespace_flags(state.rootless);
+    if let Some(user_namespace) = user_namespace {
+        if let Err(error) = crate::syscalls::setns(pidfd, user_namespace) {
+            eprintln!("zerun exec: setns(user): {error}");
             return 1;
         }
     }
-    for (f, name) in ns.iter() {
-        if *name == "pid" {
-            if let Err(e) = setns(f, name) {
-                eprintln!("zerun exec: {e}");
-                return 1;
-            }
-            break;
-        }
+    if let Err(error) = crate::syscalls::setns(pidfd, namespaces) {
+        eprintln!("zerun exec: setns(container namespaces): {error}");
+        return 1;
     }
-    // ns (the File owners) is dropped here, after every setns call. From this
-    // point on all future children are members of the container's PID ns.
+    // Joining the PID namespace takes effect only for children; the worker
+    // fork below is therefore the first process created inside that namespace.
 
     // Second fork: D is born inside the container's PID namespace.
     match crate::syscalls::fork_process() {
@@ -201,10 +195,17 @@ fn joiner(
     }
 }
 
-/// setns into one namespace by fd, with a readable error.
-fn setns(f: &File, what: &str) -> Result<(), String> {
-    use std::os::fd::AsRawFd;
-    crate::syscalls::setns(f.as_raw_fd(), 0).map_err(|error| format!("setns({what}): {error}"))
+/// Select pidfd `setns` flags. User namespaces must be entered separately
+/// first; joining PID takes effect only for children created afterward.
+fn namespace_flags(rootless: bool) -> (Option<libc::c_int>, libc::c_int) {
+    let user = rootless.then_some(libc::CLONE_NEWUSER);
+    let rest = libc::CLONE_NEWNS
+        | libc::CLONE_NEWUTS
+        | libc::CLONE_NEWIPC
+        | libc::CLONE_NEWNET
+        | libc::CLONE_NEWCGROUP
+        | libc::CLONE_NEWPID;
+    (user, rest)
 }
 
 /// The in-container worker: cgroup join, cwd, env, hardening, exec.
@@ -342,7 +343,30 @@ fn upsert(env: &mut Vec<(String, String)>, key: &str, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{join_cgroup, open_cgroup_procs};
+    use super::{join_cgroup, namespace_flags, open_cgroup_procs};
+
+    #[test]
+    fn user_namespace_is_joined_separately_before_other_namespaces() {
+        let (user_namespace, namespaces) = namespace_flags(true);
+        assert_eq!(user_namespace, Some(libc::CLONE_NEWUSER));
+        assert_eq!(
+            namespaces,
+            libc::CLONE_NEWNS
+                | libc::CLONE_NEWUTS
+                | libc::CLONE_NEWIPC
+                | libc::CLONE_NEWNET
+                | libc::CLONE_NEWCGROUP
+                | libc::CLONE_NEWPID
+        );
+    }
+
+    #[test]
+    fn rootful_namespace_join_skips_the_initial_user_namespace() {
+        let (user_namespace, namespaces) = namespace_flags(false);
+        assert_eq!(user_namespace, None);
+        assert_ne!(namespaces & libc::CLONE_NEWUSER, libc::CLONE_NEWUSER);
+        assert_ne!(namespaces & libc::CLONE_NEWPID, 0);
+    }
 
     #[test]
     fn join_cgroup_writes_the_worker_pid() {

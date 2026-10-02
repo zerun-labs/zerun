@@ -210,6 +210,7 @@ jobs:
             target/debug/zerun)
 
           id="$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
+            --init --name ci-rootless-exec -- /bin/sh -c 'sleep 30')"
             --init --name ci-detached -- /bin/sh -c \
             'printf "detached-smoke\n"; sleep 30')"
           test -n "$id"
@@ -318,6 +319,22 @@ jobs:
             echo "rootless container did not map uid 0" >&2
             exit 92
           fi
+
+          # Exercise exec's pidfd-based namespace join from a non-root host
+          # process, including the separate user-namespace join path.
+          zerun=(sudo -u "$ci_user" env
+            HOME="$home"
+            ZERUN_DATA_ROOT="$data"
+            ZERUN_RUNTIME_ROOT="$runtime"
+            "$binary")
+          id="$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
+            --init --name ci-rootless-exec -- /bin/sh -c 'sleep 30')"
+          exec_output="$("${zerun[@]}" exec "$id" /bin/sh -c \
+            'printf "rootless-exec-ok uid=%s\n" "$(/bin/busybox id -u)"')"
+          grep -Fx "rootless-exec-ok uid=0" <<<"$exec_output"
+          "${zerun[@]}" kill --signal TERM "$id"
+          test "$("${zerun[@]}" wait "$id")" = 143
+          "${zerun[@]}" rm "$id"
 
   rootful-integration:
     name: rootful integration (runtime/storage/network)
