@@ -5579,22 +5579,34 @@ fn cmd_attach(args: &[String]) -> i32 {
     use std::io::Write as _;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    let mut final_code = None;
     loop {
         match lifecycle::read_attach_frame(&mut stream) {
-            Ok(Some(chunk)) => {
+            Ok(lifecycle::AttachFrame::Data(chunk)) => {
                 if out.write_all(&chunk).is_err() {
-                    break;
+                    eprintln!("zerun attach: write workload output failed");
+                    return 1;
                 }
                 let _ = out.flush();
             }
-            Ok(None) => break,
-            Err(_) => break,
+            Ok(lifecycle::AttachFrame::Exit(code)) => {
+                final_code = Some(code);
+                break;
+            }
+            Ok(lifecycle::AttachFrame::Eof) => break,
+            Err(error) => {
+                eprintln!("zerun attach: read attach stream: {error}");
+                return 1;
+            }
         }
     }
-    // If EOF raced the control frame, fall back to the persisted state.
+    if let Some(code) = final_code {
+        return code;
+    }
+    // A reaper crash may close the socket before sending its final control
+    // frame. In that case, use the state record if it was persisted.
     match state::ContainerState::load(&store, &st.id) {
         Some(final_state) => final_state.exit_code.unwrap_or(0),
-        // `--rm` removed the state; treat a clean EOF as success.
         None => 0,
     }
 }

@@ -386,16 +386,33 @@ fn broadcast(clients: &Mutex<Vec<UnixStream>>, chunk: &[u8]) {
     list.retain_mut(|client| client.write_all(&frame).is_ok());
 }
 
-/// Read one attach-socket frame. `None` means "container exited" and carries
-/// the final status in the control payload.
-pub fn read_attach_frame(stream: &mut UnixStream) -> std::io::Result<Option<Vec<u8>>> {
+/// One message from the attach stream. EOF is separate from the explicit
+/// control frame because the latter carries the workload's exact exit code.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AttachFrame {
+    Data(Vec<u8>),
+    Exit(i32),
+    Eof,
+}
+
+/// Read one attach-socket frame, preserving the final exit status.
+pub fn read_attach_frame(stream: &mut UnixStream) -> std::io::Result<AttachFrame> {
     let mut prefix = [0u8; 4];
-    stream.read_exact(&mut prefix)?;
+    loop {
+        match stream.read(&mut prefix[..1]) {
+            Ok(0) => return Ok(AttachFrame::Eof),
+            Ok(1) => break,
+            Ok(_) => unreachable!("one-byte read returned more than one byte"),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    stream.read_exact(&mut prefix[1..])?;
     let len = u32::from_be_bytes(prefix);
     if len == 0 {
         let mut code = [0u8; 4];
         stream.read_exact(&mut code)?;
-        return Ok(None);
+        return Ok(AttachFrame::Exit(i32::from_be_bytes(code)));
     }
     // The reaper only writes pipe-sized workload frames; retain a hard bound
     // anyway so a malformed local stream cannot force a huge allocation.
@@ -407,7 +424,7 @@ pub fn read_attach_frame(stream: &mut UnixStream) -> std::io::Result<Option<Vec<
     }
     let mut chunk = vec![0u8; len as usize];
     stream.read_exact(&mut chunk)?;
-    Ok(Some(chunk))
+    Ok(AttachFrame::Data(chunk))
 }
 
 fn collect_timestamped(
@@ -595,11 +612,11 @@ mod attach_tests {
         broadcast(&clients, b"no-newline");
         assert_eq!(
             read_attach_frame(&mut client).unwrap(),
-            Some(b"exit=7\n".to_vec())
+            AttachFrame::Data(b"exit=7\n".to_vec())
         );
         assert_eq!(
             read_attach_frame(&mut client).unwrap(),
-            Some(b"no-newline".to_vec())
+            AttachFrame::Data(b"no-newline".to_vec())
         );
     }
 
@@ -611,7 +628,29 @@ mod attach_tests {
             sock_path: std::path::PathBuf::from("/nonexistent/zerun-test.sock"),
         };
         hub.close_all(7);
-        assert_eq!(read_attach_frame(&mut client).unwrap(), None);
+        assert_eq!(
+            read_attach_frame(&mut client).unwrap(),
+            AttachFrame::Exit(7)
+        );
+    }
+
+    #[test]
+    fn attach_reports_clean_eof_without_an_exit_frame() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        drop(server);
+        assert_eq!(read_attach_frame(&mut client).unwrap(), AttachFrame::Eof);
+    }
+
+    #[test]
+    fn attach_rejects_truncated_exit_frames() {
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        server.write_all(&0u32.to_be_bytes()).unwrap();
+        server.write_all(&[0, 0]).unwrap();
+        drop(server);
+        assert_eq!(
+            read_attach_frame(&mut client).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
     }
 
     #[test]

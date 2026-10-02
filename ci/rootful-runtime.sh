@@ -250,6 +250,18 @@ attach_output=$("${zerun[@]}" attach "$attach_id")
 grep -Fxq attach-ok <<<"$attach_output"
 "${zerun[@]}" rm "$attach_id" >/dev/null
 
+# The attach control frame must preserve non-zero exit codes even when --rm
+# removes the state record before the attaching CLI performs its fallback read.
+attach_rm_id=$("${zerun[@]}" run -d --rm --rootfs "$rootfs" --no-overlay --net none \
+  --pids 16 --init -- /bin/sh -c 'sleep 1; printf "attach-rm-ok\n"; exit 23')
+cleanup_ids+=("$attach_rm_id")
+set +e
+attach_rm_output=$("${zerun[@]}" attach "$attach_rm_id")
+attach_rm_status=$?
+set -e
+test "$attach_rm_status" -eq 23
+grep -Fxq attach-rm-ok <<<"$attach_rm_output"
+
 # Prune should remove retained exited records without touching live containers.
 prune_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
   --name ci-prune --init -- /bin/sh -c 'exit 0')
