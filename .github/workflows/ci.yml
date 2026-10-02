@@ -210,7 +210,6 @@ jobs:
             target/debug/zerun)
 
           id="$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
-            --init --name ci-rootless-exec -- /bin/sh -c 'sleep 30')"
             --init --name ci-detached -- /bin/sh -c \
             'printf "detached-smoke\n"; sleep 30')"
           test -n "$id"
