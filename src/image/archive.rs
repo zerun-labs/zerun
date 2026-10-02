@@ -21,12 +21,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const OCI_LAYOUT_VERSION: &str = "1.0.0";
 const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 const MANIFEST_MEDIA_TYPE: &str = "application/vnd.docker.distribution.manifest.v2+json";
 const REF_NAME_ANNOTATION: &str = "org.opencontainers.image.ref.name";
+
+static SAVE_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Serialize a set of locally tagged images to an OCI image layout tarball at
 /// `output`. Returns the records that were exported, in argument order.
@@ -45,17 +49,8 @@ pub fn save_images(
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .map_err(|e| crate::zerr!("create output directory {}: {e}", parent.display()))?;
-    let tmp_tar = parent.join(format!(
-        ".{}.tmp-{}",
-        output
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("image.tar"),
-        std::process::id()
-    ));
-    let layout = parent.join(format!(".zerun-save-layout-{}", std::process::id()));
-    let _ = fs::remove_file(&tmp_tar);
-    fsutil::remove_dir_all_quiet(&layout);
+    let (tmp_tar, layout, tar_file) = create_save_staging(parent, output)?;
+    let mut tmp_guard = Some(fsutil::TempFileGuard::new(tmp_tar.clone()));
 
     let result = (|| -> ZResult<Vec<ImageRecord>> {
         fs::create_dir_all(layout.join("blobs").join("sha256"))
@@ -104,12 +99,7 @@ pub fn save_images(
         )?;
         fsutil::atomic_write(&layout.join("index.json"), index.to_string().as_bytes())?;
 
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_tar)
-            .map_err(|e| crate::zerr!("create {}: {e}", tmp_tar.display()))?;
-        let mut builder = tar::Builder::new(file);
+        let mut builder = tar::Builder::new(tar_file);
         builder
             .append_dir_all("", &layout)
             .map_err(|e| crate::zerr!("write OCI archive: {e}"))?;
@@ -120,12 +110,63 @@ pub fn save_images(
             .map_err(|e| crate::zerr!("sync OCI archive: {e}"))?;
         fs::rename(&tmp_tar, output)
             .map_err(|e| crate::zerr!("install archive {}: {e}", output.display()))?;
+        if let Some(guard) = tmp_guard.take() {
+            let _installed_path = guard.persist();
+        }
         Ok(exported)
     })();
 
     fsutil::remove_dir_all_quiet(&layout);
-    let _ = fs::remove_file(&tmp_tar);
     result
+}
+
+/// Allocate private-to-this-call staging paths. The sequence separates
+/// concurrent calls in this process; create-new operations also handle stale
+/// paths left behind by a prior process that reused the same PID.
+fn create_save_staging(parent: &Path, output: &Path) -> ZResult<(PathBuf, PathBuf, File)> {
+    let output_name = output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image.tar");
+    loop {
+        let sequence = SAVE_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let suffix = format!("{}-{sequence}", std::process::id());
+        let tmp_tar = parent.join(format!(".{output_name}.tmp-{suffix}"));
+        let layout = parent.join(format!(".zerun-save-layout-{suffix}"));
+        let mut layout_builder = fs::DirBuilder::new();
+        layout_builder.mode(0o700);
+        match layout_builder.create(&layout) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(crate::zerr!(
+                    "create archive staging directory {}: {error}",
+                    layout.display()
+                ));
+            }
+        }
+
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_tar)
+        {
+            Ok(file) => return Ok((tmp_tar, layout, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                fs::remove_dir(&layout).map_err(|cleanup| {
+                    crate::zerr!(
+                        "remove unused archive staging directory {} after a name collision: {cleanup}",
+                        layout.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                let _ = fs::remove_dir(&layout);
+                return Err(crate::zerr!("create {}: {error}", tmp_tar.display()));
+            }
+        }
+    }
 }
 
 /// Recursively copy a manifest (and its config/layers, or child manifests for
@@ -428,6 +469,33 @@ mod tests {
     }
 
     #[test]
+    fn save_staging_allocations_are_unique_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = scratch("archive-staging");
+        let output = parent.join("image.tar");
+        let (first_tar, first_layout, first_file) = create_save_staging(&parent, &output).unwrap();
+        let (second_tar, second_layout, second_file) =
+            create_save_staging(&parent, &output).unwrap();
+        assert_ne!(first_tar, second_tar);
+        assert_ne!(first_layout, second_layout);
+        assert_eq!(
+            fs::metadata(&first_layout).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&first_tar).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop((first_file, second_file));
+        let _ = fs::remove_file(first_tar);
+        let _ = fs::remove_file(second_tar);
+        let _ = fs::remove_dir(first_layout);
+        let _ = fs::remove_dir(second_layout);
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
     fn save_then_load_roundtrips_an_oci_layout_archive() {
         let data_dir = scratch("archive-store");
         let store = ImageStore::at(&data_dir).unwrap();
@@ -481,6 +549,69 @@ mod tests {
 
         let _ = fs::remove_dir_all(&data_dir);
         let _ = fs::remove_dir_all(&source);
+    }
+
+    #[test]
+    fn concurrent_saves_use_independent_staging_and_produce_valid_archives() {
+        use std::sync::{Arc, Barrier};
+
+        let data_dir = scratch("archive-concurrent-store");
+        let store = ImageStore::at(&data_dir).unwrap();
+        let source = scratch("archive-concurrent-rootfs");
+        fs::create_dir_all(source.join("bin")).unwrap();
+        fs::write(source.join("bin/concurrent-marker"), b"parallel save").unwrap();
+        let record = commit_image(
+            &store,
+            &source,
+            "example/zerun-concurrent:v1",
+            CommitOptions::default(),
+        )
+        .unwrap();
+
+        let first_output = data_dir.join("first.tar");
+        let second_output = data_dir.join("second.tar");
+        let barrier = Arc::new(Barrier::new(3));
+        let first_store = ImageStore::at(&data_dir).unwrap();
+        let second_store = ImageStore::at(&data_dir).unwrap();
+        let first_barrier = Arc::clone(&barrier);
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            save_images(
+                &first_store,
+                &["example/zerun-concurrent:v1".to_string()],
+                &first_output,
+            )
+        });
+        let second_barrier = Arc::clone(&barrier);
+        let second = std::thread::spawn(move || {
+            second_barrier.wait();
+            save_images(
+                &second_store,
+                &["example/zerun-concurrent:v1".to_string()],
+                &second_output,
+            )
+        });
+        barrier.wait();
+
+        for (archive, exported) in [
+            (data_dir.join("first.tar"), first.join().unwrap().unwrap()),
+            (data_dir.join("second.tar"), second.join().unwrap().unwrap()),
+        ] {
+            assert_eq!(exported.len(), 1);
+            assert_eq!(exported[0].manifest, record.manifest);
+            let import_dir = scratch("archive-concurrent-import");
+            let import_store = ImageStore::at(&import_dir).unwrap();
+            let imported = load_archive(&import_store, &archive).unwrap();
+            assert_eq!(imported.len(), 1);
+            let loaded_rootfs = import_store.rootfs_path(&imported[0].config).unwrap();
+            assert_eq!(
+                fs::read(loaded_rootfs.join("bin/concurrent-marker")).unwrap(),
+                b"parallel save"
+            );
+            let _ = fs::remove_dir_all(import_dir);
+        }
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(data_dir);
     }
 
     #[test]
