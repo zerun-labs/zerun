@@ -188,6 +188,12 @@ stats_output=$("${zerun[@]}" stats "$m7_id")
 grep -q 'ci-m7' <<<"$stats_output"
 top_output=$("${zerun[@]}" top "$m7_id")
 grep -q 'CMD' <<<"$top_output"
+# A bounded event replay must emit the current record and terminate at the
+# requested wall-clock boundary instead of remaining an unbounded poll.
+events_until=$(date -u -d '1 second' '+%Y-%m-%dT%H:%M:%SZ')
+events_output=$("${zerun[@]}" events --filter "container=$m7_id" --until "$events_until")
+grep -q 'container create' <<<"$events_output"
+grep -q 'container start' <<<"$events_output"
 
 cp_source="/tmp/zerun-cp-source-${BASHPID}"
 cp_copy="/tmp/zerun-cp-copy-${BASHPID}"
