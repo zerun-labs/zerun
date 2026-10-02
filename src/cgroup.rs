@@ -175,59 +175,43 @@ impl CgroupV2 {
     }
 
     /// Write every provided limit onto this cgroup (shared by create and
-    /// `zerun update`).
+    /// `zerun update`). All user-provided values and required controllers are
+    /// validated before the first cgroup file is changed, so a malformed later
+    /// option cannot leave an earlier limit partially applied.
     pub fn apply_limits(&self, parent: &Path, limits: &ResourceLimits) -> ZResult<()> {
-        if let Some(mem) = &limits.memory {
-            let bytes = parse_size(mem)?;
-            // Docker's --memory-swap is a total memory+swap ceiling, while
-            // cgroup v2's memory.swap.max contains only the swap portion.
-            // Validate before writing memory.max so an invalid pair cannot
-            // leave a partially-applied resource configuration behind.
-            let swap_limit = match limits.memory_swap {
-                Some(swap) => swap_limit_for_total(bytes, swap)?,
-                None => bytes.to_string(),
-            };
-            self.write("memory.max", bytes.to_string())?;
-            self.write("memory.swap.max", swap_limit)?;
-        } else if let Some(swap) = limits.memory_swap {
-            if swap < 0 {
-                self.write("memory.swap.max", "max".to_string())?;
-            } else {
-                // `update --memory-swap` changes the total ceiling while the
-                // existing memory.max supplies the memory portion.
-                let memory = fs::read_to_string(self.path.join("memory.max"))
+        let current_memory =
+            if limits.memory.is_none() && limits.memory_swap.is_some_and(|swap| swap >= 0) {
+                let value = fs::read_to_string(self.path.join("memory.max"))
                     .map_err(|e| crate::zerr!("read current memory.max failed: {e}"))?;
-                let memory = memory.trim().parse::<u64>().map_err(|_| {
+                Some(value.trim().parse::<u64>().map_err(|_| {
                     crate::zerr!("finite memory-swap requires a finite current memory.max")
-                })?;
-                self.write("memory.swap.max", swap_limit_for_total(memory, swap)?)?;
-            }
+                })?)
+            } else {
+                None
+            };
+        let writes = plan_limit_writes(limits, current_memory)?;
+
+        if limits.memory.is_some()
+            || limits.memory_reservation.is_some()
+            || limits.memory_swap.is_some()
+            || limits.oom_group
+        {
+            require_controller(parent, "memory")?;
         }
-        if let Some(high) = &limits.memory_reservation {
-            let bytes = parse_size(high)?;
-            self.write("memory.high", bytes.to_string())?;
+        if limits.cpus.is_some() {
+            require_controller(parent, "cpu")?;
         }
-        if let Some(cpus) = limits.cpus {
-            let quota = cpu_quota(cpus)?;
-            self.write("cpu.max", format!("{quota} 100000"))?;
+        if limits.pids.is_some() {
+            require_controller(parent, "pids")?;
         }
-        if let Some(cpuset) = &limits.cpuset_cpus {
+        if limits.cpuset_cpus.is_some() || limits.cpuset_mems.is_some() {
             require_controller(parent, "cpuset")?;
-            self.write("cpuset.cpus", cpuset.clone())?;
-        }
-        if let Some(mems) = &limits.cpuset_mems {
-            require_controller(parent, "cpuset")?;
-            self.write("cpuset.mems", mems.clone())?;
-        }
-        if let Some(pids) = limits.pids {
-            self.write("pids.max", pids.to_string())?;
         }
         if !limits.io.is_empty() {
             require_controller(parent, "io")?;
-            self.write("io.max", io_max_value(&limits.io))?;
         }
-        if limits.oom_group {
-            self.write("memory.oom.group", "1".to_string())?;
+        for (file, value) in writes {
+            self.write(file, value)?;
         }
         Ok(())
     }
@@ -320,6 +304,59 @@ fn read_frozen(path: &Path) -> Option<bool> {
         let (key, value) = line.split_once(' ')?;
         (key == "frozen").then(|| value.trim() == "1")
     })
+}
+
+/// Validate and translate all requested limits before performing cgroupfs
+/// writes. This prevents malformed options from producing partial updates.
+fn plan_limit_writes(
+    limits: &ResourceLimits,
+    current_memory: Option<u64>,
+) -> ZResult<Vec<(&'static str, String)>> {
+    let mut writes = Vec::new();
+    if let Some(mem) = &limits.memory {
+        let bytes = parse_size(mem)?;
+        let swap_limit = match limits.memory_swap {
+            Some(swap) => swap_limit_for_total(bytes, swap)?,
+            None => bytes.to_string(),
+        };
+        writes.push(("memory.max", bytes.to_string()));
+        writes.push(("memory.swap.max", swap_limit));
+    } else if let Some(swap) = limits.memory_swap {
+        let swap_limit = if swap < 0 {
+            "max".to_string()
+        } else {
+            let memory = current_memory.ok_or_else(|| {
+                crate::zerr!("finite memory-swap requires a finite current memory.max")
+            })?;
+            swap_limit_for_total(memory, swap)?
+        };
+        writes.push(("memory.swap.max", swap_limit));
+    }
+    if let Some(high) = &limits.memory_reservation {
+        writes.push(("memory.high", parse_size(high)?.to_string()));
+    }
+    if let Some(cpus) = limits.cpus {
+        writes.push(("cpu.max", format!("{} 100000", cpu_quota(cpus)?)));
+    }
+    if let Some(cpuset) = &limits.cpuset_cpus {
+        writes.push(("cpuset.cpus", parse_cpuset(cpuset)?));
+    }
+    if let Some(mems) = &limits.cpuset_mems {
+        writes.push(("cpuset.mems", parse_cpuset(mems)?));
+    }
+    if let Some(pids) = limits.pids {
+        if pids <= 0 {
+            return Err(crate::zerr!("pids limit must be positive"));
+        }
+        writes.push(("pids.max", pids.to_string()));
+    }
+    if !limits.io.is_empty() {
+        writes.push(("io.max", io_max_value(&limits.io)));
+    }
+    if limits.oom_group {
+        writes.push(("memory.oom.group", "1".to_string()));
+    }
+    Ok(writes)
 }
 
 /// Turn Docker-style device limits into one compact `io.max` value.
@@ -785,6 +822,59 @@ mod tests {
         }
         assert!(leaf.is_dir());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invalid_later_limit_does_not_partially_apply_earlier_values() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-cgroup-preflight-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let leaf = root.join("leaf");
+        let parent = root.join("parent");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(leaf.join("memory.max"), b"max").unwrap();
+
+        let cgroup = CgroupV2::open(&leaf).unwrap();
+        let limits = ResourceLimits {
+            memory: Some("32M".to_string()),
+            memory_reservation: Some("NaN".to_string()),
+            ..ResourceLimits::default()
+        };
+        assert!(cgroup.apply_limits(&parent, &limits).is_err());
+        assert_eq!(std::fs::read(leaf.join("memory.max")).unwrap(), b"max");
+        assert!(!leaf.join("memory.swap.max").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_controller_does_not_partially_apply_other_limits() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-cgroup-controller-preflight-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let leaf = root.join("leaf");
+        let parent = root.join("parent");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(parent.join("cgroup.controllers"), b"memory cpu pids io").unwrap();
+        std::fs::write(leaf.join("memory.max"), b"max").unwrap();
+
+        let cgroup = CgroupV2::open(&leaf).unwrap();
+        let limits = ResourceLimits {
+            memory: Some("32M".to_string()),
+            cpuset_cpus: Some("0".to_string()),
+            ..ResourceLimits::default()
+        };
+        assert!(cgroup.apply_limits(&parent, &limits).is_err());
+        assert_eq!(std::fs::read(leaf.join("memory.max")).unwrap(), b"max");
+        assert!(!leaf.join("memory.swap.max").exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
