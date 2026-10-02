@@ -276,6 +276,8 @@ container_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net bridge
   -p "$port:8080" --init -- /bin/httpd -f -p 8080 -h /srv)
 cleanup_ids+=("$container_id")
 [[ "$container_id" =~ ^[0-9a-f]{12}$ ]]
+port_output=$("${zerun[@]}" port "$container_id")
+grep -Eq "^8080/tcp -> .+:$port$" <<<"$port_output"
 
 for attempt in $(seq 1 50); do
   if curl --fail --silent --show-error "http://127.0.0.1:$port/" | \
