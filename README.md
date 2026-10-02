@@ -103,6 +103,8 @@ Homebrew on Linux.
 
 ## Build
 
+Building from source requires Rust 1.89 or newer.
+
 ```bash
 cargo build --release
 ./target/release/zerun doctor

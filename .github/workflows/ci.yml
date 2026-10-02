@@ -56,6 +56,19 @@ jobs:
           find . -type f -name '*.sh' -not -path './target/*' -print0 | \
             xargs -0 -r shellcheck --severity=warning
 
+  msrv:
+    name: minimum supported Rust (1.89)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.89.0
+        uses: dtolnay/rust-toolchain@1.89.0
+
+      - name: Run all tests with the declared MSRV
+        run: cargo test --locked --all-targets -- --test-threads=1
+
   clippy:
     name: clippy
     runs-on: ubuntu-24.04
