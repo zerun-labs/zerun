@@ -18,9 +18,10 @@ use crate::image::name::Reference;
 use crate::image::pull::materialize_local_rootfs;
 use crate::image::store::{digest_hex, ImageRecord, ImageStore};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -181,19 +182,14 @@ fn copy_manifest_tree(
     if !copied.insert(digest.to_string()) {
         return Ok(());
     }
-    let bytes = store
-        .read_blob(digest)?
-        .ok_or_else(|| crate::zerr!("blob {digest} is missing from the image store"))?;
+    let bytes = store_blob(store, digest)?;
     copy_blob_to_layout(layout, digest, &bytes)?;
     match manifest::classify(&bytes)? {
         ImageDoc::Manifest(m) => {
-            copy_blob_to_layout(
-                layout,
-                &m.config.digest,
-                &store_blob(store, &m.config.digest)?,
-            )?;
-            for layer in &m.layers {
-                copy_blob_to_layout(layout, &layer.digest, &store_blob(store, &layer.digest)?)?;
+            for descriptor in std::iter::once(&m.config).chain(m.layers.iter()) {
+                if copied.insert(descriptor.digest.clone()) {
+                    copy_store_blob_to_layout(store, layout, &descriptor.digest)?;
+                }
             }
         }
         ImageDoc::Index(index) => {
@@ -203,6 +199,61 @@ fn copy_manifest_tree(
         }
     }
     Ok(())
+}
+
+/// Copy a content-addressed blob without buffering a potentially large layer
+/// in memory. Hash the same stream written to the private layout so an
+/// out-of-band mutation cannot silently produce a mismatched archive blob.
+fn copy_store_blob_to_layout(store: &ImageStore, layout: &Path, digest: &str) -> ZResult<()> {
+    let expected = digest_hex(digest)?;
+    let source_path = store.blob_path(digest)?;
+    let mut source = File::open(&source_path)
+        .map_err(|e| crate::zerr!("open blob {digest} at {}: {e}", source_path.display()))?;
+    if !source
+        .metadata()
+        .map_err(|e| crate::zerr!("stat blob {digest}: {e}"))?
+        .file_type()
+        .is_file()
+    {
+        return Err(crate::zerr!("blob {digest} is not a regular file"));
+    }
+
+    let destination = layout.join("blobs").join("sha256").join(&expected);
+    let result = (|| -> ZResult<()> {
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+            .map_err(|e| crate::zerr!("create archive blob {}: {e}", destination.display()))?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = source
+                .read(&mut buffer)
+                .map_err(|e| crate::zerr!("read blob {digest}: {e}"))?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+            output
+                .write_all(&buffer[..count])
+                .map_err(|e| crate::zerr!("write archive blob {digest}: {e}"))?;
+        }
+        output
+            .sync_all()
+            .map_err(|e| crate::zerr!("sync archive blob {digest}: {e}"))?;
+        let actual = format!("{:x}", hasher.finalize());
+        if actual != expected {
+            return Err(crate::zerr!(
+                "blob digest mismatch while saving: expected sha256:{expected}, got sha256:{actual}"
+            ));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&destination);
+    }
+    result
 }
 
 fn store_blob(store: &ImageStore, digest: &str) -> ZResult<Vec<u8>> {
@@ -467,6 +518,29 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn streaming_blob_copy_rejects_corruption_and_removes_partial_output() {
+        let data_dir = scratch("archive-corrupt-blob-store");
+        let store = ImageStore::at(&data_dir).unwrap();
+        let original = b"expected layer payload";
+        let digest = format!("sha256:{}", crate::image::store::sha256_hex(original));
+        store.write_blob(&digest, original).unwrap();
+        fs::write(store.blob_path(&digest).unwrap(), b"corrupted payload").unwrap();
+
+        let layout = scratch("archive-corrupt-blob-layout");
+        fs::create_dir_all(layout.join("blobs/sha256")).unwrap();
+        let err = copy_store_blob_to_layout(&store, &layout, &digest).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("blob digest mismatch while saving"));
+        assert!(!layout
+            .join("blobs/sha256")
+            .join(digest_hex(&digest).unwrap())
+            .exists());
+        let _ = fs::remove_dir_all(data_dir);
+        let _ = fs::remove_dir_all(layout);
     }
 
     #[test]
