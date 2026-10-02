@@ -326,11 +326,32 @@ jobs:
             ZERUN_DATA_ROOT="$data"
             ZERUN_RUNTIME_ROOT="$runtime"
             "$binary")
-          id="$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
-            --init --name ci-rootless-exec -- /bin/sh -c 'sleep 30')"
-          exec_output="$("${zerun[@]}" exec "$id" /bin/sh -c \
-            'printf "rootless-exec-ok uid=%s\n" "$(/bin/busybox id -u)"')"
-          grep -Fx "rootless-exec-ok uid=0" <<<"$exec_output"
+          if ! id="$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
+            --init --name ci-rootless-exec -- /bin/sh -c 'sleep 30' 2>"$base/rootless-run.err")"; then
+            while IFS= read -r line; do
+              line=${line//\%/%25}
+              line=${line//$'\r'/%0D}
+              line=${line//$'\n'/%0A}
+              echo "::error title=rootless detached run failed::$line"
+            done <"$base/rootless-run.err"
+            exit 93
+          fi
+          if ! exec_output="$("${zerun[@]}" exec "$id" /bin/sh -c \
+            'printf "rootless-exec-ok uid=%s\n" "$(/bin/busybox id -u)"' 2>"$base/rootless-exec.err")"; then
+            while IFS= read -r line; do
+              line=${line//\%/%25}
+              line=${line//$'\r'/%0D}
+              line=${line//$'\n'/%0A}
+              echo "::error title=rootless exec failed::$line"
+            done <"$base/rootless-exec.err"
+            "${zerun[@]}" kill --signal KILL "$id" >/dev/null 2>&1 || true
+            exit 94
+          fi
+          if ! grep -Fx "rootless-exec-ok uid=0" <<<"$exec_output"; then
+            echo "::error title=rootless exec output::$exec_output"
+            "${zerun[@]}" kill --signal KILL "$id" >/dev/null 2>&1 || true
+            exit 95
+          fi
           "${zerun[@]}" kill --signal TERM "$id"
           test "$("${zerun[@]}" wait "$id")" = 143
           "${zerun[@]}" rm "$id"
