@@ -80,6 +80,8 @@ pub struct RunSpec {
     pub ports: Vec<crate::network::PublishedPort>,
     /// Host bind mounts (simple file/directory volumes).
     pub volumes: Vec<BindMount>,
+    /// Operator-provided names resolved into the container `/etc/hosts`.
+    pub hosts: Vec<crate::network::HostEntry>,
     /// Bridge IPv4 assigned by the parent from the file IPAM (set before
     /// clone; consumed by both host-side NAT and the child's eth0 config).
     pub bridge_ip: Option<std::net::Ipv4Addr>,
@@ -602,11 +604,26 @@ fn write_etc_hosts(spec: &RunSpec) {
         return;
     }
     let host = spec.hostname.as_deref().unwrap_or(&spec.id);
-    let self_entry = match spec.bridge_ip {
-        Some(ip) => format!("{ip}\t{host}\t{}", spec.id),
-        None => format!("127.0.0.1\t{host}"),
+    let content = render_etc_hosts(host, &spec.id, spec.bridge_ip, &spec.hosts);
+    let etc = std::path::Path::new("/etc");
+    if let Err(e) =
+        std::fs::create_dir_all(etc).and_then(|_| std::fs::write(etc.join("hosts"), content))
+    {
+        eprintln!("zerun: warning: /etc/hosts injection: {e}");
+    }
+}
+
+fn render_etc_hosts(
+    hostname: &str,
+    id: &str,
+    bridge_ip: Option<std::net::Ipv4Addr>,
+    aliases: &[crate::network::HostEntry],
+) -> String {
+    let self_entry = match bridge_ip {
+        Some(ip) => format!("{ip}\t{hostname}\t{id}"),
+        None => format!("127.0.0.1\t{hostname}"),
     };
-    let content = format!(
+    let mut content = format!(
         "127.0.0.1\tlocalhost\n\
          ::1\tlocalhost ip6-localhost ip6-loopback\n\
          fe00::0\tip6-localnet\n\
@@ -615,12 +632,10 @@ fn write_etc_hosts(spec: &RunSpec) {
          ff02::2\tip6-allrouters\n\
          \n{self_entry}\n"
     );
-    let etc = std::path::Path::new("/etc");
-    if let Err(e) =
-        std::fs::create_dir_all(etc).and_then(|_| std::fs::write(etc.join("hosts"), content))
-    {
-        eprintln!("zerun: warning: /etc/hosts injection: {e}");
+    for alias in aliases {
+        content.push_str(&format!("{}\t{}\n", alias.ip, alias.name));
     }
+    content
 }
 
 /// Unprivileged rootless: map uid/gid 0 inside the new user namespace to the host
@@ -739,4 +754,36 @@ fn wait_pid(pid: i32) -> ZResult<i32> {
     let (_, status) =
         syscalls::wait_pid(pid, 0)?.ok_or_else(|| crate::zerr!("waitpid returned no child"))?;
     Ok(syscalls::wait_status_code(status).unwrap_or(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::HostEntry;
+    use std::net::IpAddr;
+
+    #[test]
+    fn generated_hosts_file_contains_identity_and_operator_aliases() {
+        let content = render_etc_hosts(
+            "web",
+            "0123abcd",
+            Some("10.88.0.42".parse().unwrap()),
+            &[
+                HostEntry {
+                    name: "db.internal".to_string(),
+                    ip: "192.0.2.10".parse::<IpAddr>().unwrap(),
+                },
+                HostEntry {
+                    name: "host.zerun.internal".to_string(),
+                    ip: "10.88.0.1".parse::<IpAddr>().unwrap(),
+                },
+            ],
+        );
+        assert!(content.contains("10.88.0.42\tweb\t0123abcd\n"));
+        assert!(content.contains("192.0.2.10\tdb.internal\n"));
+        assert!(content.contains("10.88.0.1\thost.zerun.internal\n"));
+
+        let loopback = render_etc_hosts("box", "0123abcd", None, &[]);
+        assert!(loopback.contains("127.0.0.1\tbox\n"));
+    }
 }

@@ -30,7 +30,7 @@ pub fn generate(a: &RunArgs, out: &mut dyn Write) -> Result<(), String> {
 
 /// Generate unit text.  `binary` is injected separately for testability.
 pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, String> {
-    validate(a)?;
+    validate(a, rootful)?;
 
     let container_name = a
         .name
@@ -178,6 +178,10 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--dns".into());
         run_args.push(v.clone());
     }
+    for v in &a.add_hosts {
+        run_args.push("--add-host".into());
+        run_args.push(v.render());
+    }
     for (k, v) in &a.labels {
         run_args.push("--label".into());
         run_args.push(format!("{k}={v}"));
@@ -265,7 +269,7 @@ pub fn print_usage() {
     );
 }
 
-fn validate(a: &RunArgs) -> Result<(), String> {
+fn validate(a: &RunArgs, rootful: bool) -> Result<(), String> {
     if a.detach {
         return Err(
             "-d/--detach cannot be used with generate-service; systemd runs the foreground process"
@@ -294,6 +298,20 @@ fn validate(a: &RunArgs) -> Result<(), String> {
     if !a.dns.is_empty() && a.net != NetMode::Bridge {
         return Err("--dns requires --net bridge".into());
     }
+    let effective_net = if a.net_specified {
+        a.net
+    } else if rootful {
+        NetMode::Bridge
+    } else {
+        NetMode::None
+    };
+    if !a.add_hosts.is_empty() && effective_net == NetMode::Host {
+        return Err("--add-host cannot be used with --net host".into());
+    }
+    crate::network::resolve_host_aliases(
+        &a.add_hosts,
+        (effective_net == NetMode::Bridge).then_some(crate::network::GATEWAY_IP),
+    )?;
     if a.rootfs.is_some() && !a.env.is_empty() {
         return Err("-e/--env requires image mode (drop --rootfs)".into());
     }
@@ -487,6 +505,40 @@ mod tests {
         generate(&a, &mut out).unwrap();
         let unit = String::from_utf8(out).unwrap();
         assert!(unit.contains("--label tier=prod"));
+    }
+
+    #[test]
+    fn renders_and_validates_custom_host_aliases() {
+        let a = args(&[
+            "--net",
+            "bridge",
+            "--add-host",
+            "db.internal:192.0.2.10",
+            "--add-host",
+            "host.zerun.internal:host-gateway",
+            "alpine",
+        ]);
+        let unit = render(Path::new("/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains(" --add-host db.internal:192.0.2.10 "));
+        assert!(unit.contains(" --add-host host.zerun.internal:host-gateway "));
+
+        let host_net = args(&[
+            "--net",
+            "host",
+            "--add-host",
+            "db.internal:192.0.2.10",
+            "alpine",
+        ]);
+        assert!(render(Path::new("/bin/zerun"), &host_net, true).is_err());
+
+        let no_gateway = args(&[
+            "--net",
+            "none",
+            "--add-host",
+            "host.zerun.internal:host-gateway",
+            "alpine",
+        ]);
+        assert!(render(Path::new("/bin/zerun"), &no_gateway, true).is_err());
     }
 
     #[test]

@@ -36,7 +36,8 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   (10.88.0.1/24) and a per-container veth pair with container-side `eth0` and a default
   route (verified: host ↔ container reachable). Per-container egress NAT via nf_tables
   (pure netlink, shared `zerun-nat` subnet rule), `-p [ADDR:]HOST[:CONTAINER][/tcp|/udp]` publishing through a built-in userland
-  proxy (Docker's docker-proxy in-binary), and `--dns` / host resolv.conf inheritance.
+  proxy (Docker's docker-proxy in-binary), `--dns` / host resolv.conf inheritance, and
+  repeatable `--add-host NAME:IP` aliases (including `host-gateway`).
 - **M5 — detached lifecycle (done)**: `run -d` forks a tiny per-container reaper that
   redirects stdio to `console.log` and persists state to disk;
   `ps [-a] [-q] [--format table|json] [--filter KEY=VALUE]`, `start`, `pause`, `unpause`, `stop`, `restart`,
@@ -193,6 +194,7 @@ Run options (current subset):
 -p, --publish [ADDR:]HOST[:CONTAINER][/proto]
                      publish a TCP (default) or UDP port; ADDR supports IPv4 and
                      bracketed IPv6 bind addresses (for example 127.0.0.1 or [::1])
+--add-host HOST:IP  add an /etc/hosts entry (repeatable; IP or host-gateway)
 --init               run built-in mini-init (reap orphans, forward signals)
 --seccomp default|unconfined   seccomp policy (default: deny-by-default allowlist)
 --cap-add CAP|ALL              add capabilities to the default set (repeatable/comma-separated)
@@ -322,7 +324,9 @@ Detached containers keep no daemon: the per-container reaper is a tiny process t
 disappears when the container exits. If the host crashes (or the reaper is killed), the
 next `ps`/`rm` reconciles the stale record and reclaims host-side resources.
 `-p` can bind a specific host address (`127.0.0.1:18080:80` or `[::1]:18080:80`);
-`zerun port` and `ps` display the selected bind address.
+`zerun port` and `ps` display the selected bind address. Repeatable
+`--add-host NAME:IP` entries are written to the container `/etc/hosts`; the special
+`host-gateway` value resolves to the bridge gateway (`10.88.0.1`) in bridge mode.
 `logs` hides capture-time timestamps by default; `-t/--timestamps` shows them.
 `--since`/`--until` accept RFC3339 times, UNIX seconds, or Go-style durations such as
 `10m` (relative to now) and select inclusive capture-time bounds. `--tail N` narrows the

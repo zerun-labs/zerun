@@ -175,6 +175,8 @@ struct RunArgs {
     ports: Vec<network::PublishedPort>,
     volumes: Vec<mounts::BindMount>,
     dns: Vec<String>,
+    /// `--add-host NAME:ADDRESS` entries written to the container `/etc/hosts`.
+    add_hosts: Vec<network::HostAlias>,
     labels: BTreeMap<String, String>,
     argv: Vec<String>,
     /// `-i/--interactive`: keep stdin attached (foreground runs).
@@ -401,6 +403,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 v.parse::<std::net::IpAddr>()
                     .map_err(|_| format!("invalid --dns address '{v}'"))?;
                 a.dns.push(v);
+            }
+            "--add-host" => {
+                let v = next_value(args, &mut i, "--add-host")?;
+                a.add_hosts.push(network::HostAlias::parse(&v)?);
             }
             "--label" => {
                 let (k, v) = parse_label(&next_value(args, &mut i, "--label")?)?;
@@ -715,6 +721,21 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
             "zerun: warning: log rotation options only apply to detached containers; ignoring"
         );
     }
+    let host_aliases = if !a.add_hosts.is_empty() && a.net == NetMode::Host {
+        eprintln!("zerun run: --add-host cannot be used with --net host");
+        return 2;
+    } else {
+        match network::resolve_host_aliases(
+            &a.add_hosts,
+            (a.net == NetMode::Bridge).then_some(network::GATEWAY_IP),
+        ) {
+            Ok(entries) => entries,
+            Err(e) => {
+                eprintln!("zerun run: {e}");
+                return 2;
+            }
+        }
+    };
     let capabilities = match security::CapabilitySet::resolve(&a.cap_add, &a.cap_drop) {
         Ok(capabilities) => capabilities,
         Err(e) => {
@@ -1042,6 +1063,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         user,
         ports: a.ports,
         volumes: a.volumes,
+        hosts: host_aliases,
         readonly: a.readonly,
         tmpfs: a.tmpfs,
         // Allocated from the file IPAM inside run_container (bridge mode).
@@ -1734,6 +1756,9 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     }
     for v in &a.dns {
         args.extend(["--dns".to_string(), v.clone()]);
+    }
+    for v in &a.add_hosts {
+        args.extend(["--add-host".to_string(), v.render()]);
     }
     for (k, v) in &a.labels {
         args.extend(["--label".to_string(), format!("{k}={v}")]);
@@ -6150,6 +6175,7 @@ RUN OPTIONS:\n  \
   -v, --volume HOST|NAME:CONTAINER[:ro]
                                         bind-mount a host path or managed named volume\n  \
   --dns IP            container DNS server (repeatable; bridge mode; defaults to the host's)\n  \
+  --add-host HOST:IP  add an /etc/hosts entry (repeatable; IP or host-gateway)\n  \
   --init              run the built-in mini-init (reap orphans + forward signals)\n  \
   --seccomp default|unconfined\n  \
   --cap-add CAP|ALL    add capability to the default set (repeatable/comma-separated)\n  \
@@ -6799,6 +6825,37 @@ mod tests {
         assert_eq!(a.labels.get("only").map(String::as_str), Some(""));
         assert!(parse_label("novalue").is_err());
         assert!(parse_label("=value").is_err());
+    }
+
+    #[test]
+    fn parses_and_persists_custom_host_aliases() {
+        let args: Vec<_> = [
+            "--net",
+            "bridge",
+            "--add-host",
+            "db.internal:192.0.2.10",
+            "--add-host",
+            "host.zerun.internal:host-gateway",
+            "alpine",
+            "true",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_run_args(&args).expect("valid host aliases");
+        assert_eq!(a.add_hosts.len(), 2);
+        let entries =
+            network::resolve_host_aliases(&a.add_hosts, Some(network::GATEWAY_IP)).unwrap();
+        assert_eq!(entries[1].ip, std::net::IpAddr::V4(network::GATEWAY_IP));
+        let launch = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+        assert!(launch
+            .windows(2)
+            .any(|w| w == ["--add-host", "db.internal:192.0.2.10"]));
+        assert!(launch
+            .windows(2)
+            .any(|w| w == ["--add-host", "host.zerun.internal:host-gateway"]));
+
+        assert!(parse_run_args(&["--add-host".to_string(), "host:not-an-ip".to_string()]).is_err());
     }
 
     #[test]

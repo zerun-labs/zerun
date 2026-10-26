@@ -81,6 +81,113 @@ pub const BRIDGE_NAME: &str = "zerun0";
 pub const GATEWAY_IP: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 1);
 pub const SUBNET_PREFIX: u8 = 24;
 
+/// Address supplied by `--add-host NAME:ADDRESS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostAliasAddress {
+    Ip(IpAddr),
+    /// Docker-compatible magic value resolved to the bridge gateway.
+    HostGateway,
+}
+
+/// One operator-provided `/etc/hosts` entry, kept in parsed form so launch
+/// metadata and generated services can reproduce the original flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostAlias {
+    name: String,
+    address: HostAliasAddress,
+}
+
+/// A host alias with `host-gateway` resolved to a concrete address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostEntry {
+    pub name: String,
+    pub ip: IpAddr,
+}
+
+impl HostAlias {
+    /// Parse Docker's `--add-host NAME:ADDRESS` form. IPv6 addresses are
+    /// accepted without brackets because the separator is the first colon.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let (name, address) = value
+            .split_once(':')
+            .ok_or_else(|| format!("--add-host '{value}' must be NAME:ADDRESS"))?;
+        if !valid_host_alias_name(name) {
+            return Err(format!(
+                "--add-host '{value}' has an invalid host name (use ASCII letters, digits, '.', '_' or '-')"
+            ));
+        }
+        let address = if address == "host-gateway" {
+            HostAliasAddress::HostGateway
+        } else {
+            HostAliasAddress::Ip(
+                address
+                    .parse()
+                    .map_err(|_| format!("--add-host '{value}' has an invalid IP address"))?,
+            )
+        };
+        Ok(Self {
+            name: name.to_string(),
+            address,
+        })
+    }
+
+    /// Canonical flag value retained in detached state and service units.
+    pub fn render(&self) -> String {
+        let address = match self.address {
+            HostAliasAddress::Ip(ip) => ip.to_string(),
+            HostAliasAddress::HostGateway => "host-gateway".to_string(),
+        };
+        format!("{}:{address}", self.name)
+    }
+
+    /// Resolve the alias for a concrete network mode. `gateway` is `Some` only
+    /// for bridge mode; literal addresses work in every network mode.
+    pub fn resolve(&self, gateway: Option<Ipv4Addr>) -> Result<HostEntry, String> {
+        let ip = match self.address {
+            HostAliasAddress::Ip(ip) => ip,
+            HostAliasAddress::HostGateway => gateway.map(IpAddr::V4).ok_or_else(|| {
+                format!(
+                    "--add-host {}:host-gateway requires --net bridge",
+                    self.name
+                )
+            })?,
+        };
+        Ok(HostEntry {
+            name: self.name.clone(),
+            ip,
+        })
+    }
+}
+
+/// Resolve every `--add-host` alias before cloning the container.
+pub fn resolve_host_aliases(
+    aliases: &[HostAlias],
+    gateway: Option<Ipv4Addr>,
+) -> Result<Vec<HostEntry>, String> {
+    aliases.iter().map(|alias| alias.resolve(gateway)).collect()
+}
+
+fn valid_host_alias_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 253 {
+        return false;
+    }
+    name.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            && label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+    })
+}
+
 /// What the parent created for one container; torn down after the run exits.
 pub struct HostNet {
     veth_name: String,
@@ -758,6 +865,44 @@ fn enable_ip_forward() -> ZResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_aliases_parse_resolve_and_reject_unsafe_names() {
+        let v4 = HostAlias::parse("host.example:192.0.2.7").unwrap();
+        assert_eq!(v4.render(), "host.example:192.0.2.7");
+        assert_eq!(
+            v4.resolve(None).unwrap(),
+            HostEntry {
+                name: "host.example".to_string(),
+                ip: "192.0.2.7".parse().unwrap(),
+            }
+        );
+
+        let v6 = HostAlias::parse("v6.example:2001:db8::7").unwrap();
+        assert_eq!(v6.render(), "v6.example:2001:db8::7");
+        assert_eq!(
+            v6.resolve(None).unwrap().ip,
+            "2001:db8::7".parse::<IpAddr>().unwrap()
+        );
+
+        let gateway = HostAlias::parse("host.zerun.internal:host-gateway").unwrap();
+        assert_eq!(
+            gateway.resolve(Some(GATEWAY_IP)).unwrap().ip,
+            IpAddr::V4(GATEWAY_IP)
+        );
+        assert!(gateway.resolve(None).is_err());
+
+        for invalid in [
+            "missing-address",
+            "bad name:192.0.2.1",
+            "-leading:192.0.2.1",
+            "trailing-:192.0.2.1",
+            "host:not-an-ip",
+            "host:",
+        ] {
+            assert!(HostAlias::parse(invalid).is_err(), "{invalid} was accepted");
+        }
+    }
 
     #[test]
     fn tcp_proxy_connection_slots_enforce_limit_and_release() {
