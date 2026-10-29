@@ -550,8 +550,9 @@ fn child_stage(
         make_root_readonly(identity.rootless)?;
     }
 
-    // 3. Security hardening: no_new_privs -> capability drop -> seccomp profile.
-    security::harden(spec.seccomp, &spec.capabilities)?;
+    // 3. Security hardening: no_new_privs -> supplementary groups -> capability
+    //    drop -> seccomp profile.
+    security::harden(spec.seccomp, &spec.capabilities, identity.rootless)?;
 
     // 3a. Drop to the requested container user while CAP_SETUID/SETGID are still
     // effective (the capability set was trimmed but these two are retained).

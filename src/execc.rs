@@ -295,7 +295,7 @@ fn worker(
         None => crate::security::CapabilitySet::default(),
     };
     let seccomp = state.seccomp.unwrap_or_default();
-    if let Err(e) = crate::security::harden(seccomp, &capabilities) {
+    if let Err(e) = crate::security::harden(seccomp, &capabilities, state.rootless) {
         eprintln!("zerun exec: {e}");
         return 1;
     }

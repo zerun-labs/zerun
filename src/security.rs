@@ -262,12 +262,23 @@ fn ensure_supported(cap: i32, last: i32) -> ZResult<()> {
 }
 
 /// Security sequence before the workload execs. Order matters: NO_NEW_PRIVS first,
-/// then capabilities, then seccomp (loading a seccomp filter without CAP_SYS_ADMIN
-/// requires NO_NEW_PRIVS to be set first).
-pub fn harden(seccomp_mode: SeccompMode, capabilities: &CapabilitySet) -> ZResult<()> {
+/// then inherited supplementary groups, capabilities, and seccomp. Clearing groups
+/// before the capability drop keeps `--cap-drop SETGID` usable for containers that
+/// remain uid/gid 0, while still preventing host group memberships from granting
+/// access through group-owned bind mounts. Rootless user namespaces have
+/// `setgroups=deny` and only map gid 0, so they cannot and need not perform it.
+pub fn harden(
+    seccomp_mode: SeccompMode,
+    capabilities: &CapabilitySet,
+    rootless: bool,
+) -> ZResult<()> {
     trace::mark("child:security:begin");
     no_new_privs()?;
     trace::mark("child:nnp:done");
+    if !rootless {
+        syscalls::clear_supplementary_groups()?;
+    }
+    trace::mark("child:groups:done");
     apply_capabilities(capabilities)?;
     trace::mark("child:caps:done");
     seccomp::apply(seccomp_mode)?;
@@ -284,24 +295,38 @@ pub fn harden(seccomp_mode: SeccompMode, capabilities: &CapabilitySet) -> ZResul
 /// only uid/gid 0 to the host user, so any other requested identity is a clear
 /// setup error.
 pub fn switch_user(spec: Option<&str>, rootless: bool) -> ZResult<()> {
-    let Some(raw) = spec else { return Ok(()) };
-    let resolved = resolve_user_spec(raw)?;
-    if rootless && (resolved.uid != 0 || resolved.gid != 0) {
-        return Err(crate::zerr!(
-            "rootless containers map only uid/gid 0; cannot switch to '{raw}'              (use --user 0 or run rootful)"
-        ));
-    }
+    let Some(resolved) = plan_user_switch(spec, rootless)? else {
+        return Ok(());
+    };
     if resolved.uid == 0 && resolved.gid == 0 {
         return Ok(());
     }
-    // Clear supplementary groups, then set gid before uid (the classic order:
-    // after setgid, the effective uid is still root, so setuid is still allowed).
-    syscalls::clear_supplementary_groups()?;
+    // Set gid before uid (the classic order: after setgid, the effective uid is
+    // still root, so setuid is still allowed).
     syscalls::set_gid(resolved.gid)
         .map_err(|e| crate::zerr!("setgid({}) failed: {e}", resolved.gid))?;
     syscalls::set_uid(resolved.uid)
         .map_err(|e| crate::zerr!("setuid({}) failed: {e}", resolved.uid))?;
     Ok(())
+}
+
+/// Resolve the requested identity and decide whether the rootless pre-existing
+/// uid/gid 0 mapping needs no further switch.
+fn plan_user_switch(spec: Option<&str>, rootless: bool) -> ZResult<Option<ResolvedUser>> {
+    let resolved = match spec {
+        Some(raw) => resolve_user_spec(raw)?,
+        None => ResolvedUser { uid: 0, gid: 0 },
+    };
+    if rootless {
+        if resolved.uid != 0 || resolved.gid != 0 {
+            return Err(crate::zerr!(
+                "rootless containers map only uid/gid 0; cannot switch to '{}' (use --user 0 or run rootful)",
+                spec.unwrap_or("0")
+            ));
+        }
+        return Ok(None);
+    }
+    Ok(Some(resolved))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,6 +486,21 @@ mod user_tests {
         assert!(resolve_user_spec("1000:").is_err());
         assert!(resolve_user_spec("1000:1000:extra").is_err());
         assert!(resolve_user_spec("-1").is_err());
+    }
+
+    #[test]
+    fn rootful_and_rootless_root_planning_is_explicit() {
+        assert_eq!(
+            plan_user_switch(None, false).unwrap(),
+            Some(ResolvedUser { uid: 0, gid: 0 })
+        );
+        assert_eq!(
+            plan_user_switch(Some("0:0"), false).unwrap(),
+            Some(ResolvedUser { uid: 0, gid: 0 })
+        );
+        assert_eq!(plan_user_switch(None, true).unwrap(), None);
+        assert_eq!(plan_user_switch(Some("root"), true).unwrap(), None);
+        assert!(plan_user_switch(Some("1000:1000"), true).is_err());
     }
 }
 

@@ -86,6 +86,24 @@ printf '%s\n' "$foreground_output"
 test "$foreground_status" -eq 17
 grep -Fx foreground-ok <<<"$foreground_output" >/dev/null
 
+# A rootful container must not inherit the caller's supplementary groups, even
+# when no --user was requested and all capabilities are dropped. Clearing the
+# groups must therefore happen before the capability drop.
+if command -v setpriv >/dev/null 2>&1; then
+  if (( EUID == 0 )); then
+    grouped_zerun=(setpriv --groups 4242 -- "${zerun[@]}")
+  else
+    grouped_zerun=(sudo setpriv --groups 4242 -- env
+      ZERUN_DATA_ROOT="$data_root"
+      ZERUN_RUNTIME_ROOT="$runtime_root"
+      "$binary")
+  fi
+  inherited_groups=$("${grouped_zerun[@]}" run --rootfs "$rootfs" --net none     --no-overlay --cap-drop ALL -- /bin/sh -c '/bin/busybox id -G')
+  grep -Fx 0 <<<"$inherited_groups" >/dev/null
+else
+  echo "setpriv unavailable; skipping supplementary-group isolation check" >&2
+fi
+
 # The default writable path must use overlayfs (or the documented rootless
 # fallback) and allow writes without modifying the source rootfs.
 overlay_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --init -- \
