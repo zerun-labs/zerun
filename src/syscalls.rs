@@ -642,6 +642,37 @@ pub fn read_fd(fd: RawFd, buf: &mut [u8]) -> ZResult<isize> {
     }
 }
 
+/// Probe whether a non-blocking stream socket still has a connected peer.
+///
+/// `recv(MSG_PEEK)` observes EOF without consuming application data. A socket
+/// with no queued data reports `EAGAIN`; that is a live connection, while other
+/// errors (for example a reset) are treated as disconnected.
+pub fn socket_peer_connected(fd: RawFd) -> bool {
+    let mut byte = 0u8;
+    loop {
+        let n = unsafe {
+            libc::recv(
+                fd,
+                &mut byte as *mut u8 as *mut c_void,
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if n > 0 {
+            return true;
+        }
+        if n == 0 {
+            return false;
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EAGAIN) => return true,
+            _ => return false,
+        }
+    }
+}
+
 // ---------- clone: the only entry point into new namespaces ----------
 
 const CLONE_STACK_SIZE: usize = 8 * 1024 * 1024;
@@ -829,5 +860,23 @@ mod tests {
         assert_eq!(wait_status_code(23 << 8), Some(23));
         assert_eq!(wait_status_code(libc::SIGTERM), Some(128 + libc::SIGTERM));
         assert_eq!(wait_status_code((libc::SIGSTOP << 8) | 0x7f), None);
+    }
+
+    #[test]
+    fn socket_peer_probe_observes_eof_without_consuming_data() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+
+        let (mut server, client) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        assert!(socket_peer_connected(server.as_raw_fd()));
+        (&client).write_all(b"x").unwrap();
+        assert!(socket_peer_connected(server.as_raw_fd()));
+        let mut byte = [0u8; 1];
+        server.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"x");
+
+        drop(client);
+        assert!(!socket_peer_connected(server.as_raw_fd()));
     }
 }

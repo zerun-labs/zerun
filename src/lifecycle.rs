@@ -23,6 +23,7 @@ use crate::state::{self, ContainerState, Status};
 use crate::store::{ContainerFs, Store};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::fd::RawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -38,6 +39,13 @@ use std::time::{Duration, Instant};
 /// oversized lines are split into timestamped records. Splitting only the
 /// on-disk log keeps the `attach` stream byte-for-byte faithful.
 const MAX_LOG_RECORD_BYTES: usize = 64 * 1024;
+
+/// Upper bound on simultaneous `zerun attach` clients for one container.
+///
+/// The socket is owner-only, but a local process can still open it repeatedly.
+/// Keep the reaper's descriptor and fan-out memory bounded even when clients
+/// stop reading or disconnect while the workload is silent.
+const MAX_ATTACH_CLIENTS: usize = 32;
 
 /// Persist the running transition before the detached CLI is released.
 ///
@@ -344,6 +352,7 @@ impl AttachHub {
             .spawn(move || {
                 // Blocks on accept until the reaper process exits; the
                 // kernel closes the listener fd with the process.
+                let mut warned_full = false;
                 for stream in listener.incoming() {
                     match stream {
                         Ok(s) => {
@@ -352,7 +361,14 @@ impl AttachHub {
                             // dropped and can catch up with `zerun logs`.
                             let _ = s.set_nonblocking(true);
                             if let Ok(mut list) = worker_clients.lock() {
-                                list.push(s);
+                                if register_attach_client(&mut list, s) {
+                                    warned_full = false;
+                                } else if !warned_full {
+                                    eprintln!(
+                                        "zerun: warn: attach client limit ({MAX_ATTACH_CLIENTS}) reached; dropping new connection"
+                                    );
+                                    warned_full = true;
+                                }
                             }
                         }
                         Err(_) => break,
@@ -376,6 +392,16 @@ impl AttachHub {
         }
         let _ = std::fs::remove_file(&self.sock_path);
     }
+}
+
+/// Drop disconnected clients and reserve one slot for a new attachment.
+fn register_attach_client(clients: &mut Vec<UnixStream>, client: UnixStream) -> bool {
+    clients.retain(|attached| crate::syscalls::socket_peer_connected(attached.as_raw_fd()));
+    if clients.len() >= MAX_ATTACH_CLIENTS {
+        return false;
+    }
+    clients.push(client);
+    true
 }
 
 /// Write `chunk` to every attached client; failed clients are dropped.
@@ -692,6 +718,29 @@ mod attach_tests {
             read_attach_frame(&mut client).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn attach_registration_prunes_disconnected_clients_and_enforces_the_limit() {
+        let mut clients = Vec::new();
+        let mut peers = Vec::new();
+        for _ in 0..MAX_ATTACH_CLIENTS {
+            let (server, peer) = UnixStream::pair().unwrap();
+            server.set_nonblocking(true).unwrap();
+            assert!(register_attach_client(&mut clients, server));
+            peers.push(peer);
+        }
+        assert_eq!(clients.len(), MAX_ATTACH_CLIENTS);
+
+        let (server, _peer) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        assert!(!register_attach_client(&mut clients, server));
+
+        peers.remove(0);
+        let (server, _peer) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        assert!(register_attach_client(&mut clients, server));
+        assert_eq!(clients.len(), MAX_ATTACH_CLIENTS);
     }
 
     #[test]
