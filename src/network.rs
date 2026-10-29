@@ -44,6 +44,7 @@ use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, U
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -500,21 +501,37 @@ fn udp_loop(listener: UdpSocket, container_ip: Ipv4Addr, container: u16) {
 
 /// Pump bytes both ways between an accepted client and the container.
 fn forward(mut client: TcpStream, container_ip: Ipv4Addr, container: u16) -> std::io::Result<()> {
-    let mut upstream = TcpStream::connect((container_ip, container))?;
+    let upstream_addr = SocketAddr::from((container_ip, container));
+    let mut upstream = TcpStream::connect_timeout(&upstream_addr, Duration::from_secs(5))?;
     let mut c2u = client.try_clone()?;
     let mut u2c = upstream.try_clone()?;
     // Keep control descriptors so a failed second spawn can wake the first
     // pump even after the data streams have moved into their closures.
     let client_control = client.try_clone()?;
     let upstream_control = upstream.try_clone()?;
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let client_to_upstream_tx = finished_tx.clone();
     let a = thread::Builder::new()
         .name("zerun-port-client-to-container".to_string())
-        .spawn(move || std::io::copy(&mut c2u, &mut upstream))
+        .spawn(move || {
+            let result = std::io::copy(&mut c2u, &mut upstream);
+            if result.is_ok() {
+                // Preserve TCP half-close: let the container finish sending
+                // its response after the client has shut down its write side.
+                let _ = upstream.shutdown(Shutdown::Write);
+            }
+            let _ = client_to_upstream_tx.send(result);
+        })
         .map_err(|e| std::io::Error::other(format!("spawn TCP pump: {e}")))?;
     let b = match thread::Builder::new()
         .name("zerun-port-container-to-client".to_string())
-        .spawn(move || std::io::copy(&mut u2c, &mut client))
-    {
+        .spawn(move || {
+            let result = std::io::copy(&mut u2c, &mut client);
+            if result.is_ok() {
+                let _ = client.shutdown(Shutdown::Write);
+            }
+            let _ = finished_tx.send(result);
+        }) {
         Ok(handle) => handle,
         Err(error) => {
             // The first pump owns cloned descriptors. Shut down the control
@@ -525,9 +542,29 @@ fn forward(mut client: TcpStream, container_ip: Ipv4Addr, container: u16) -> std
             return Err(std::io::Error::other(format!("spawn TCP pump: {error}")));
         }
     };
+
+    // Wait for both directions. If either fails, shut down the control
+    // descriptors so the opposite blocking copy cannot retain a proxy slot
+    // indefinitely. Clean EOF is directional and must not cut off replies.
+    let mut first_error = None;
+    for _ in 0..2 {
+        let Ok(result) = finished_rx.recv() else {
+            break;
+        };
+        if let Err(error) = result {
+            if first_error.is_none() {
+                first_error = Some(error);
+                let _ = client_control.shutdown(Shutdown::Both);
+                let _ = upstream_control.shutdown(Shutdown::Both);
+            }
+        }
+    }
     let _ = a.join();
     let _ = b.join();
-    Ok(())
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Host end of the veth pair (<= 15 chars, IFNAMSIZ-1).
@@ -925,6 +962,38 @@ mod tests {
             active.load(Ordering::Acquire),
             TCP_PROXY_CONNECTION_LIMIT - 1
         );
+    }
+
+    #[test]
+    fn tcp_proxy_preserves_half_close_and_returns_the_reply() {
+        use std::io::{Read, Write};
+
+        let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let backend_thread = std::thread::spawn(move || {
+            let (mut stream, _) = backend.accept().unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).unwrap();
+            assert_eq!(request, b"request");
+            stream.write_all(b"reply").unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+        });
+
+        let front = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let front_addr = front.local_addr().unwrap();
+        let mut client = TcpStream::connect(front_addr).unwrap();
+        let (proxy_client, _) = front.accept().unwrap();
+        let proxy_thread = std::thread::spawn(move || {
+            forward(proxy_client, Ipv4Addr::LOCALHOST, backend_addr.port()).unwrap();
+        });
+
+        client.write_all(b"request").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).unwrap();
+        assert_eq!(reply, b"reply");
+        proxy_thread.join().unwrap();
+        backend_thread.join().unwrap();
     }
 
     #[test]
