@@ -31,6 +31,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// Maximum bytes buffered for one newline-terminated console record.
+///
+/// A workload can write arbitrarily many bytes without a newline. Retaining
+/// that partial line in memory would let it grow the reaper without bound, so
+/// oversized lines are split into timestamped records. Splitting only the
+/// on-disk log keeps the `attach` stream byte-for-byte faithful.
+const MAX_LOG_RECORD_BYTES: usize = 64 * 1024;
+
 /// Persist the running transition before the detached CLI is released.
 ///
 /// This is deliberately a fallible boundary: a detached run without a durable
@@ -247,19 +255,16 @@ impl RotatingLog {
     }
 
     fn write_record(&mut self, timestamp: &[u8], line: &[u8]) -> std::io::Result<()> {
-        let mut record =
-            Vec::with_capacity(timestamp.len().saturating_add(1).saturating_add(line.len()));
-        record.extend_from_slice(timestamp);
-        record.push(b'\t');
-        record.extend_from_slice(line);
-        let record_len = record.len() as u64;
+        let record_len = timestamp.len().saturating_add(1).saturating_add(line.len()) as u64;
         if self.options.max_size > 0
             && self.written > 0
             && self.written.saturating_add(record_len) > self.options.max_size
         {
             self.rotate()?;
         }
-        self.file.write_all(&record)?;
+        self.file.write_all(timestamp)?;
+        self.file.write_all(b"\t")?;
+        self.file.write_all(line)?;
         self.written = self.written.saturating_add(record_len);
         Ok(())
     }
@@ -437,27 +442,51 @@ fn collect_timestamped(
     loop {
         match crate::syscalls::read_fd(read_fd, &mut buf) {
             Ok(0) => break,
-            Ok(n) => pending.extend_from_slice(&buf[..n as usize]),
+            Ok(n) => {
+                let chunk = &buf[..n as usize];
+                if append_log_bytes(&mut output, &mut pending, chunk).is_err() {
+                    crate::syscalls::close(read_fd);
+                    return;
+                }
+                if let Some(clients) = &attach {
+                    broadcast(clients, chunk);
+                }
+            }
             Err(_) => break,
-        }
-        while let Some(end) = pending.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = pending.drain(..=end).collect();
-            if write_timestamped_line(&mut output, &line).is_err() {
-                crate::syscalls::close(read_fd);
-                return;
-            }
-            if let Some(clients) = &attach {
-                broadcast(clients, &line);
-            }
         }
     }
     if !pending.is_empty() {
         let _ = write_timestamped_line(&mut output, &pending);
-        if let Some(clients) = &attach {
-            broadcast(clients, &pending);
-        }
     }
     crate::syscalls::close(read_fd);
+}
+
+/// Append workload bytes to the timestamped line buffer, flushing complete
+/// lines and splitting an unterminated line once it reaches the memory bound.
+fn append_log_bytes(
+    output: &mut RotatingLog,
+    pending: &mut Vec<u8>,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    pending.extend_from_slice(bytes);
+    loop {
+        let scan_len = pending.len().min(MAX_LOG_RECORD_BYTES);
+        if let Some(end) = pending[..scan_len].iter().position(|&byte| byte == b'\n') {
+            write_timestamped_line(output, &pending[..=end])?;
+            pending.drain(..=end);
+            continue;
+        }
+        if pending.len() < MAX_LOG_RECORD_BYTES {
+            return Ok(());
+        }
+
+        // Keep the on-disk record line-oriented so timestamp stripping and
+        // time filters remain well-defined. The original bytes are unchanged;
+        // only this synthetic record boundary is added.
+        pending.insert(MAX_LOG_RECORD_BYTES, b'\n');
+        write_timestamped_line(output, &pending[..=MAX_LOG_RECORD_BYTES])?;
+        pending.drain(..=MAX_LOG_RECORD_BYTES);
+    }
 }
 
 fn write_timestamped_line(output: &mut RotatingLog, line: &[u8]) -> std::io::Result<()> {
@@ -743,6 +772,64 @@ mod attach_tests {
         assert!(bytes.windows(b"third".len()).any(|w| w == b"third"));
         assert!(!bytes.windows(b"second".len()).any(|w| w == b"second"));
         assert!(!dir.join("console.log.1").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unterminated_console_lines_are_split_with_a_bounded_buffer() {
+        let dir = temp_log_dir("bounded-line");
+        let active = dir.join("console.log");
+        std::fs::write(&active, b"").unwrap();
+        let mut log = RotatingLog::open(
+            &active,
+            LogOptions {
+                max_size: 0,
+                max_files: 1,
+            },
+        )
+        .unwrap();
+
+        let payload = vec![b'x'; MAX_LOG_RECORD_BYTES * 2 + 17];
+        let mut pending = Vec::new();
+        append_log_bytes(&mut log, &mut pending, &payload).unwrap();
+        assert_eq!(pending.len(), 17);
+        write_timestamped_line(&mut log, &pending).unwrap();
+        drop(log);
+
+        let stored = std::fs::read(&active).unwrap();
+        let mut expected = Vec::new();
+        expected.extend(std::iter::repeat_n(b'x', MAX_LOG_RECORD_BYTES));
+        expected.push(b'\n');
+        expected.extend(std::iter::repeat_n(b'x', MAX_LOG_RECORD_BYTES));
+        expected.push(b'\n');
+        expected.extend(std::iter::repeat_n(b'x', 17));
+        assert_eq!(crate::logs::strip_log_timestamps(&stored), expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn console_line_buffering_preserves_terminated_lines_and_the_final_partial_line() {
+        let dir = temp_log_dir("normal-lines");
+        let active = dir.join("console.log");
+        std::fs::write(&active, b"").unwrap();
+        let mut log = RotatingLog::open(
+            &active,
+            LogOptions {
+                max_size: 0,
+                max_files: 1,
+            },
+        )
+        .unwrap();
+
+        let payload = b"first\nsecond\npartial";
+        let mut pending = Vec::new();
+        append_log_bytes(&mut log, &mut pending, payload).unwrap();
+        assert_eq!(pending, b"partial");
+        write_timestamped_line(&mut log, &pending).unwrap();
+        drop(log);
+
+        let stored = std::fs::read(&active).unwrap();
+        assert_eq!(crate::logs::strip_log_timestamps(&stored), payload);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
