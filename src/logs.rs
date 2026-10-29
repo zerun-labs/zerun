@@ -42,35 +42,7 @@ impl Default for LogOptions {
 
 /// Parse a log size (`10m`, `10mb`, `1024`) and allow `0` to disable rotation.
 pub fn parse_size(value: &str) -> Result<u64, String> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Err("size cannot be empty".to_string());
-    }
-    let value = value
-        .strip_suffix(['b', 'B'])
-        .filter(|value| !value.is_empty())
-        .unwrap_or(value);
-    let (number, multiplier) = match value.chars().last() {
-        Some('k' | 'K') => (&value[..value.len() - 1], 1024_u64),
-        Some('m' | 'M') => (&value[..value.len() - 1], 1024_u64 * 1024),
-        Some('g' | 'G') => (&value[..value.len() - 1], 1024_u64 * 1024 * 1024),
-        _ => (value, 1_u64),
-    };
-    let number = number.trim();
-    if number.is_empty() {
-        return Err("size is missing a number".to_string());
-    }
-    let parsed = number
-        .parse::<f64>()
-        .map_err(|_| "size is not a number".to_string())?;
-    if !parsed.is_finite() || parsed < 0.0 {
-        return Err("size must be finite and non-negative".to_string());
-    }
-    let bytes = parsed * multiplier as f64;
-    if bytes > u64::MAX as f64 {
-        return Err("size is too large".to_string());
-    }
-    Ok(bytes as u64)
+    crate::units::parse_size(value).map_err(|error| error.to_string())
 }
 
 /// Parse the retained-file count accepted by `--log-max-file`.
@@ -550,6 +522,9 @@ mod tests {
         assert_eq!(parse_size("2gb").unwrap(), 2 * 1024 * 1024 * 1024);
         assert!(parse_size("-1").is_err());
         assert!(parse_size("nope").is_err());
+        assert!(parse_size("NaN").is_err());
+        assert!(parse_size("1e3").is_err());
+        assert!(parse_size("18446744073709551616").is_err());
         assert_eq!(parse_max_files("1").unwrap(), 1);
         assert_eq!(parse_max_files("1024").unwrap(), 1024);
         assert!(parse_max_files("0").is_err());
