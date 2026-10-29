@@ -332,7 +332,9 @@ next `ps`/`rm` reconciles the stale record and reclaims host-side resources.
 `10m` (relative to now) and select inclusive capture-time bounds. `--tail N` narrows the
 raw lines before applying the time window. Untimestamped legacy logs are displayed
 normally but cannot be selected by time. `--until` ends follow mode at that boundary;
-`--since` remains fixed while following.
+`--since` remains fixed while following. An unterminated line is split into 64 KiB
+timestamped records in `console.log`, so a workload cannot make the reaper buffer an
+unbounded line; `attach` still receives the original bytes unchanged.
 `prune` removes every retained exited container and its writable layer. It reconciles stale
 Running records first, never touches live containers, and requires `--force` when stdin is
 not a terminal. `--images` additionally runs the image-store garbage collector for unreachable
@@ -358,7 +360,8 @@ the container itself is removed.
 Detached state and console logs are stored owner-only because state contains the resolved
 command line and environment. When the workload exits, a final control frame closes the stream
 and the attach command returns the container's exit code without mixing runtime metadata into
-output.
+output. Up to 32 clients may attach to one container; disconnected clients are pruned as new
+connections arrive so the reaper's descriptor and memory use stay bounded.
 Use `exec` for interactive input.
 `commit` produces a single-layer OCI image from the container rootfs. Exited detached
 containers retain their writable layer until `rm`; `--rm` still removes it on exit.
