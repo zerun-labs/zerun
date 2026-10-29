@@ -7,6 +7,7 @@
 //! Layer files are streamed from disk; they are never buffered wholly in
 //! memory.
 use crate::error::ZResult;
+use crate::image::limits::{MAX_CONFIG_BYTES, MAX_MANIFEST_BYTES};
 use crate::image::manifest::{self, Descriptor, ImageDoc};
 use crate::image::name::Reference;
 use crate::image::registry::RegistryClient;
@@ -41,7 +42,7 @@ pub fn push_image(
     // records have no index and therefore push just the selected manifest.
     let root_digest = record.index.as_deref().unwrap_or(&record.manifest);
     let root_bytes = store
-        .read_blob(root_digest)?
+        .read_blob_limited(root_digest, MAX_MANIFEST_BYTES, "manifest")?
         .ok_or_else(|| crate::zerr!("image manifest blob is missing: {root_digest}"))?;
     let actual_root_digest = format!("sha256:{}", crate::image::store::sha256_hex(&root_bytes));
     if actual_root_digest != root_digest {
@@ -114,9 +115,11 @@ fn validate_manifest_tree(
         }
         ImageDoc::Index(index) => {
             for child in &index.manifests {
-                let child_bytes = store.read_blob(&child.digest)?.ok_or_else(|| {
-                    crate::zerr!("child manifest blob is missing: {}", child.digest)
-                })?;
+                let child_bytes = store
+                    .read_blob_limited(&child.digest, MAX_MANIFEST_BYTES, "child manifest")?
+                    .ok_or_else(|| {
+                        crate::zerr!("child manifest blob is missing: {}", child.digest)
+                    })?;
                 let actual = format!("sha256:{}", crate::image::store::sha256_hex(&child_bytes));
                 if actual != child.digest {
                     return Err(crate::zerr!(
@@ -188,9 +191,12 @@ fn push_manifest_tree(
         }
         ImageDoc::Index(index) => {
             for child in &index.manifests {
-                let child_bytes = context.store.read_blob(&child.digest)?.ok_or_else(|| {
-                    crate::zerr!("child manifest blob is missing: {}", child.digest)
-                })?;
+                let child_bytes = context
+                    .store
+                    .read_blob_limited(&child.digest, MAX_MANIFEST_BYTES, "child manifest")?
+                    .ok_or_else(|| {
+                        crate::zerr!("child manifest blob is missing: {}", child.digest)
+                    })?;
                 let actual = format!("sha256:{}", crate::image::store::sha256_hex(&child_bytes));
                 if actual != child.digest {
                     return Err(crate::zerr!(
@@ -243,7 +249,11 @@ fn push_manifest_blobs(
                 let sep = if upload_url.contains('?') { '&' } else { '?' };
                 let upload_url = format!("{upload_url}{sep}digest={}", descriptor.digest);
                 if descriptor.digest == manifest.config.digest {
-                    let bytes = store.read_blob(&descriptor.digest)?.unwrap_or_default();
+                    let bytes = store
+                        .read_blob_limited(&descriptor.digest, MAX_CONFIG_BYTES, "image config")?
+                        .ok_or_else(|| {
+                            crate::zerr!("image config blob is missing: {}", descriptor.digest)
+                        })?;
                     client.put_blob_bytes(&upload_url, registry, repo, &bytes)?;
                 } else {
                     client.put_blob_file(&upload_url, registry, repo, &path)?;

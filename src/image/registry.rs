@@ -10,8 +10,10 @@
 //! they are deliberately not sent to Docker Hub mirrors.
 use crate::error::ZResult;
 use crate::image::auth::{normalize_registry, Credential, CredentialStore};
+use crate::image::limits::{read_limited, MAX_ERROR_BODY_BYTES, MAX_TOKEN_RESPONSE_BYTES};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -463,7 +465,7 @@ impl RegistryClient {
                 Ok(resp) => Some(Ok(resp)),
                 Err(ureq::Error::Status(code, resp)) => {
                     let retry_after = retry_after(&resp);
-                    let body = resp.into_string().unwrap_or_default();
+                    let body = response_snippet(resp);
                     let err = crate::zerr!("token endpoint {url}: HTTP {code}: {body}");
                     if is_retryable_status(code) && attempt < 2 {
                         thread::sleep(retry_delay(attempt, retry_after));
@@ -486,11 +488,13 @@ impl RegistryClient {
             Some(result) => result?,
             None => return Err(crate::zerr!("token endpoint retry loop exhausted: {url}")),
         };
-        let body = resp
-            .into_string()
-            .map_err(|e| crate::zerr!("read token response: {e}"))?;
+        let body = read_limited(
+            resp.into_reader(),
+            MAX_TOKEN_RESPONSE_BYTES,
+            "token response",
+        )?;
         let v: serde_json::Value =
-            serde_json::from_str(&body).map_err(|e| crate::zerr!("parse token response: {e}"))?;
+            serde_json::from_slice(&body).map_err(|e| crate::zerr!("parse token response: {e}"))?;
         v.get("token")
             .or_else(|| v.get("access_token"))
             .and_then(|t| t.as_str())
@@ -541,11 +545,12 @@ enum RequestBody<'a> {
 /// Read a bounded response-body snippet for diagnostics. HEAD/204 responses
 /// and unreadable bodies simply produce an empty string.
 fn response_snippet(resp: ureq::Response) -> String {
-    resp.into_string()
-        .unwrap_or_default()
-        .chars()
-        .take(300)
-        .collect()
+    let mut bytes = Vec::new();
+    let _ = resp
+        .into_reader()
+        .take(MAX_ERROR_BODY_BYTES as u64)
+        .read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).chars().take(300).collect()
 }
 
 /// Resolve a distribution `Location` header. OCI permits an absolute URL or a

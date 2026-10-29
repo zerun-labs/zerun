@@ -228,6 +228,7 @@ impl ImageStore {
         self.verify_blob(digest).unwrap_or(false)
     }
 
+    #[cfg(test)]
     pub fn read_blob(&self, digest: &str) -> ZResult<Option<Vec<u8>>> {
         let path = self.blob_path(digest)?;
         if !path.is_file() {
@@ -236,6 +237,33 @@ impl ImageStore {
         fs::read(&path)
             .map(Some)
             .map_err(|e| crate::zerr!("read blob {digest}: {e}"))
+    }
+
+    /// Read a metadata blob while enforcing a byte limit before allocating it
+    /// through `fs::read`. Layer content should keep using streaming APIs.
+    pub fn read_blob_limited(
+        &self,
+        digest: &str,
+        limit: usize,
+        description: &str,
+    ) -> ZResult<Option<Vec<u8>>> {
+        let path = self.blob_path(digest)?;
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(crate::zerr!("stat blob {digest}: {error}")),
+        };
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        let label = format!("{description} blob {digest}");
+        if metadata.len() > limit as u64 {
+            return Err(crate::zerr!(
+                "{label} exceeds the {limit}-byte metadata limit"
+            ));
+        }
+        let file = File::open(&path).map_err(|error| crate::zerr!("open {label}: {error}"))?;
+        crate::image::limits::read_limited(file, limit, &label).map(Some)
     }
 
     /// Store in-memory bytes as a blob, verifying `digest` matches the content.
@@ -694,7 +722,10 @@ impl ImageStore {
         if !keep_blobs.insert(digest.to_string()) {
             return;
         }
-        let bytes = self.read_blob(digest).ok().flatten();
+        let bytes = self
+            .read_blob_limited(digest, crate::image::limits::MAX_MANIFEST_BYTES, "manifest")
+            .ok()
+            .flatten();
         let Some(bytes) = bytes else {
             return;
         };
@@ -846,6 +877,31 @@ mod tests {
         // Mismatched content is rejected (digest is checked before install).
         let bad_d = format!("sha256:{}", sha256_hex(b"other"));
         assert!(s.write_blob(&bad_d, b"different").is_err());
+        let _ = fs::remove_dir_all(&s.data_root);
+    }
+
+    #[test]
+    fn limited_blob_reads_reject_oversized_metadata() {
+        let s = test_store();
+        let content = b"metadata";
+        let digest = format!("sha256:{}", sha256_hex(content));
+        s.write_blob(&digest, content).unwrap();
+        assert_eq!(
+            s.read_blob_limited(&digest, content.len(), "fixture")
+                .unwrap()
+                .unwrap(),
+            content
+        );
+        let error = s
+            .read_blob_limited(&digest, content.len() - 1, "fixture")
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("exceeds the 7-byte metadata limit"));
+        assert!(s
+            .read_blob_limited(&format!("sha256:{}", "0".repeat(64)), 8, "fixture")
+            .unwrap()
+            .is_none());
         let _ = fs::remove_dir_all(&s.data_root);
     }
 

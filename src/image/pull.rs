@@ -7,6 +7,7 @@
 use crate::error::{ZError, ZResult};
 use crate::fsutil;
 use crate::image::config::ImageConfig;
+use crate::image::limits::{read_limited, MAX_CONFIG_BYTES, MAX_MANIFEST_BYTES};
 use crate::image::manifest::{self, ImageDoc, Platform};
 use crate::image::name::Reference;
 use crate::image::registry::RegistryClient;
@@ -59,7 +60,7 @@ pub fn local_image(
         ));
     }
     let cfg_bytes = store
-        .read_blob(&rec.config)?
+        .read_blob_limited(&rec.config, MAX_CONFIG_BYTES, "image config")?
         .ok_or_else(|| crate::zerr!("image {} config blob disappeared", reference.canonical()))?;
     let config = ImageConfig::parse(&cfg_bytes)?;
     Ok(Some((rootfs, config)))
@@ -117,6 +118,12 @@ pub fn pull_image_with_lease(
     };
 
     // 2. Config blob: download if missing, parse it.
+    if manifest.config.size > MAX_CONFIG_BYTES as u64 {
+        return Err(crate::zerr!(
+            "image config descriptor is {} bytes; metadata limit is {MAX_CONFIG_BYTES}",
+            manifest.config.size
+        ));
+    }
     ensure_blob(
         store,
         client,
@@ -126,7 +133,7 @@ pub fn pull_image_with_lease(
         &manifest.config.digest,
     )?;
     let cfg_bytes = store
-        .read_blob(&manifest.config.digest)?
+        .read_blob_limited(&manifest.config.digest, MAX_CONFIG_BYTES, "image config")?
         .ok_or_else(|| crate::zerr!("config blob disappeared after download"))?;
     let config = ImageConfig::parse(&cfg_bytes)?;
 
@@ -204,10 +211,7 @@ fn resolve_single_manifest(
         let res = (|| -> ZResult<(String, Vec<u8>, Option<String>)> {
             let resp = client.get(&top_url, Some(manifest::ACCEPT_MANIFEST), registry, repo)?;
             let digest_hdr = resp.header("docker-content-digest").map(str::to_string);
-            let bytes = resp
-                .into_string()
-                .map_err(|e| crate::zerr!("read manifest body: {e}"))?
-                .into_bytes();
+            let bytes = read_limited(resp.into_reader(), MAX_MANIFEST_BYTES, "manifest body")?;
             match manifest::classify(&bytes)? {
                 ImageDoc::Manifest(_) => {
                     let digest = store_manifest(store, digest_hdr.as_deref(), &bytes)?;
@@ -226,10 +230,11 @@ fn resolve_single_manifest(
                     let child_url = format!("{base}/v2/{repo}/manifests/{child_digest}");
                     let child_resp =
                         client.get(&child_url, Some(manifest::ACCEPT_MANIFEST), registry, repo)?;
-                    let child_bytes = child_resp
-                        .into_string()
-                        .map_err(|e| crate::zerr!("read child manifest body: {e}"))?
-                        .into_bytes();
+                    let child_bytes = read_limited(
+                        child_resp.into_reader(),
+                        MAX_MANIFEST_BYTES,
+                        "child manifest body",
+                    )?;
                     let digest = store_manifest(store, Some(&child_digest), &child_bytes)?;
                     Ok((digest, child_bytes, Some(index_digest)))
                 }

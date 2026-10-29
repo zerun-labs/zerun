@@ -13,6 +13,10 @@
 use crate::error::ZResult;
 use crate::fsutil;
 use crate::image::config::ImageConfig;
+use crate::image::limits::{
+    read_limited, MAX_ARCHIVE_INDEX_BYTES, MAX_CONFIG_BYTES, MAX_LAYOUT_DOCUMENT_BYTES,
+    MAX_MANIFEST_BYTES,
+};
 use crate::image::manifest::{self, ImageDoc};
 use crate::image::name::Reference;
 use crate::image::pull::materialize_local_rootfs;
@@ -71,7 +75,7 @@ pub fn save_images(
             let root_digest = record.index.as_deref().unwrap_or(&record.manifest);
             copy_manifest_tree(store, &layout, root_digest, &mut copied)?;
             let bytes = store
-                .read_blob(root_digest)?
+                .read_blob_limited(root_digest, MAX_MANIFEST_BYTES, "manifest")?
                 .ok_or_else(|| crate::zerr!("manifest blob {root_digest} is missing"))?;
             let mut annotations = HashMap::new();
             if let Some(tag) = &record.tag {
@@ -182,7 +186,7 @@ fn copy_manifest_tree(
     if !copied.insert(digest.to_string()) {
         return Ok(());
     }
-    let bytes = store_blob(store, digest)?;
+    let bytes = read_manifest_blob(store, digest)?;
     copy_blob_to_layout(layout, digest, &bytes)?;
     match manifest::classify(&bytes)? {
         ImageDoc::Manifest(m) => {
@@ -256,14 +260,14 @@ fn copy_store_blob_to_layout(store: &ImageStore, layout: &Path, digest: &str) ->
     result
 }
 
-fn store_blob(store: &ImageStore, digest: &str) -> ZResult<Vec<u8>> {
+fn read_manifest_blob(store: &ImageStore, digest: &str) -> ZResult<Vec<u8>> {
     if !store.verify_blob(digest)? {
         return Err(crate::zerr!(
             "blob {digest} is missing or corrupted in the image store"
         ));
     }
     store
-        .read_blob(digest)?
+        .read_blob_limited(digest, MAX_MANIFEST_BYTES, "manifest")?
         .ok_or_else(|| crate::zerr!("blob {digest} disappeared from the image store"))
 }
 
@@ -315,10 +319,8 @@ pub fn load_archive(store: &ImageStore, input: &Path) -> ZResult<Vec<ImageRecord
             .ok_or_else(|| crate::zerr!("non-UTF-8 path in archive: {}", raw_path.display()))?;
         match name {
             "oci-layout" => {
-                let mut bytes = Vec::new();
-                entry
-                    .read_to_end(&mut bytes)
-                    .map_err(|e| crate::zerr!("read oci-layout: {e}"))?;
+                let bytes =
+                    read_limited(&mut entry, MAX_LAYOUT_DOCUMENT_BYTES, "OCI layout marker")?;
                 let doc: OciLayout = serde_json::from_slice(&bytes)
                     .map_err(|e| crate::zerr!("invalid oci-layout json: {e}"))?;
                 if doc.image_layout_version != OCI_LAYOUT_VERSION {
@@ -330,11 +332,11 @@ pub fn load_archive(store: &ImageStore, input: &Path) -> ZResult<Vec<ImageRecord
                 layout_ok = true;
             }
             "index.json" => {
-                let mut bytes = Vec::new();
-                entry
-                    .read_to_end(&mut bytes)
-                    .map_err(|e| crate::zerr!("read index.json: {e}"))?;
-                index_bytes = Some(bytes);
+                index_bytes = Some(read_limited(
+                    &mut entry,
+                    MAX_ARCHIVE_INDEX_BYTES,
+                    "OCI archive index.json",
+                )?);
             }
             _ => {
                 let Some(rest) = name.strip_prefix("blobs/sha256/") else {
@@ -393,7 +395,7 @@ fn import_descriptor(
     ref_name: Option<&str>,
     source_index: Option<&str>,
 ) -> ZResult<Vec<ImageRecord>> {
-    let bytes = store_blob(store, digest)?;
+    let bytes = read_manifest_blob(store, digest)?;
     match manifest::classify(&bytes)? {
         ImageDoc::Manifest(m) => Ok(vec![import_manifest(
             store,
@@ -439,7 +441,16 @@ fn import_manifest(
             ));
         }
     }
-    let config_bytes = store_blob(store, &manifest.config.digest)?;
+    if manifest.config.size > MAX_CONFIG_BYTES as u64 {
+        return Err(crate::zerr!(
+            "archive config descriptor {} is {} bytes; metadata limit is {MAX_CONFIG_BYTES}",
+            manifest.config.digest,
+            manifest.config.size
+        ));
+    }
+    let config_bytes = store
+        .read_blob_limited(&manifest.config.digest, MAX_CONFIG_BYTES, "image config")?
+        .ok_or_else(|| crate::zerr!("archive config blob {} is missing", manifest.config.digest))?;
     let config = ImageConfig::parse(&config_bytes)?;
     let _rootfs = materialize_local_rootfs(store, manifest, &config)?;
 
@@ -785,6 +796,29 @@ mod tests {
         let _ = fs::remove_dir_all(&data_dir);
         let _ = fs::remove_dir_all(&amd_root);
         let _ = fs::remove_dir_all(&arm_root);
+    }
+
+    #[test]
+    fn load_rejects_oversized_index_metadata() {
+        let data_dir = scratch("archive-oversized-index");
+        let store = ImageStore::at(&data_dir).unwrap();
+        let bad = data_dir.join("oversized-index.tar");
+        let file = File::create(&bad).unwrap();
+        let mut builder = tar::Builder::new(file);
+        let size = MAX_ARCHIVE_INDEX_BYTES as u64 + 1;
+        let mut header = tar::Header::new_gnu();
+        header.set_path("index.json").unwrap();
+        header.set_size(size);
+        header.set_cksum();
+        builder
+            .append(&header, std::io::repeat(b' ').take(size))
+            .unwrap();
+        builder.into_inner().unwrap();
+
+        let error = load_archive(&store, &bad).unwrap_err();
+        assert!(error.to_string().contains("metadata limit"));
+        assert!(store.records().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&data_dir);
     }
 
     #[test]
