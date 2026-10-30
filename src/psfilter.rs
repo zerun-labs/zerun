@@ -135,6 +135,7 @@ mod tests {
             env: vec![],
             cwd: None,
             user: None,
+            stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
             capabilities: None,
             seccomp: None,
             labels: BTreeMap::new(),

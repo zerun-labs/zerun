@@ -29,6 +29,7 @@ mod pty;
 mod seccomp;
 mod security;
 mod service;
+mod signal;
 mod state;
 mod store;
 mod syscalls;
@@ -145,6 +146,9 @@ struct RunArgs {
     /// Container user (`--user USER[:GROUP]`; image `config.User` wins when no
     /// explicit flag is given).
     user: Option<String>,
+    /// Signal used by `stop`/`restart` (`--stop-signal`); an image
+    /// `config.StopSignal` is used when this is absent.
+    stop_signal: Option<i32>,
     net: NetMode,
     /// True after the operator explicitly selected `--net`.
     net_specified: bool,
@@ -273,6 +277,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--user" | "-u" => {
                 a.user = Some(next_value(args, &mut i, "--user")?);
+            }
+            "--stop-signal" => {
+                let v = next_value(args, &mut i, "--stop-signal")?;
+                a.stop_signal = Some(signal::parse(&v)?);
             }
             "--net" => {
                 let v = next_value(args, &mut i, "--net")?;
@@ -443,6 +451,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             other if other.starts_with("--pull=") => {
                 a.pull = PullPolicy::parse(&other["--pull=".len()..])?;
+                i += 1;
+            }
+            other if other.starts_with("--stop-signal=") => {
+                a.stop_signal = Some(signal::parse(&other["--stop-signal=".len()..])?);
                 i += 1;
             }
             other if other.starts_with("--cap-add=") => {
@@ -809,161 +821,180 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
 
     // Resolve the container root filesystem and, for image mode, the process
     // environment / working directory / default command from the OCI config.
-    let (rootfs, env, cwd, user, argv, labels, capabilities, seccomp) = if let Some(st) = &resume {
-        if st.tmpfs_upper {
-            eprintln!(
+    let (rootfs, env, cwd, user, stop_signal, argv, labels, capabilities, seccomp) =
+        if let Some(st) = &resume {
+            if st.tmpfs_upper {
+                eprintln!(
                 "zerun start: container {} used --tmpfs-upper; its writable layer was ephemeral",
                 display_name(st)
             );
-            return 1;
-        }
-        let lower = match resumable_lower_rootfs(&store, st) {
-            Ok(lower) => lower,
-            Err(e) => {
-                eprintln!("zerun start: {e}");
                 return 1;
             }
-        };
-        let env = match state_environment(st) {
-            Ok(env) => env,
-            Err(e) => {
-                eprintln!("zerun start: {e}");
-                return 1;
-            }
-        };
-        let capabilities = match st.capabilities.as_deref() {
-            Some(names) => match security::CapabilitySet::from_names(names) {
-                Ok(caps) => caps,
+            let lower = match resumable_lower_rootfs(&store, st) {
+                Ok(lower) => lower,
                 Err(e) => {
                     eprintln!("zerun start: {e}");
                     return 1;
                 }
-            },
-            None => capabilities,
-        };
-        let seccomp = st.seccomp.unwrap_or(a.seccomp);
-        (
-            lower,
-            env,
-            st.cwd.clone(),
-            st.user.clone(),
-            st.cmd.clone(),
-            st.labels.clone(),
-            capabilities,
-            seccomp,
-        )
-    } else if let Some(rootfs_str) = &a.rootfs {
-        if !a.env.is_empty() {
-            eprintln!("zerun run: -e/--env requires image mode (drop --rootfs)");
-            return 2;
-        }
-        let rootfs = PathBuf::from(rootfs_str);
-        if !rootfs.is_dir() {
-            eprintln!(
-                "zerun: rootfs directory does not exist: {}",
-                rootfs.display()
-            );
-            return 2;
-        }
-        let mut argv = a.argv.clone();
-        if argv.is_empty() {
-            argv = vec!["/bin/sh".to_string()];
-        }
-        (
-            rootfs,
-            None,
-            a.workdir.clone(),
-            None,
-            argv,
-            a.labels.clone(),
-            capabilities,
-            a.seccomp,
-        )
-    } else {
-        let image = a.image.as_deref().expect("image required");
-        let reference = match Reference::parse(image) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("zerun run: invalid image reference '{image}': {e}");
+            };
+            let env = match state_environment(st) {
+                Ok(env) => env,
+                Err(e) => {
+                    eprintln!("zerun start: {e}");
+                    return 1;
+                }
+            };
+            let capabilities = match st.capabilities.as_deref() {
+                Some(names) => match security::CapabilitySet::from_names(names) {
+                    Ok(caps) => caps,
+                    Err(e) => {
+                        eprintln!("zerun start: {e}");
+                        return 1;
+                    }
+                },
+                None => capabilities,
+            };
+            let seccomp = st.seccomp.unwrap_or(a.seccomp);
+            let stop_signal = match signal::validate(st.stop_signal) {
+                Ok(signal) => signal,
+                Err(e) => {
+                    eprintln!("zerun start: invalid persisted stop signal: {e}");
+                    return 1;
+                }
+            };
+            (
+                lower,
+                env,
+                st.cwd.clone(),
+                st.user.clone(),
+                stop_signal,
+                st.cmd.clone(),
+                st.labels.clone(),
+                capabilities,
+                seccomp,
+            )
+        } else if let Some(rootfs_str) = &a.rootfs {
+            if !a.env.is_empty() {
+                eprintln!("zerun run: -e/--env requires image mode (drop --rootfs)");
                 return 2;
             }
-        };
-        match resolve_run_image(
-            &store,
-            &reference,
-            a.platform.as_deref(),
-            a.pull,
-            image_store_lease
-                .as_ref()
-                .expect("image runs hold an image-store lease"),
-        ) {
-            Ok((rootfs, cfg)) => {
-                let imgstore = match image::store::ImageStore::open(&store) {
-                    Ok(store) => store,
-                    Err(error) => {
-                        eprintln!("zerun: {error}");
-                        return 1;
-                    }
-                };
-                image_rootfs_lease = match imgstore.lock_rootfs_path(
-                    image_store_lease
-                        .as_ref()
-                        .expect("image runs hold an image-store lease"),
-                    &rootfs,
-                ) {
-                    Ok(lease) => Some(lease),
-                    Err(error) => {
-                        eprintln!("zerun: {error}");
-                        return 1;
-                    }
-                };
-                let env = match build_image_env(
-                    &cfg.config.env,
-                    &a.env,
-                    a.hostname.as_deref(),
-                    &id,
-                    a.tty,
-                ) {
-                    Ok(env) => env,
-                    Err(e) => {
-                        eprintln!("zerun run: {e}");
-                        return 1;
-                    }
-                };
-                let argv = resolve_image_argv(&cfg, a.entrypoint.as_deref(), &a.argv);
-                let mut labels = cfg.config.labels.clone();
-                labels.extend(a.labels.clone());
-                let cwd = a.workdir.clone().or_else(|| {
-                    (!cfg.config.working_dir.is_empty()).then(|| cfg.config.working_dir.clone())
-                });
-                let rootless = syscalls::effective_uid() != 0;
-                let image_user = if cfg.config.user.is_empty() {
-                    None
-                } else {
-                    Some(cfg.config.user.as_str())
-                };
-                let (user, user_warning) =
-                    resolve_image_user(a.user.as_deref(), image_user, rootless);
-                if let Some(w) = &user_warning {
-                    eprintln!("{w}");
+            let rootfs = PathBuf::from(rootfs_str);
+            if !rootfs.is_dir() {
+                eprintln!(
+                    "zerun: rootfs directory does not exist: {}",
+                    rootfs.display()
+                );
+                return 2;
+            }
+            let mut argv = a.argv.clone();
+            if argv.is_empty() {
+                argv = vec!["/bin/sh".to_string()];
+            }
+            (
+                rootfs,
+                None,
+                a.workdir.clone(),
+                None,
+                a.stop_signal.unwrap_or(signal::DEFAULT_STOP_SIGNAL),
+                argv,
+                a.labels.clone(),
+                capabilities,
+                a.seccomp,
+            )
+        } else {
+            let image = a.image.as_deref().expect("image required");
+            let reference = match Reference::parse(image) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("zerun run: invalid image reference '{image}': {e}");
+                    return 2;
                 }
-                (
-                    rootfs,
-                    Some(env),
-                    cwd,
-                    user,
-                    argv,
-                    labels,
-                    capabilities,
-                    a.seccomp,
-                )
+            };
+            match resolve_run_image(
+                &store,
+                &reference,
+                a.platform.as_deref(),
+                a.pull,
+                image_store_lease
+                    .as_ref()
+                    .expect("image runs hold an image-store lease"),
+            ) {
+                Ok((rootfs, cfg)) => {
+                    let imgstore = match image::store::ImageStore::open(&store) {
+                        Ok(store) => store,
+                        Err(error) => {
+                            eprintln!("zerun: {error}");
+                            return 1;
+                        }
+                    };
+                    image_rootfs_lease = match imgstore.lock_rootfs_path(
+                        image_store_lease
+                            .as_ref()
+                            .expect("image runs hold an image-store lease"),
+                        &rootfs,
+                    ) {
+                        Ok(lease) => Some(lease),
+                        Err(error) => {
+                            eprintln!("zerun: {error}");
+                            return 1;
+                        }
+                    };
+                    let env = match build_image_env(
+                        &cfg.config.env,
+                        &a.env,
+                        a.hostname.as_deref(),
+                        &id,
+                        a.tty,
+                    ) {
+                        Ok(env) => env,
+                        Err(e) => {
+                            eprintln!("zerun run: {e}");
+                            return 1;
+                        }
+                    };
+                    let argv = resolve_image_argv(&cfg, a.entrypoint.as_deref(), &a.argv);
+                    let mut labels = cfg.config.labels.clone();
+                    labels.extend(a.labels.clone());
+                    let cwd = a.workdir.clone().or_else(|| {
+                        (!cfg.config.working_dir.is_empty()).then(|| cfg.config.working_dir.clone())
+                    });
+                    let rootless = syscalls::effective_uid() != 0;
+                    let image_user = if cfg.config.user.is_empty() {
+                        None
+                    } else {
+                        Some(cfg.config.user.as_str())
+                    };
+                    let (user, user_warning) =
+                        resolve_image_user(a.user.as_deref(), image_user, rootless);
+                    if let Some(w) = &user_warning {
+                        eprintln!("{w}");
+                    }
+                    let stop_signal =
+                        match resolve_stop_signal(a.stop_signal, &cfg.config.stop_signal) {
+                            Ok(signal) => signal,
+                            Err(e) => {
+                                eprintln!("zerun run: {e}");
+                                return 1;
+                            }
+                        };
+                    (
+                        rootfs,
+                        Some(env),
+                        cwd,
+                        user,
+                        stop_signal,
+                        argv,
+                        labels,
+                        capabilities,
+                        a.seccomp,
+                    )
+                }
+                Err(e) => {
+                    eprintln!("zerun: {e}");
+                    return 1;
+                }
             }
-            Err(e) => {
-                eprintln!("zerun: {e}");
-                return 1;
-            }
-        }
-    };
+        };
 
     drop(image_store_lease);
     let container_fs = if let Some(st) = &resume {
@@ -1086,6 +1117,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
             &state_rootfs,
             DetachedInfo {
                 launch_args,
+                stop_signal,
                 name: if resume.is_some() {
                     resume.as_ref().and_then(|st| st.name.clone())
                 } else {
@@ -1325,6 +1357,9 @@ fn cleanup_failed_detached_start(
 /// for a container that failed to start.
 struct DetachedInfo {
     launch_args: Vec<String>,
+    /// Signal `stop`/`restart` deliver before escalating to SIGKILL. This is
+    /// lifecycle metadata, not namespace/child configuration.
+    stop_signal: i32,
     name: Option<String>,
     rm: bool,
     labels: BTreeMap<String, String>,
@@ -1448,6 +1483,7 @@ fn run_detached(
         env: Vec::new(),
         cwd: None,
         user: None,
+        stop_signal: signal::DEFAULT_STOP_SIGNAL,
         capabilities: None,
         seccomp: None,
         labels: BTreeMap::new(),
@@ -1495,6 +1531,7 @@ fn run_detached(
     st.env = env;
     st.cwd = spec.cwd.clone();
     st.user = spec.user.clone();
+    st.stop_signal = info.stop_signal;
     st.capabilities = Some(spec.capabilities.names());
     st.seccomp = Some(spec.seccomp);
     st.labels = info.labels;
@@ -1694,6 +1731,9 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     if let Some(v) = &a.user {
         args.extend(["--user".to_string(), v.clone()]);
     }
+    if let Some(v) = a.stop_signal {
+        args.extend(["--stop-signal".to_string(), signal::name(v)]);
+    }
     args.extend(["--net".to_string(), net_label(a.net)]);
     if a.use_init {
         args.push("--init".to_string());
@@ -1813,6 +1853,7 @@ fn launch_has_flag(args: &[String], flag: &str) -> bool {
 
 fn cmd_restart(args: &[String]) -> i32 {
     let mut timeout_secs: u64 = 10;
+    let mut stop_signal: Option<i32> = None;
     let mut targets: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -1831,8 +1872,21 @@ fn cmd_restart(args: &[String]) -> i32 {
                     return 2;
                 }
             },
+            "-s" | "--signal" => match next_value(args, &mut i, a) {
+                Ok(v) => match signal::parse(&v) {
+                    Ok(signal) => stop_signal = Some(signal),
+                    Err(e) => {
+                        eprintln!("zerun restart: {e}");
+                        return 2;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("zerun restart: {e}");
+                    return 2;
+                }
+            },
             "-h" | "--help" => {
-                println!("usage: zerun restart [--time SECONDS] CONTAINER...");
+                println!("usage: zerun restart [--time SECONDS] [--signal SIGNAL] CONTAINER...");
                 return 0;
             }
             other if other.starts_with('-') && other.len() > 1 => {
@@ -1889,7 +1943,7 @@ fn cmd_restart(args: &[String]) -> i32 {
             failed = true;
             continue;
         }
-        if let Err(e) = stop_one(&store, &target, timeout_secs) {
+        if let Err(e) = stop_one(&store, &target, timeout_secs, stop_signal) {
             eprintln!("zerun restart: {e}");
             failed = true;
             continue;
@@ -2369,6 +2423,19 @@ fn upsert_env(env: &mut Vec<(String, String)>, key: String, value: String) {
     } else {
         env.push((key, value));
     }
+}
+
+/// Resolve Docker's `STOPSIGNAL` precedence: an explicit run flag wins over
+/// the image config, which wins over the runtime default. An invalid image
+/// value fails before container resources are created.
+fn resolve_stop_signal(explicit: Option<i32>, image: &str) -> Result<i32, String> {
+    if let Some(signal) = explicit {
+        return signal::validate(signal);
+    }
+    if image.is_empty() {
+        return Ok(signal::DEFAULT_STOP_SIGNAL);
+    }
+    signal::parse(image).map_err(|e| format!("image config StopSignal: {e}"))
 }
 
 /// Combine image Entrypoint/Cmd with CLI arguments (docker semantics):
@@ -3402,6 +3469,7 @@ fn wait_one(store: &Store, target: &str) -> Result<i32, String> {
 
 fn cmd_stop(args: &[String]) -> i32 {
     let mut timeout_secs: u64 = 10;
+    let mut stop_signal: Option<i32> = None;
     let mut targets: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -3420,8 +3488,21 @@ fn cmd_stop(args: &[String]) -> i32 {
                     return 2;
                 }
             },
+            "-s" | "--signal" => match next_value(args, &mut i, a) {
+                Ok(v) => match signal::parse(&v) {
+                    Ok(signal) => stop_signal = Some(signal),
+                    Err(e) => {
+                        eprintln!("zerun stop: {e}");
+                        return 2;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("zerun stop: {e}");
+                    return 2;
+                }
+            },
             "-h" | "--help" => {
-                println!("usage: zerun stop [--time SECONDS] CONTAINER...");
+                println!("usage: zerun stop [--time SECONDS] [--signal SIGNAL] CONTAINER...");
                 return 0;
             }
             other if other.starts_with('-') && other.len() > 1 => {
@@ -3447,7 +3528,7 @@ fn cmd_stop(args: &[String]) -> i32 {
     };
     let mut failed = false;
     for t in targets {
-        match stop_one(&store, &t, timeout_secs) {
+        match stop_one(&store, &t, timeout_secs, stop_signal) {
             Ok(name) => println!("{name}"),
             Err(e) => {
                 eprintln!("zerun stop: {e}");
@@ -3470,10 +3551,10 @@ fn cmd_kill(args: &[String]) -> i32 {
         let a = args[i].as_str();
         match a {
             "-s" | "--signal" => match next_value(args, &mut i, a) {
-                Ok(v) => match signal_number(&v) {
-                    Some(sig) => signal = sig,
-                    None => {
-                        eprintln!("zerun kill: invalid signal '{v}'");
+                Ok(v) => match signal::parse(&v) {
+                    Ok(sig) => signal = sig,
+                    Err(e) => {
+                        eprintln!("zerun kill: {e}");
                         return 2;
                     }
                 },
@@ -3522,53 +3603,6 @@ fn cmd_kill(args: &[String]) -> i32 {
     } else {
         0
     }
-}
-
-/// Accept Docker's signal names (with or without the `SIG` prefix) and numeric
-/// Linux signal numbers. Signal 0 is deliberately not exposed because `kill`
-/// is a lifecycle command, not a PID liveness probe.
-fn signal_number(input: &str) -> Option<libc::c_int> {
-    if let Ok(value) = input.parse::<libc::c_int>() {
-        return (1..=64).contains(&value).then_some(value);
-    }
-    let upper = input.to_ascii_uppercase();
-    let name = upper.strip_prefix("SIG").unwrap_or(&upper);
-    let name = name.strip_prefix('-').unwrap_or(name);
-    let signal = match name {
-        "HUP" => libc::SIGHUP,
-        "INT" => libc::SIGINT,
-        "QUIT" => libc::SIGQUIT,
-        "ILL" => libc::SIGILL,
-        "TRAP" => libc::SIGTRAP,
-        "ABRT" => libc::SIGABRT,
-        "BUS" => libc::SIGBUS,
-        "FPE" => libc::SIGFPE,
-        "KILL" => libc::SIGKILL,
-        "USR1" => libc::SIGUSR1,
-        "SEGV" => libc::SIGSEGV,
-        "USR2" => libc::SIGUSR2,
-        "PIPE" => libc::SIGPIPE,
-        "ALRM" => libc::SIGALRM,
-        "TERM" => libc::SIGTERM,
-        "STKFLT" => libc::SIGSTKFLT,
-        "CHLD" => libc::SIGCHLD,
-        "CONT" => libc::SIGCONT,
-        "STOP" => libc::SIGSTOP,
-        "TSTP" => libc::SIGTSTP,
-        "TTIN" => libc::SIGTTIN,
-        "TTOU" => libc::SIGTTOU,
-        "URG" => libc::SIGURG,
-        "XCPU" => libc::SIGXCPU,
-        "XFSZ" => libc::SIGXFSZ,
-        "VTALRM" => libc::SIGVTALRM,
-        "PROF" => libc::SIGPROF,
-        "WINCH" => libc::SIGWINCH,
-        "IO" => libc::SIGIO,
-        "PWR" => libc::SIGPWR,
-        "SYS" => libc::SIGSYS,
-        _ => return None,
-    };
-    Some(signal)
 }
 
 /// Send one signal to a detached container's PID 1. Unlike `stop`, this does
@@ -3666,10 +3700,16 @@ fn thaw_paused_container(store: &Store, st: &mut state::ContainerState) -> Resul
     Ok(())
 }
 
-/// Docker semantics: SIGTERM, wait up to `--time`, then SIGKILL. The per-run
-/// reaper observes the death and persists the exit itself; when it is gone
-/// (crash) the stale record is reconciled instead.
-fn stop_one(store: &Store, target: &str, timeout_secs: u64) -> Result<String, String> {
+/// Docker semantics: send the container's configured signal (SIGTERM by
+/// default), wait up to `--time`, then SIGKILL. The per-run reaper observes the
+/// death and persists the exit itself; when it is gone (crash) the stale record
+/// is reconciled instead.
+fn stop_one(
+    store: &Store,
+    target: &str,
+    timeout_secs: u64,
+    override_signal: Option<i32>,
+) -> Result<String, String> {
     let initial = state::resolve(store, target)?;
     let _lock = state::ContainerOperationLock::try_acquire(store, &initial.id)?;
     let mut st = state::ContainerState::load(store, &initial.id).ok_or_else(|| {
@@ -3688,10 +3728,12 @@ fn stop_one(store: &Store, target: &str, timeout_secs: u64) -> Result<String, St
         reconcile_stale_state(store, &mut s)?;
         return Ok(name);
     }
-    // A frozen task cannot service SIGTERM; thaw first so the grace period is
-    // meaningful instead of always ending in SIGKILL.
+    let stop_signal =
+        signal::validate(override_signal.unwrap_or(st.stop_signal)).map_err(|e| e.to_string())?;
+    // A frozen task cannot service the stop signal; thaw first so the grace
+    // period is meaningful instead of always ending in SIGKILL.
     thaw_paused_container(store, &mut st)?;
-    signal_container(&st, libc::SIGTERM)?;
+    signal_container(&st, stop_signal)?;
     if !wait_pid_gone(&st, Duration::from_secs(timeout_secs)) {
         signal_container(&st, libc::SIGKILL)?;
         wait_pid_gone(&st, Duration::from_secs(5));
@@ -6108,9 +6150,11 @@ USAGE:\n  \
   zerun start CONTAINER...              resume stopped containers in place\n  \
   zerun pause CONTAINER...              freeze all processes in detached containers\n  \
   zerun unpause CONTAINER...            resume frozen detached containers\n  \
-  zerun stop [--time S] CONTAINER...    SIGTERM, then SIGKILL after the timeout\n  \
+  zerun stop [--time S] [--signal SIG] CONTAINER...\n  \
+                                        send the stop signal, then SIGKILL after timeout\n  \
   zerun kill [--signal SIG] CONTAINER... signal detached containers (default KILL)\n  \
-  zerun restart [--time S] CONTAINER... restart detached containers\n  \
+  zerun restart [--time S] [--signal SIG] CONTAINER...\n  \
+                                        restart detached containers\n  \
   zerun rm [-f] CONTAINER...            remove stopped containers (-f: kill first)\n  \
   zerun logs [--tail N] [--since TIME] [--until TIME] [-f] [-t] CONTAINER\n  \
   zerun stats [-a] [CONTAINER...]        one-shot resource metrics\n  \
@@ -6164,6 +6208,7 @@ RUN OPTIONS:\n  \
   --device-write-iops DEV:COUNT  cgroup v2 io.max write IOPS (repeatable)\n  \
   -h, --hostname H    container hostname (new UTS namespace)\n  \
   -u, --user USER[:GROUP]  run as container user (numeric or /etc/passwd name)\n  \
+  --stop-signal SIGNAL     stop/restart signal (image StopSignal; default SIGTERM)\n  \
   --net none|host|bridge\n  \
                       none = fresh netns + loopback; host = share host net;\n  \
                       bridge = zerun0 bridge + NAT (needs CAP_NET_ADMIN;\n  \
@@ -7023,13 +7068,31 @@ mod tests {
     }
 
     #[test]
-    fn kill_signal_input_accepts_names_and_numbers() {
-        assert_eq!(signal_number("KILL"), Some(libc::SIGKILL));
-        assert_eq!(signal_number("sig-term"), Some(libc::SIGTERM));
-        assert_eq!(signal_number("15"), Some(15));
-        assert_eq!(signal_number("65"), None);
-        assert_eq!(signal_number("0"), None);
-        assert_eq!(signal_number("not-a-signal"), None);
+    fn stop_signal_override_is_captured_in_launch_metadata() {
+        let args: Vec<String> = ["--stop-signal", "SIGUSR1", "alpine", "echo", "ok"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let parsed = parse_run_args(&args).unwrap();
+        assert_eq!(parsed.stop_signal, Some(libc::SIGUSR1));
+        let launch = detached_launch_args(&parsed, Path::new("/tmp/rootfs"));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--stop-signal", "SIGUSR1"]));
+    }
+
+    #[test]
+    fn stop_signal_precedence_prefers_run_then_image_then_default() {
+        assert_eq!(
+            resolve_stop_signal(Some(libc::SIGUSR1), "SIGQUIT"),
+            Ok(libc::SIGUSR1)
+        );
+        assert_eq!(resolve_stop_signal(None, "SIGQUIT"), Ok(libc::SIGQUIT));
+        assert_eq!(
+            resolve_stop_signal(None, ""),
+            Ok(signal::DEFAULT_STOP_SIGNAL)
+        );
+        assert!(resolve_stop_signal(None, "not-a-signal").is_err());
     }
 
     #[test]

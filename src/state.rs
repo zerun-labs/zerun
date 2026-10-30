@@ -22,6 +22,10 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+fn default_stop_signal() -> i32 {
+    crate::signal::DEFAULT_STOP_SIGNAL
+}
+
 /// Runtime status of a detached container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -264,6 +268,10 @@ pub struct ContainerState {
     /// exec; `zerun exec` re-applies it. None = root.
     #[serde(default)]
     pub user: Option<String>,
+    /// Signal used by `stop`/`restart` before escalating to SIGKILL. Older
+    /// records and the default configuration use SIGTERM.
+    #[serde(default = "default_stop_signal")]
+    pub stop_signal: i32,
     /// Exact capability set left for the workload. None = legacy record using
     /// the secure default set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -551,6 +559,54 @@ mod tests {
     }
 
     #[test]
+    fn legacy_state_without_stop_signal_defaults_to_sigterm() {
+        let mut value = serde_json::to_value(ContainerState {
+            version: 1,
+            id: "0123456789ab".to_string(),
+            name: None,
+            image: "alpine".to_string(),
+            pid: None,
+            pid_start_time: None,
+            status: Status::Exited,
+            paused: false,
+            exit_code: Some(0),
+            created: now_rfc3339(),
+            started: None,
+            finished: None,
+            rootless: false,
+            net: "none".to_string(),
+            ports: Vec::new(),
+            port_protocols: None,
+            port_ips: None,
+            ip: None,
+            cmd: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+            user: None,
+            stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
+            capabilities: None,
+            seccomp: None,
+            log: String::new(),
+            log_max_size: None,
+            log_max_file: None,
+            lower: None,
+            rootfs: String::new(),
+            overlay: None,
+            tmpfs_upper: false,
+            labels: BTreeMap::new(),
+            launch_args: None,
+            table: None,
+            veth: None,
+            cgroup: None,
+            metrics: None,
+        })
+        .unwrap();
+        value.as_object_mut().unwrap().remove("stop_signal");
+        let state: ContainerState = serde_json::from_value(value).unwrap();
+        assert_eq!(state.stop_signal, libc::SIGTERM);
+    }
+
+    #[test]
     fn reads_metrics_from_cgroup_files() {
         let dir = std::env::temp_dir().join(format!(
             "zerun-cgroup-metrics-{}-{:?}",
@@ -619,6 +675,7 @@ mod tests {
             env: vec![],
             cwd: None,
             user: None,
+            stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
             capabilities: None,
             seccomp: None,
             log: String::new(),
@@ -701,6 +758,7 @@ mod tests {
             env: vec![],
             cwd: None,
             user: None,
+            stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
             capabilities: Some(vec!["CAP_NET_RAW".to_string()]),
             seccomp: Some(SeccompMode::Unconfined),
             log: format!("{}/x/console.log", std::env::temp_dir().display()),

@@ -31,6 +31,10 @@ pub struct ConfigSection {
     /// Image user (`USER` in a Dockerfile), e.g. "nginx" or "1000:1000".
     #[serde(default, rename = "User")]
     pub user: String,
+    /// Signal used by `zerun stop` (`STOPSIGNAL` in a Dockerfile), e.g.
+    /// "SIGTERM" or "9". Empty means the runtime default.
+    #[serde(default, rename = "StopSignal")]
+    pub stop_signal: String,
     /// OCI/Docker image labels, inherited by containers.
     #[serde(default, rename = "Labels")]
     pub labels: BTreeMap<String, String>,
@@ -64,6 +68,7 @@ mod tests {
                     "Env": ["PATH=/usr/local/sbin:/usr/bin:/bin"],
                     "WorkingDir": "/app",
                     "User": "nginx:nginx",
+                    "StopSignal": "SIGQUIT",
                     "Cmd": ["/bin/sh"],
                     "Labels": {"org.opencontainers.image.title": "nginx"}
                 },
@@ -78,6 +83,7 @@ mod tests {
         assert_eq!(cfg.config.env.len(), 1);
         assert_eq!(cfg.config.working_dir, "/app");
         assert_eq!(cfg.config.user, "nginx:nginx");
+        assert_eq!(cfg.config.stop_signal, "SIGQUIT");
         assert_eq!(
             cfg.config
                 .labels

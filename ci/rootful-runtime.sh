@@ -180,6 +180,29 @@ done
 "${zerun[@]}" wait "$restart_id" >/dev/null
 "${zerun[@]}" rm "$restart_id" >/dev/null
 
+# A configured stop signal must reach the workload through mini-init. The
+# shell child traps SIGUSR1 and exits with a distinctive code, proving Zerun
+# did not silently substitute SIGTERM or leave the signal queued on PID 1.
+custom_stop_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
+  --init --stop-signal USR1 -- /bin/sh -c \
+  'trap "exit 42" USR1; printf "custom-stop-ready\\n"; while :; do sleep 1; done')
+cleanup_ids+=("$custom_stop_id")
+for attempt in $(seq 1 50); do
+  custom_stop_logs=$("${zerun[@]}" logs "$custom_stop_id" 2>/dev/null || true)
+  if grep -Fxq custom-stop-ready <<<"$custom_stop_logs"; then
+    break
+  fi
+  if (( attempt == 50 )); then
+    echo "custom-stop-signal workload did not start" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+"${zerun[@]}" stop --time 3 "$custom_stop_id" >/dev/null
+custom_stop_code=$("${zerun[@]}" wait "$custom_stop_id")
+test "$custom_stop_code" -eq 42
+"${zerun[@]}" rm "$custom_stop_id" >/dev/null
+
 # M7 lifecycle and storage commands operate on a live writable container.
 # Keep this workload alive while inspect/stats/top/cp/diff/export/commit run,
 # then import the exported tar and execute it as a local image.

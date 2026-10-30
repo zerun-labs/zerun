@@ -3,7 +3,7 @@
 //! Runs directly as container PID 1 when `--init` is used. Responsibilities:
 //!
 //! 1. reap orphaned children to avoid zombies;
-//! 2. forward SIGTERM/SIGINT to the workload;
+//! 2. forward lifecycle signals to the workload;
 //! 3. exit with the workload's exit code.
 //!
 //! The `zerun __init -- cmd` re-exec entry is retained for manual/legacy use.
@@ -34,17 +34,21 @@ pub fn run(
         return Err(crate::zerr!("__init: missing business command"));
     }
 
-    // Install forwarding handlers. Init itself ignores SIGPIPE/SIGHUP
-    // termination semantics; the workload decides how to handle them.
-    crate::syscalls::install_signal_handler(libc::SIGTERM, forward_signal)?;
-    crate::syscalls::install_signal_handler(libc::SIGINT, forward_signal)?;
+    // Forward every catchable asynchronous lifecycle signal, including custom
+    // STOPSIGNAL values and real-time signals. PID 1 controls the namespace's
+    // signal disposition, so forwarding only TERM/INT would make `stop
+    // --signal USR1` silently lose the signal whenever `--init` is enabled.
+    for signal in forwardable_signals() {
+        crate::syscalls::install_signal_handler(signal, forward_signal)?;
+    }
 
     let pid = crate::syscalls::fork_process()
         .map_err(|error| crate::zerr!("fork in mini-init: {error}"))?;
     if pid == 0 {
         // Workload child (container PID 2): restore default signal handling, then exec.
-        crate::syscalls::reset_signal_handler(libc::SIGTERM)?;
-        crate::syscalls::reset_signal_handler(libc::SIGINT)?;
+        for signal in forwardable_signals() {
+            crate::syscalls::reset_signal_handler(signal)?;
+        }
         exec_business(business, env, hostname, id)?;
         unreachable!("exec failure is returned as Err");
     }
@@ -74,6 +78,14 @@ pub fn run(
     Ok(business_code)
 }
 
+/// Catchable asynchronous signals forwarded by mini-init. SIGKILL and SIGSTOP
+/// cannot have handlers; SIGCHLD stays with init because it drives reaping.
+fn forwardable_signals() -> impl Iterator<Item = libc::c_int> {
+    (1..=31)
+        .chain(libc::SIGRTMIN()..=libc::SIGRTMAX())
+        .filter(|signal| !matches!(*signal, libc::SIGKILL | libc::SIGSTOP | libc::SIGCHLD))
+}
+
 fn decode_status(status: libc::c_int) -> i32 {
     crate::syscalls::wait_status_code(status).unwrap_or(1)
 }
@@ -90,4 +102,21 @@ fn exec_business(
     crate::workload::apply_env(&mut cmd, env, hostname, id);
     let err = cmd.exec();
     Err(crate::zerr!("mini-init exec {} failed: {err}", argv[0]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forwards_custom_and_realtime_signals_but_not_reaping_signals() {
+        let signals: Vec<_> = forwardable_signals().collect();
+        assert!(signals.contains(&libc::SIGUSR1));
+        assert!(signals.contains(&libc::SIGQUIT));
+        assert!(signals.contains(&libc::SIGRTMIN()));
+        assert!(signals.contains(&libc::SIGRTMAX()));
+        assert!(!signals.contains(&libc::SIGKILL));
+        assert!(!signals.contains(&libc::SIGSTOP));
+        assert!(!signals.contains(&libc::SIGCHLD));
+    }
 }

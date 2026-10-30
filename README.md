@@ -185,6 +185,8 @@ Run options (current subset):
 -u, --user USER[:GROUP]
                      run as a container user (numeric or from the image's /etc/passwd;
                      image config USER applies automatically when --user is absent)
+--stop-signal SIGNAL stop/restart signal name or number 1-64 (image STOPSIGNAL;
+                     default SIGTERM; --init forwards custom signals to the workload)
 --net bridge|none|host
                      bridge = rootful bridge networking on zerun0 (veth + eth0 in container;
                      rootful default); none = fresh netns with loopback only (rootless default);
@@ -307,7 +309,8 @@ sudo target/release/zerun attach web                  # stream live container ou
 sudo target/release/zerun stats web                   # one-shot resource metrics
 sudo target/release/zerun exec web /bin/sh            # join the container
 sudo target/release/zerun diff web                    # changed/added/deleted paths
-sudo target/release/zerun stop --time 3 web           # SIGTERM, then SIGKILL
+sudo target/release/zerun stop --time 3 web           # configured signal, then SIGKILL
+sudo target/release/zerun stop --signal USR1 web      # one-off signal override
 sudo target/release/zerun kill --signal TERM web      # send any Linux signal
 sudo target/release/zerun start web                   # resume with the same id/writable layer
 sudo target/release/zerun pause web                   # freeze the complete process tree

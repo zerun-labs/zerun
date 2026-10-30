@@ -916,6 +916,7 @@ mod attach_tests {
             env: Vec::new(),
             cwd: None,
             user: None,
+            stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
             capabilities: None,
             seccomp: Some(crate::seccomp::SeccompMode::Unconfined),
             log: String::new(),
