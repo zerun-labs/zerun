@@ -38,6 +38,7 @@ fi
 # fails. The runner is ephemeral, but explicit cleanup makes repeated local
 # runs deterministic and prevents leaked bridge listeners between checks.
 cleanup_ids=()
+cleanup_pids=()
 cleanup_paths=()
 remove_cleanup_path() {
   if (( EUID == 0 )); then
@@ -47,6 +48,9 @@ remove_cleanup_path() {
   fi
 }
 cleanup() {
+  for pid in "${cleanup_pids[@]}"; do
+    kill -TERM "$pid" >/dev/null 2>&1 || true
+  done
   for id in "${cleanup_ids[@]}"; do
     "${zerun[@]}" rm -f "$id" >/dev/null 2>&1 || true
   done
@@ -85,6 +89,34 @@ set -e
 printf '%s\n' "$foreground_output"
 test "$foreground_status" -eq 17
 grep -Fx foreground-ok <<<"$foreground_output" >/dev/null
+
+# A supervisor such as systemd stops a foreground run with SIGTERM. The parent
+# must translate that request into the resolved image/operator stop signal.
+foreground_stop_log=$(mktemp)
+cleanup_paths+=("$foreground_stop_log")
+"${zerun[@]}" run --rootfs "$rootfs" --no-overlay --net none --init \
+  --stop-signal USR1 -- /bin/sh -c \
+  'trap "exit 42" USR1; printf "foreground-stop-ready\n"; while :; do sleep 1; done' \
+  >"$foreground_stop_log" 2>&1 &
+foreground_stop_pid=$!
+cleanup_pids+=("$foreground_stop_pid")
+for attempt in $(seq 1 50); do
+  if grep -Fxq foreground-stop-ready "$foreground_stop_log"; then
+    break
+  fi
+  if (( attempt == 50 )); then
+    echo "foreground stop workload did not start" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+kill -TERM "$foreground_stop_pid"
+set +e
+wait "$foreground_stop_pid"
+foreground_stop_code=$?
+set -e
+cleanup_pids=()
+test "$foreground_stop_code" -eq 42
 
 # A rootful container must not inherit the caller's supplementary groups, even
 # when no --user was requested and all capabilities are dropped. Clearing the

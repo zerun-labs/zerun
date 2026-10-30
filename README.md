@@ -186,8 +186,10 @@ Run options (current subset):
                      run as a container user (numeric or from the image's /etc/passwd;
                      image config USER applies automatically when --user is absent)
 --stop-signal SIGNAL stop/restart signal name or number 1-64 (image STOPSIGNAL;
-                     default SIGTERM; --init forwards custom signals to the workload)
---stop-timeout S     seconds to wait for the stop signal before SIGKILL (default 10)
+                     default SIGTERM; SIGTERM sent to a foreground supervisor is
+                     translated to this signal)
+--stop-timeout S     seconds to wait for the stop signal before SIGKILL (default 10;
+                     generate-service maps this to TimeoutStopSec)
 --net bridge|none|host
                      bridge = rootful bridge networking on zerun0 (veth + eth0 in container;
                      rootful default); none = fresh netns with loopback only (rootless default);
@@ -383,8 +385,10 @@ ANDed; `--since`/`--until` accept RFC3339 UTC times and first replay matching hi
 ### systemd integration (M6)
 
 Generate a declarative systemd unit from the same arguments you would pass to `run`.
-The unit runs a foreground container, so systemd supervises Zerun, SIGTERM follows the
-normal signal-forwarding path, and failed workloads can be restarted:
+The unit runs a foreground container, so systemd supervises Zerun and failed workloads
+can be restarted. systemd's stop signal is SIGTERM; Zerun translates it to the resolved
+image/operator `--stop-signal`, while `--stop-timeout` (or the 10-second default) becomes
+`TimeoutStopSec` before systemd force-kills the cgroup:
 
 ```bash
 sudo ./target/release/zerun generate-service \
@@ -396,10 +400,11 @@ sudo systemctl enable --now zerun-web.service
 sudo journalctl -u zerun-web.service -f
 ```
 
-Use `--init` with services whose SIGTERM handling matters. For a rootless container,
+Use `--init` with services whose signal handling matters. For a rootless container,
 generate the unit as that user, install it under `~/.config/systemd/user/`, and use
 `systemctl --user enable --now`. `generate-service` rejects `-d`/`--rm` because systemd
-owns lifecycle and restart semantics.
+owns lifecycle and restart semantics. A zero stop timeout becomes systemd's smallest
+practical positive timeout (`1ms`), because systemd otherwise treats zero as "wait forever".
 
 ### Legacy rootfs mode (M1/M2)
 

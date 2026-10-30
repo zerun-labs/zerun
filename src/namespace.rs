@@ -60,6 +60,11 @@ pub struct RunSpec {
     /// Per-container writable filesystem; None = pivot directly into `rootfs`.
     pub overlay: Option<OverlayPaths>,
     pub id: String,
+    /// Lifecycle signal selected from `--stop-signal` or the image
+    /// `config.StopSignal`. The parent translates an externally delivered
+    /// SIGTERM into this signal, allowing an ordinary supervisor such as
+    /// systemd to stop foreground containers with their intended policy.
+    pub stop_signal: i32,
     /// Explicit container environment (image mode: KEY=VALUE pairs, fully
     /// replacing the inherited env). None = legacy `--rootfs` behavior
     /// (inherit host env + inject defaults).
@@ -94,11 +99,23 @@ pub struct RunSpec {
 }
 
 static TARGET_CHILD: AtomicI32 = AtomicI32::new(0);
+static TARGET_STOP_SIGNAL: AtomicI32 = AtomicI32::new(crate::signal::DEFAULT_STOP_SIGNAL);
 
 extern "C" fn forward_to_child(sig: libc::c_int) {
     let pid = TARGET_CHILD.load(Ordering::Relaxed);
     if pid > 0 {
-        crate::syscalls::signal_process(pid, sig);
+        crate::syscalls::signal_process(pid, forwarded_signal(sig));
+    }
+}
+
+/// A supervisor convention: SIGTERM requests a graceful stop, so use the
+/// container's resolved stop signal. Other terminal signals retain their
+/// original meaning (Ctrl-C stays SIGINT, for example).
+fn forwarded_signal(received: libc::c_int) -> libc::c_int {
+    if received == libc::SIGTERM {
+        TARGET_STOP_SIGNAL.load(Ordering::Relaxed)
+    } else {
+        received
     }
 }
 
@@ -262,6 +279,7 @@ where
 
     // The parent keeps neither the write end nor the child end of the error pipe.
     syscalls::close(err_w);
+    TARGET_STOP_SIGNAL.store(spec.stop_signal, Ordering::Relaxed);
     TARGET_CHILD.store(pid, Ordering::Relaxed);
 
     // Bridge mode: build the host side now. The child is parked on the net-ready
@@ -308,7 +326,7 @@ where
         // which the child relays over this pipe).
         let msg = String::from_utf8_lossy(&buf[..n]);
         eprintln!("zerun: container setup failed: {msg}");
-        let _ = wait_pid(pid);
+        let _ = wait_child(pid);
         if let Some(net) = &host_net {
             crate::network::teardown_host_side(net);
         }
@@ -341,7 +359,7 @@ where
         // the workload is already running at this point, so terminate it and
         // release every host-side resource before returning the error.
         let _ = syscalls::kill(pid, libc::SIGKILL);
-        let _ = wait_pid(pid);
+        let _ = wait_child(pid);
         if let Some(net) = &host_net {
             crate::network::teardown_host_side(net);
         }
@@ -366,7 +384,7 @@ where
                 // The workload is already running, so a failed pump startup
                 // must follow the same cleanup path as a failed start hook.
                 let _ = syscalls::kill(pid, libc::SIGKILL);
-                let _ = wait_pid(pid);
+                let _ = wait_child(pid);
                 if let Some(net) = &host_net {
                     crate::network::teardown_host_side(net);
                 }
@@ -380,7 +398,7 @@ where
     } else {
         None
     };
-    let code = wait_pid(pid)?;
+    let code = wait_child(pid)?;
     if let Some(net) = &host_net {
         crate::network::teardown_host_side(net);
     }
@@ -757,11 +775,28 @@ fn wait_pid(pid: i32) -> ZResult<i32> {
     Ok(syscalls::wait_status_code(status).unwrap_or(1))
 }
 
+fn wait_child(pid: i32) -> ZResult<i32> {
+    let result = wait_pid(pid);
+    // Do not leave a stale PID in the async handler after the child has been
+    // reaped; that PID may later be reused by an unrelated host process.
+    TARGET_CHILD.store(0, Ordering::Relaxed);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::network::HostEntry;
     use std::net::IpAddr;
+
+    #[test]
+    fn supervisor_term_uses_the_resolved_stop_signal() {
+        TARGET_STOP_SIGNAL.store(libc::SIGUSR1, Ordering::Relaxed);
+        assert_eq!(forwarded_signal(libc::SIGTERM), libc::SIGUSR1);
+        assert_eq!(forwarded_signal(libc::SIGINT), libc::SIGINT);
+        assert_eq!(forwarded_signal(libc::SIGHUP), libc::SIGHUP);
+        TARGET_STOP_SIGNAL.store(crate::signal::DEFAULT_STOP_SIGNAL, Ordering::Relaxed);
+    }
 
     #[test]
     fn generated_hosts_file_contains_identity_and_operator_aliases() {

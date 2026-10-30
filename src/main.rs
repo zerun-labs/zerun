@@ -1112,6 +1112,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         interactive: a.interactive,
         overlay,
         id,
+        stop_signal,
         env,
         cwd,
         user,

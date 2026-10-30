@@ -1,10 +1,10 @@
 //! systemd integration for foreground containers (`zerun generate-service`).
 //!
 //! Zerun is daemonless.  Rather than asking systemd to supervise an internal
-//! daemon, it supervises the normal foreground `zerun run` process.  The
-//! container is then an ordinary child of the unit, SIGTERM reaches Zerun's
-//! existing signal-forwarding path, and a failed container is restarted by
-//! systemd.
+//! daemon, it supervises the normal foreground `zerun run` process. The
+//! container is then an ordinary child of the unit; SIGTERM reaches Zerun's
+//! signal-forwarding path and is translated to the image/operator stop signal.
+//! A failed container is restarted by systemd.
 //!
 //! The generated unit is intentionally declarative: it is built from the same
 //! run arguments the operator would type, not from mutable runtime state under
@@ -113,6 +113,14 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
     if let Some(v) = &a.user {
         run_args.push("--user".into());
         run_args.push(v.clone());
+    }
+    if let Some(v) = a.stop_signal {
+        run_args.push("--stop-signal".into());
+        run_args.push(crate::signal::name(v));
+    }
+    if let Some(v) = a.stop_timeout {
+        run_args.push("--stop-timeout".into());
+        run_args.push(v.to_string());
     }
     if a.net != NetMode::None {
         run_args.push("--net".into());
@@ -242,12 +250,22 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
     s.push_str("Restart=on-failure\n");
     s.push_str("RestartSec=2s\n");
     s.push_str("KillMode=mixed\n");
+    // The foreground parent maps SIGTERM to the image/operator stop signal, so
+    // systemd does not need to know that signal at unit-generation time.
     s.push_str("KillSignal=SIGTERM\n");
-    s.push_str("TimeoutStopSec=15s\n");
+    s.push_str(&format!(
+        "TimeoutStopSec={}\n",
+        systemd_timeout(
+            a.stop_timeout
+                .unwrap_or(crate::state::DEFAULT_STOP_TIMEOUT_SECS)
+        )
+    ));
     s.push_str("NoNewPrivileges=true\n");
-    // Zerun's parent returns 128+SIGTERM after forwarding systemd's stop
-    // signal to the container.  Treat that normal stop path as clean.
-    s.push_str("SuccessExitStatus=143\n");
+    // A workload terminated by its stop signal produces 128+signal after the
+    // foreground parent forwards it. Explicit run policy is known here; image
+    // policy is resolved at runtime and otherwise falls back to SIGTERM.
+    let stop_exit_status = 128 + a.stop_signal.unwrap_or(crate::signal::DEFAULT_STOP_SIGNAL);
+    s.push_str(&format!("SuccessExitStatus={stop_exit_status}\n"));
     s.push_str("StandardOutput=journal\n");
     s.push_str("StandardError=journal\n");
     s.push_str("\n[Install]\n");
@@ -258,6 +276,10 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
     }
     Ok(s)
 }
+
+// systemd parses time spans into u64 microseconds. Keep one second below the
+// arithmetic boundary so its decimal parser cannot round into overflow.
+const SYSTEMD_MAX_TIMEOUT_SECS: u64 = u64::MAX / 1_000_000 - 1;
 
 pub fn print_usage() {
     println!(
@@ -270,6 +292,13 @@ pub fn print_usage() {
 }
 
 fn validate(a: &RunArgs, rootful: bool) -> Result<(), String> {
+    if let Some(timeout) = a.stop_timeout {
+        if timeout > SYSTEMD_MAX_TIMEOUT_SECS {
+            return Err(format!(
+                "--stop-timeout {timeout} exceeds systemd's maximum of {SYSTEMD_MAX_TIMEOUT_SECS} seconds"
+            ));
+        }
+    }
     if a.detach {
         return Err(
             "-d/--detach cannot be used with generate-service; systemd runs the foreground process"
@@ -349,6 +378,16 @@ fn validate(a: &RunArgs, rootful: bool) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// systemd treats a zero timeout as "disabled"; Zerun's zero means an
+/// immediate SIGKILL, so use the smallest practical positive duration instead.
+fn systemd_timeout(seconds: u64) -> String {
+    if seconds == 0 {
+        "1ms".to_string()
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn source_label(rootfs: Option<&str>, image: Option<&str>) -> String {
@@ -575,6 +614,43 @@ mod tests {
 
         let invalid = args(&["--no-overlay", "--tmpfs-upper", "alpine"]);
         assert!(render(Path::new("/bin/zerun"), &invalid, true).is_err());
+    }
+
+    #[test]
+    fn renders_and_applies_stop_policy() {
+        let a = args(&[
+            "--stop-signal",
+            "USR1",
+            "--stop-timeout",
+            "7",
+            "alpine",
+            "true",
+        ]);
+        let unit = render(Path::new("/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains(" --stop-signal SIGUSR1 --stop-timeout 7 "));
+        assert!(unit.contains("KillSignal=SIGTERM\n"));
+        assert!(unit.contains("TimeoutStopSec=7s\n"));
+        assert!(unit.contains("SuccessExitStatus=138\n"));
+
+        let defaults = args(&["alpine", "true"]);
+        let unit = render(Path::new("/bin/zerun"), &defaults, true).unwrap();
+        assert!(unit.contains("TimeoutStopSec=10s\n"));
+        assert!(!unit.contains("--stop-signal"));
+        assert!(!unit.contains("--stop-timeout"));
+    }
+
+    #[test]
+    fn zero_stop_timeout_is_not_rendered_as_systemd_disable() {
+        assert_eq!(systemd_timeout(0), "1ms");
+        assert_eq!(systemd_timeout(1), "1s");
+    }
+
+    #[test]
+    fn rejects_timeouts_beyond_systemd_representation() {
+        let value = (SYSTEMD_MAX_TIMEOUT_SECS + 1).to_string();
+        let a = args(&["--stop-timeout", &value, "alpine", "true"]);
+        let err = render(Path::new("/bin/zerun"), &a, true).unwrap_err();
+        assert!(err.contains("systemd's maximum"));
     }
 
     #[test]
