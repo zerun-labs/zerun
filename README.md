@@ -187,6 +187,7 @@ Run options (current subset):
                      image config USER applies automatically when --user is absent)
 --stop-signal SIGNAL stop/restart signal name or number 1-64 (image STOPSIGNAL;
                      default SIGTERM; --init forwards custom signals to the workload)
+--stop-timeout S     seconds to wait for the stop signal before SIGKILL (default 10)
 --net bridge|none|host
                      bridge = rootful bridge networking on zerun0 (veth + eth0 in container;
                      rootful default); none = fresh netns with loopback only (rootless default);

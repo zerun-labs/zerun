@@ -184,7 +184,7 @@ done
 # shell child traps SIGUSR1 and exits with a distinctive code, proving Zerun
 # did not silently substitute SIGTERM or leave the signal queued on PID 1.
 custom_stop_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
-  --init --stop-signal USR1 -- /bin/sh -c \
+  --init --stop-signal USR1 --stop-timeout 3 -- /bin/sh -c \
   'trap "exit 42" USR1; printf "custom-stop-ready\\n"; while :; do sleep 1; done')
 cleanup_ids+=("$custom_stop_id")
 for attempt in $(seq 1 50); do
@@ -198,10 +198,35 @@ for attempt in $(seq 1 50); do
   fi
   sleep 0.1
 done
-"${zerun[@]}" stop --time 3 "$custom_stop_id" >/dev/null
+"${zerun[@]}" stop "$custom_stop_id" >/dev/null
 custom_stop_code=$("${zerun[@]}" wait "$custom_stop_id")
 test "$custom_stop_code" -eq 42
 "${zerun[@]}" rm "$custom_stop_id" >/dev/null
+
+# The persisted timeout is the fallback when a workload ignores the configured
+# signal: Zerun must escalate to SIGKILL after roughly one second.
+stop_timeout_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
+  --init --stop-signal USR1 --stop-timeout 1 -- /bin/sh -c \
+  'trap "" USR1; printf "stop-timeout-ready\\n"; while :; do sleep 1; done')
+cleanup_ids+=("$stop_timeout_id")
+for attempt in $(seq 1 50); do
+  stop_timeout_logs=$("${zerun[@]}" logs "$stop_timeout_id" 2>/dev/null || true)
+  if grep -Fxq stop-timeout-ready <<<"$stop_timeout_logs"; then
+    break
+  fi
+  if (( attempt == 50 )); then
+    echo "stop-timeout workload did not start" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+stop_started=$(date +%s%N)
+"${zerun[@]}" stop "$stop_timeout_id" >/dev/null
+stop_elapsed_ms=$(( ($(date +%s%N) - stop_started) / 1000000 ))
+stop_timeout_code=$("${zerun[@]}" wait "$stop_timeout_id")
+test "$stop_timeout_code" -eq 137
+test "$stop_elapsed_ms" -ge 500
+"${zerun[@]}" rm "$stop_timeout_id" >/dev/null
 
 # M7 lifecycle and storage commands operate on a live writable container.
 # Keep this workload alive while inspect/stats/top/cp/diff/export/commit run,

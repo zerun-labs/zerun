@@ -917,6 +917,7 @@ mod attach_tests {
             cwd: None,
             user: None,
             stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
+            stop_timeout: crate::state::DEFAULT_STOP_TIMEOUT_SECS,
             capabilities: None,
             seccomp: Some(crate::seccomp::SeccompMode::Unconfined),
             log: String::new(),

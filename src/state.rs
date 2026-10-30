@@ -22,8 +22,15 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Default grace period between the configured stop signal and SIGKILL.
+pub const DEFAULT_STOP_TIMEOUT_SECS: u64 = 10;
+
 fn default_stop_signal() -> i32 {
     crate::signal::DEFAULT_STOP_SIGNAL
+}
+
+fn default_stop_timeout() -> u64 {
+    DEFAULT_STOP_TIMEOUT_SECS
 }
 
 /// Runtime status of a detached container.
@@ -272,6 +279,10 @@ pub struct ContainerState {
     /// records and the default configuration use SIGTERM.
     #[serde(default = "default_stop_signal")]
     pub stop_signal: i32,
+    /// Grace period in seconds before `stop`/`restart` escalate to SIGKILL.
+    /// Older records use the runtime default.
+    #[serde(default = "default_stop_timeout")]
+    pub stop_timeout: u64,
     /// Exact capability set left for the workload. None = legacy record using
     /// the secure default set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -559,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_state_without_stop_signal_defaults_to_sigterm() {
+    fn legacy_state_without_stop_policy_uses_defaults() {
         let mut value = serde_json::to_value(ContainerState {
             version: 1,
             id: "0123456789ab".to_string(),
@@ -584,6 +595,7 @@ mod tests {
             cwd: None,
             user: None,
             stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
+            stop_timeout: DEFAULT_STOP_TIMEOUT_SECS,
             capabilities: None,
             seccomp: None,
             log: String::new(),
@@ -602,8 +614,10 @@ mod tests {
         })
         .unwrap();
         value.as_object_mut().unwrap().remove("stop_signal");
+        value.as_object_mut().unwrap().remove("stop_timeout");
         let state: ContainerState = serde_json::from_value(value).unwrap();
         assert_eq!(state.stop_signal, libc::SIGTERM);
+        assert_eq!(state.stop_timeout, DEFAULT_STOP_TIMEOUT_SECS);
     }
 
     #[test]
@@ -676,6 +690,7 @@ mod tests {
             cwd: None,
             user: None,
             stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
+            stop_timeout: DEFAULT_STOP_TIMEOUT_SECS,
             capabilities: None,
             seccomp: None,
             log: String::new(),
@@ -759,6 +774,7 @@ mod tests {
             cwd: None,
             user: None,
             stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
+            stop_timeout: DEFAULT_STOP_TIMEOUT_SECS,
             capabilities: Some(vec!["CAP_NET_RAW".to_string()]),
             seccomp: Some(SeccompMode::Unconfined),
             log: format!("{}/x/console.log", std::env::temp_dir().display()),

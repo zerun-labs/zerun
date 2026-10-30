@@ -149,6 +149,8 @@ struct RunArgs {
     /// Signal used by `stop`/`restart` (`--stop-signal`); an image
     /// `config.StopSignal` is used when this is absent.
     stop_signal: Option<i32>,
+    /// Grace period used by `stop`/`restart` before SIGKILL.
+    stop_timeout: Option<u64>,
     net: NetMode,
     /// True after the operator explicitly selected `--net`.
     net_specified: bool,
@@ -281,6 +283,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             "--stop-signal" => {
                 let v = next_value(args, &mut i, "--stop-signal")?;
                 a.stop_signal = Some(signal::parse(&v)?);
+            }
+            "--stop-timeout" => {
+                let v = next_value(args, &mut i, "--stop-timeout")?;
+                a.stop_timeout = Some(parse_seconds(&v, "--stop-timeout")?);
             }
             "--net" => {
                 let v = next_value(args, &mut i, "--net")?;
@@ -457,6 +463,13 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 a.stop_signal = Some(signal::parse(&other["--stop-signal=".len()..])?);
                 i += 1;
             }
+            other if other.starts_with("--stop-timeout=") => {
+                a.stop_timeout = Some(parse_seconds(
+                    &other["--stop-timeout=".len()..],
+                    "--stop-timeout",
+                )?);
+                i += 1;
+            }
             other if other.starts_with("--cap-add=") => {
                 a.cap_add.extend(security::parse_capability_list(
                     &other["--cap-add=".len()..],
@@ -587,6 +600,12 @@ fn next_value(args: &[String], i: &mut usize, opt: &str) -> Result<String, Strin
         .ok_or_else(|| format!("option {opt} requires a value"))?;
     *i += 2;
     Ok(v.clone())
+}
+
+fn parse_seconds(value: &str, option: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("{option}: invalid seconds value '{value}'"))
 }
 
 /// Docker-style networking defaults: rootful runs use the managed bridge;
@@ -821,7 +840,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
 
     // Resolve the container root filesystem and, for image mode, the process
     // environment / working directory / default command from the OCI config.
-    let (rootfs, env, cwd, user, stop_signal, argv, labels, capabilities, seccomp) =
+    let (rootfs, env, cwd, user, stop_signal, stop_timeout, argv, labels, capabilities, seccomp) =
         if let Some(st) = &resume {
             if st.tmpfs_upper {
                 eprintln!(
@@ -862,12 +881,14 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
                     return 1;
                 }
             };
+            let stop_timeout = st.stop_timeout;
             (
                 lower,
                 env,
                 st.cwd.clone(),
                 st.user.clone(),
                 stop_signal,
+                stop_timeout,
                 st.cmd.clone(),
                 st.labels.clone(),
                 capabilities,
@@ -896,6 +917,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
                 a.workdir.clone(),
                 None,
                 a.stop_signal.unwrap_or(signal::DEFAULT_STOP_SIGNAL),
+                a.stop_timeout.unwrap_or(state::DEFAULT_STOP_TIMEOUT_SECS),
                 argv,
                 a.labels.clone(),
                 capabilities,
@@ -983,6 +1005,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
                         cwd,
                         user,
                         stop_signal,
+                        a.stop_timeout.unwrap_or(state::DEFAULT_STOP_TIMEOUT_SECS),
                         argv,
                         labels,
                         capabilities,
@@ -1118,6 +1141,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
             DetachedInfo {
                 launch_args,
                 stop_signal,
+                stop_timeout,
                 name: if resume.is_some() {
                     resume.as_ref().and_then(|st| st.name.clone())
                 } else {
@@ -1360,6 +1384,8 @@ struct DetachedInfo {
     /// Signal `stop`/`restart` deliver before escalating to SIGKILL. This is
     /// lifecycle metadata, not namespace/child configuration.
     stop_signal: i32,
+    /// Grace period between `stop_signal` and the SIGKILL fallback.
+    stop_timeout: u64,
     name: Option<String>,
     rm: bool,
     labels: BTreeMap<String, String>,
@@ -1484,6 +1510,7 @@ fn run_detached(
         cwd: None,
         user: None,
         stop_signal: signal::DEFAULT_STOP_SIGNAL,
+        stop_timeout: state::DEFAULT_STOP_TIMEOUT_SECS,
         capabilities: None,
         seccomp: None,
         labels: BTreeMap::new(),
@@ -1532,6 +1559,7 @@ fn run_detached(
     st.cwd = spec.cwd.clone();
     st.user = spec.user.clone();
     st.stop_signal = info.stop_signal;
+    st.stop_timeout = info.stop_timeout;
     st.capabilities = Some(spec.capabilities.names());
     st.seccomp = Some(spec.seccomp);
     st.labels = info.labels;
@@ -1734,6 +1762,9 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     if let Some(v) = a.stop_signal {
         args.extend(["--stop-signal".to_string(), signal::name(v)]);
     }
+    if let Some(v) = a.stop_timeout {
+        args.extend(["--stop-timeout".to_string(), v.to_string()]);
+    }
     args.extend(["--net".to_string(), net_label(a.net)]);
     if a.use_init {
         args.push("--init".to_string());
@@ -1852,7 +1883,7 @@ fn launch_has_flag(args: &[String], flag: &str) -> bool {
 }
 
 fn cmd_restart(args: &[String]) -> i32 {
-    let mut timeout_secs: u64 = 10;
+    let mut timeout_secs: Option<u64> = None;
     let mut stop_signal: Option<i32> = None;
     let mut targets: Vec<String> = Vec::new();
     let mut i = 0;
@@ -1860,10 +1891,10 @@ fn cmd_restart(args: &[String]) -> i32 {
         let a = args[i].as_str();
         match a {
             "-t" | "--time" => match next_value(args, &mut i, a) {
-                Ok(v) => match v.parse::<u64>() {
-                    Ok(n) => timeout_secs = n,
-                    Err(_) => {
-                        eprintln!("zerun restart: invalid --time value '{v}'");
+                Ok(v) => match parse_seconds(&v, "--time") {
+                    Ok(n) => timeout_secs = Some(n),
+                    Err(e) => {
+                        eprintln!("zerun restart: {e}");
                         return 2;
                     }
                 },
@@ -3468,7 +3499,7 @@ fn wait_one(store: &Store, target: &str) -> Result<i32, String> {
 }
 
 fn cmd_stop(args: &[String]) -> i32 {
-    let mut timeout_secs: u64 = 10;
+    let mut timeout_secs: Option<u64> = None;
     let mut stop_signal: Option<i32> = None;
     let mut targets: Vec<String> = Vec::new();
     let mut i = 0;
@@ -3476,10 +3507,10 @@ fn cmd_stop(args: &[String]) -> i32 {
         let a = args[i].as_str();
         match a {
             "-t" | "--time" => match next_value(args, &mut i, a) {
-                Ok(v) => match v.parse::<u64>() {
-                    Ok(n) => timeout_secs = n,
-                    Err(_) => {
-                        eprintln!("zerun stop: invalid --time value '{v}'");
+                Ok(v) => match parse_seconds(&v, "--time") {
+                    Ok(n) => timeout_secs = Some(n),
+                    Err(e) => {
+                        eprintln!("zerun stop: {e}");
                         return 2;
                     }
                 },
@@ -3701,13 +3732,13 @@ fn thaw_paused_container(store: &Store, st: &mut state::ContainerState) -> Resul
 }
 
 /// Docker semantics: send the container's configured signal (SIGTERM by
-/// default), wait up to `--time`, then SIGKILL. The per-run reaper observes the
-/// death and persists the exit itself; when it is gone (crash) the stale record
-/// is reconciled instead.
+/// default), wait for its configured timeout (or the `--time` override), then
+/// SIGKILL. The per-run reaper observes the death and persists the exit itself;
+/// when it is gone (crash) the stale record is reconciled instead.
 fn stop_one(
     store: &Store,
     target: &str,
-    timeout_secs: u64,
+    timeout_override: Option<u64>,
     override_signal: Option<i32>,
 ) -> Result<String, String> {
     let initial = state::resolve(store, target)?;
@@ -3730,6 +3761,7 @@ fn stop_one(
     }
     let stop_signal =
         signal::validate(override_signal.unwrap_or(st.stop_signal)).map_err(|e| e.to_string())?;
+    let timeout_secs = timeout_override.unwrap_or(st.stop_timeout);
     // A frozen task cannot service the stop signal; thaw first so the grace
     // period is meaningful instead of always ending in SIGKILL.
     thaw_paused_container(store, &mut st)?;
@@ -5938,8 +5970,10 @@ fn signal_container(state: &state::ContainerState, signal: libc::c_int) -> Resul
 }
 
 fn wait_pid_gone(state: &state::ContainerState, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
+    // Compare elapsed time rather than adding a user-controlled Duration to an
+    // Instant: `Instant + Duration` can overflow for very large --time values.
+    let started = Instant::now();
+    while started.elapsed() < timeout {
         if !state.pid_alive() {
             return true;
         }
@@ -6209,6 +6243,7 @@ RUN OPTIONS:\n  \
   -h, --hostname H    container hostname (new UTS namespace)\n  \
   -u, --user USER[:GROUP]  run as container user (numeric or /etc/passwd name)\n  \
   --stop-signal SIGNAL     stop/restart signal (image StopSignal; default SIGTERM)\n  \
+  --stop-timeout S         seconds before stop/restart sends SIGKILL (default 10)\n  \
   --net none|host|bridge\n  \
                       none = fresh netns + loopback; host = share host net;\n  \
                       bridge = zerun0 bridge + NAT (needs CAP_NET_ADMIN;\n  \
@@ -7069,16 +7104,36 @@ mod tests {
 
     #[test]
     fn stop_signal_override_is_captured_in_launch_metadata() {
-        let args: Vec<String> = ["--stop-signal", "SIGUSR1", "alpine", "echo", "ok"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        let args: Vec<String> = [
+            "--stop-signal",
+            "SIGUSR1",
+            "--stop-timeout",
+            "7",
+            "alpine",
+            "echo",
+            "ok",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
         let parsed = parse_run_args(&args).unwrap();
         assert_eq!(parsed.stop_signal, Some(libc::SIGUSR1));
+        assert_eq!(parsed.stop_timeout, Some(7));
         let launch = detached_launch_args(&parsed, Path::new("/tmp/rootfs"));
         assert!(launch
             .windows(2)
             .any(|pair| pair == ["--stop-signal", "SIGUSR1"]));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--stop-timeout", "7"]));
+    }
+
+    #[test]
+    fn stop_timeout_rejects_negative_and_overflowing_values() {
+        for value in ["-1", "18446744073709551616", "1.5", "ten"] {
+            let args = vec!["--stop-timeout".to_string(), value.to_string()];
+            assert!(parse_run_args(&args).is_err(), "{value:?} was accepted");
+        }
     }
 
     #[test]
