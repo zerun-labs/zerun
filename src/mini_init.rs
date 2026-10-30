@@ -78,12 +78,36 @@ pub fn run(
     Ok(business_code)
 }
 
-/// Catchable asynchronous signals forwarded by mini-init. SIGKILL and SIGSTOP
+/// Asynchronous signals forwarded by mini-init. Synchronous faults
+/// (SIGSEGV/SIGBUS/...) must keep their default disposition so a real fault in
+/// init cannot recurse through the forwarding handler. SIGKILL and SIGSTOP
 /// cannot have handlers; SIGCHLD stays with init because it drives reaping.
 fn forwardable_signals() -> impl Iterator<Item = libc::c_int> {
-    (1..=31)
-        .chain(libc::SIGRTMIN()..=libc::SIGRTMAX())
-        .filter(|signal| !matches!(*signal, libc::SIGKILL | libc::SIGSTOP | libc::SIGCHLD))
+    [
+        libc::SIGHUP,
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGUSR1,
+        libc::SIGUSR2,
+        libc::SIGPIPE,
+        libc::SIGALRM,
+        libc::SIGTERM,
+        libc::SIGSTKFLT,
+        libc::SIGCONT,
+        libc::SIGTSTP,
+        libc::SIGTTIN,
+        libc::SIGTTOU,
+        libc::SIGURG,
+        libc::SIGXCPU,
+        libc::SIGXFSZ,
+        libc::SIGVTALRM,
+        libc::SIGPROF,
+        libc::SIGWINCH,
+        libc::SIGIO,
+        libc::SIGPWR,
+    ]
+    .into_iter()
+    .chain(libc::SIGRTMIN()..=libc::SIGRTMAX())
 }
 
 fn decode_status(status: libc::c_int) -> i32 {
@@ -118,5 +142,7 @@ mod tests {
         assert!(!signals.contains(&libc::SIGKILL));
         assert!(!signals.contains(&libc::SIGSTOP));
         assert!(!signals.contains(&libc::SIGCHLD));
+        assert!(!signals.contains(&libc::SIGSEGV));
+        assert!(!signals.contains(&libc::SIGBUS));
     }
 }
