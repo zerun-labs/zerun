@@ -134,7 +134,7 @@ entries=$(tar -tzf "$archive") || die "cannot inspect downloaded archive"
 tar -xzf "$archive" -C "$tmpdir" -o --no-same-permissions -- zerun
 
 [ -f "$tmpdir/zerun" ] && [ ! -L "$tmpdir/zerun" ] || \
-die "downloaded archive did not contain a regular `zerun` binary"
+die "downloaded archive did not contain a regular \"zerun\" binary"
 chmod 0755 "$tmpdir/zerun"
 
 if [ -n "$SUDO" ]; then
