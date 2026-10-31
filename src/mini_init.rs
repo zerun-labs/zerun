@@ -34,6 +34,10 @@ pub fn run(
         return Err(crate::zerr!("__init: missing business command"));
     }
 
+    // PID 1 is implicitly a subreaper. In a shared host PID namespace it is an
+    // ordinary process, so opt in explicitly to keep orphan reaping working.
+    crate::syscalls::become_child_subreaper()?;
+
     // Forward every catchable asynchronous lifecycle signal, including custom
     // STOPSIGNAL values and real-time signals. PID 1 controls the namespace's
     // signal disposition, so forwarding only TERM/INT would make `stop

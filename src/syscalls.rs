@@ -85,6 +85,13 @@ pub fn kernel_machine() -> Option<String> {
     kernel_uname().map(|uts| cstr_to_string(uts.machine.as_ptr()))
 }
 
+/// Return the current UTS namespace hostname, if `uname(2)` succeeds.
+pub fn host_name() -> Option<String> {
+    kernel_uname()
+        .map(|uts| cstr_to_string(uts.nodename.as_ptr()))
+        .filter(|name| !name.is_empty())
+}
+
 fn kernel_uname() -> Option<libc::utsname> {
     let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
     if unsafe { libc::uname(&mut uts) } != 0 {
@@ -611,6 +618,63 @@ pub fn setns(fd: RawFd, flags: c_int) -> ZResult<()> {
     Ok(())
 }
 
+/// Clone the mount containing `path` into a detached mount fd.
+///
+/// This is used for explicit host namespace sharing: the source mount can be
+/// captured before pivot_root and attached later without relying on a path in
+/// the old root that will be detached.
+pub fn open_tree_clone<P: AsRef<Path>>(path: P) -> ZResult<OwnedFd> {
+    let path = cpath(path.as_ref())?;
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_open_tree,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::OPEN_TREE_CLONE | libc::OPEN_TREE_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(last_err("open_tree"));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
+/// Attach the detached mount referred to by `fd` at `target`.
+pub fn move_mount<P: AsRef<Path>>(fd: RawFd, target: P) -> ZResult<()> {
+    let target = cpath(target.as_ref())?;
+    let empty = c"";
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_move_mount,
+            fd,
+            empty.as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            libc::MOVE_MOUNT_F_EMPTY_PATH,
+        )
+    };
+    if rc != 0 {
+        return Err(last_err(&format!(
+            "move_mount -> {}",
+            target.to_string_lossy()
+        )));
+    }
+    Ok(())
+}
+
+/// Make this process the reaper for orphaned descendants.
+///
+/// The runtime parent uses this to sweep container descendants after a
+/// `--pid host` workload exits. mini-init is normally PID 1 and already
+/// inherits that role; under host PID sharing it is an ordinary process, so it
+/// opts in explicitly to preserve the same `--init` behavior.
+pub fn become_child_subreaper() -> ZResult<()> {
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
+        return Err(last_err("PR_SET_CHILD_SUBREAPER"));
+    }
+    Ok(())
+}
+
 /// Open a stable handle for a process. Unlike a bare PID, a pidfd continues
 /// to refer to the same process even if the numeric PID is later reused.
 pub fn pidfd_open(pid: libc::pid_t) -> ZResult<OwnedFd> {
@@ -886,6 +950,7 @@ mod tests {
         assert!(!pid_exists(-1));
         assert!(!pid_exists(i32::MAX));
         assert!(clock_ticks_per_second() > 0);
+        assert!(host_name().is_some_and(|name| !name.is_empty()));
         assert!(kernel_release().is_some());
         assert!(kernel_machine().is_some());
     }

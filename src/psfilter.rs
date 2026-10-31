@@ -145,6 +145,7 @@ mod tests {
             finished: None,
             rootless: false,
             net: "none".to_string(),
+            namespaces: Default::default(),
             ports: vec![],
             port_protocols: None,
             port_ips: None,

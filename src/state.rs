@@ -33,6 +33,48 @@ fn default_stop_timeout() -> u64 {
     DEFAULT_STOP_TIMEOUT_SECS
 }
 
+/// Namespace-sharing mode for the PID, IPC, and UTS namespaces.
+///
+/// The mount, network, cgroup, and user namespaces are still selected by their
+/// own runtime options. These three modes share a simple persisted shape so
+/// `run`, restart, and `exec` make the same namespace decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NamespaceMode {
+    /// Create a fresh namespace for this container.
+    #[default]
+    Private,
+    /// Join the runtime's (host) namespace.
+    Host,
+}
+
+impl NamespaceMode {
+    /// Parse a Docker-style `--pid`, `--ipc`, or `--uts` value.
+    pub fn parse(option: &str, value: &str) -> Result<Self, String> {
+        match value {
+            "private" => Ok(Self::Private),
+            "host" => Ok(Self::Host),
+            other => Err(format!("invalid {option} value '{other}' (private|host)")),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Host => "host",
+        }
+    }
+}
+
+/// Persisted PID/IPC/UTS namespace choices for one container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NamespaceModes {
+    pub pid: NamespaceMode,
+    pub ipc: NamespaceMode,
+    pub uts: NamespaceMode,
+}
+
 /// Runtime status of a detached container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -328,6 +370,9 @@ pub struct ContainerState {
     pub rootless: bool,
     /// "none" | "host" | "bridge".
     pub net: String,
+    /// PID/IPC/UTS namespace modes. Older records default to all-private.
+    #[serde(default)]
+    pub namespaces: NamespaceModes,
     /// Published ports (host, container).
     pub ports: Vec<(u16, u16)>,
     /// Transport for each port (`tcp`/`udp`). Older records are TCP.
@@ -691,6 +736,7 @@ mod tests {
             finished: None,
             rootless: false,
             net: "none".to_string(),
+            namespaces: Default::default(),
             ports: Vec::new(),
             port_protocols: None,
             port_ips: None,
@@ -732,6 +778,7 @@ mod tests {
         value.as_object_mut().unwrap().remove("reaper_start_time");
         value.as_object_mut().unwrap().remove("ulimits");
         value.as_object_mut().unwrap().remove("group_add");
+        value.as_object_mut().unwrap().remove("namespaces");
         let state: ContainerState = serde_json::from_value(value).unwrap();
         assert_eq!(state.stop_signal, libc::SIGTERM);
         assert_eq!(state.stop_timeout, DEFAULT_STOP_TIMEOUT_SECS);
@@ -742,6 +789,22 @@ mod tests {
         assert_eq!(state.reaper_start_time, None);
         assert_eq!(state.ulimits, None);
         assert_eq!(state.group_add, None);
+        assert_eq!(state.namespaces, NamespaceModes::default());
+    }
+
+    #[test]
+    fn namespace_modes_round_trip_through_state_json() {
+        let modes = NamespaceModes {
+            pid: NamespaceMode::Host,
+            ipc: NamespaceMode::Host,
+            uts: NamespaceMode::Private,
+        };
+        let json = serde_json::to_string(&modes).unwrap();
+        assert_eq!(json, r#"{"pid":"host","ipc":"host","uts":"private"}"#);
+        assert_eq!(
+            serde_json::from_str::<NamespaceModes>(&json).unwrap(),
+            modes
+        );
     }
 
     #[test]
@@ -807,6 +870,7 @@ mod tests {
             finished: None,
             rootless: false,
             net: "none".to_string(),
+            namespaces: Default::default(),
             ports: vec![],
             port_protocols: None,
             port_ips: None,
@@ -904,6 +968,7 @@ mod tests {
             finished: None,
             rootless: false,
             net: "none".to_string(),
+            namespaces: Default::default(),
             ports: vec![],
             port_protocols: None,
             port_ips: None,

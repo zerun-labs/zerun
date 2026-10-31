@@ -147,6 +147,8 @@ struct RunArgs {
     /// Process-level POSIX limits (`--ulimit TYPE=SOFT[:HARD]`).
     ulimits: rlimit::UlimitSet,
     hostname: Option<String>,
+    /// PID/IPC/UTS namespace sharing selected for this run.
+    namespaces: state::NamespaceModes,
     /// Container user (`--user USER[:GROUP]`; image `config.User` wins when no
     /// explicit flag is given).
     user: Option<String>,
@@ -296,6 +298,18 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--hostname" | "-h" => {
                 a.hostname = Some(next_value(args, &mut i, s)?);
+            }
+            "--pid" => {
+                let value = next_value(args, &mut i, "--pid")?;
+                a.namespaces.pid = state::NamespaceMode::parse("--pid", &value)?;
+            }
+            "--ipc" => {
+                let value = next_value(args, &mut i, "--ipc")?;
+                a.namespaces.ipc = state::NamespaceMode::parse("--ipc", &value)?;
+            }
+            "--uts" => {
+                let value = next_value(args, &mut i, "--uts")?;
+                a.namespaces.uts = state::NamespaceMode::parse("--uts", &value)?;
             }
             "--user" | "-u" => {
                 a.user = Some(next_value(args, &mut i, "--user")?);
@@ -524,6 +538,18 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 append_group_additions(&mut a.group_add, &other["--group-add=".len()..])?;
                 i += 1;
             }
+            other if other.starts_with("--pid=") => {
+                a.namespaces.pid = state::NamespaceMode::parse("--pid", &other["--pid=".len()..])?;
+                i += 1;
+            }
+            other if other.starts_with("--ipc=") => {
+                a.namespaces.ipc = state::NamespaceMode::parse("--ipc", &other["--ipc=".len()..])?;
+                i += 1;
+            }
+            other if other.starts_with("--uts=") => {
+                a.namespaces.uts = state::NamespaceMode::parse("--uts", &other["--uts=".len()..])?;
+                i += 1;
+            }
             other if other.starts_with("--cap-add=") => {
                 a.cap_add.extend(security::parse_capability_list(
                     &other["--cap-add=".len()..],
@@ -562,6 +588,9 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 i = args.len();
             }
         }
+    }
+    if a.namespaces.uts == state::NamespaceMode::Host && a.hostname.is_some() {
+        return Err("--hostname cannot be used with --uts host".to_string());
     }
     Ok(a)
 }
@@ -951,6 +980,20 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         })
         .expect("new runs reserve an id and resumed runs have one");
 
+    // A host UTS namespace cannot be renamed without host privileges (and
+    // `--hostname` is rejected with it). Use the live host name for the
+    // container's HOSTNAME default and /etc/hosts identity instead of the id.
+    let effective_hostname = match a.namespaces.uts {
+        state::NamespaceMode::Host => match syscalls::host_name() {
+            Some(name) => Some(name),
+            None => {
+                eprintln!("zerun run: cannot read the host hostname for --uts host");
+                return 1;
+            }
+        },
+        state::NamespaceMode::Private => a.hostname.clone(),
+    };
+
     // Resolve the container root filesystem and, for image mode, the process
     // environment / working directory / default command from the OCI config.
     let (rootfs, env, cwd, user, stop_signal, stop_timeout, argv, labels, capabilities, seccomp) =
@@ -1074,7 +1117,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
                         &cfg.config.env,
                         &env_file_overrides,
                         &a.env,
-                        a.hostname.as_deref(),
+                        effective_hostname.as_deref(),
                         &id,
                         a.tty,
                     ) {
@@ -1215,7 +1258,8 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
     let spec = RunSpec {
         rootfs: pivot_root,
         argv,
-        hostname: a.hostname,
+        hostname: effective_hostname,
+        namespaces: a.namespaces,
         net: a.net,
         use_init: a.use_init,
         limits: ResourceLimits {
@@ -1657,6 +1701,7 @@ fn run_detached(
         finished: None,
         rootless: syscalls::effective_uid() != 0,
         net: net_label(spec.net),
+        namespaces: spec.namespaces,
         ports: Vec::new(),
         port_protocols: None,
         port_ips: None,
@@ -1701,6 +1746,7 @@ fn run_detached(
     st.ip = None;
     st.rootless = syscalls::effective_uid() != 0;
     st.net = net_label(spec.net);
+    st.namespaces = spec.namespaces;
     st.ports = spec.ports.iter().map(|p| (p.host, p.container)).collect();
     st.port_protocols = if spec.ports.is_empty() {
         None
@@ -1926,6 +1972,15 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     }
     if let Some(v) = &a.hostname {
         args.extend(["--hostname".to_string(), v.clone()]);
+    }
+    for (flag, mode) in [
+        ("--pid", a.namespaces.pid),
+        ("--ipc", a.namespaces.ipc),
+        ("--uts", a.namespaces.uts),
+    ] {
+        if mode == state::NamespaceMode::Host {
+            args.extend([flag.to_string(), mode.label().to_string()]);
+        }
     }
     if let Some(v) = &a.user {
         args.extend(["--user".to_string(), v.clone()]);
@@ -6636,6 +6691,9 @@ RUN OPTIONS:\n  \
   --device-write-iops DEV:COUNT  cgroup v2 io.max write IOPS (repeatable)\n  \
   --ulimit TYPE=SOFT[:HARD]      per-process rlimit (repeatable; -1 = unlimited)\n  \
   -h, --hostname H    container hostname (new UTS namespace)\n  \
+  --pid private|host  private PID namespace (default) or share host PID (sensitive)\n  \
+  --ipc private|host  private IPC/shm (default) or share host IPC (sensitive)\n  \
+  --uts private|host  private UTS namespace (default) or share host name (sensitive)\n  \
   -u, --user USER[:GROUP]  run as container user (numeric or /etc/passwd name)\n  \
   --group-add NAME|GID     add a supplementary group (repeatable/comma-separated)\n  \
   --stop-signal SIGNAL     stop/restart signal (image StopSignal; default SIGTERM)\n  \
@@ -7372,6 +7430,39 @@ mod tests {
                 .collect();
             assert!(parse_run_args(&args).is_err(), "{value} should be rejected");
         }
+    }
+
+    #[test]
+    fn parses_and_captures_host_namespace_modes() {
+        let args: Vec<_> = [
+            "--pid=host",
+            "--ipc",
+            "host",
+            "--uts=private",
+            "alpine",
+            "true",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_run_args(&args).expect("namespace modes");
+        assert_eq!(a.namespaces.pid, state::NamespaceMode::Host);
+        assert_eq!(a.namespaces.ipc, state::NamespaceMode::Host);
+        assert_eq!(a.namespaces.uts, state::NamespaceMode::Private);
+        let launch = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+        assert!(launch.windows(2).any(|pair| pair == ["--pid", "host"]));
+        assert!(launch.windows(2).any(|pair| pair == ["--ipc", "host"]));
+        assert!(!launch.iter().any(|arg| arg == "--uts"));
+
+        for option in ["--pid=container:web", "--ipc=none", "--uts="] {
+            let args = vec![option.to_string(), "alpine".to_string()];
+            assert!(parse_run_args(&args).is_err(), "{option} should fail");
+        }
+        let incompatible = ["--uts=host", "--hostname", "box", "alpine"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        assert!(parse_run_args(&incompatible).is_err());
     }
 
     #[test]

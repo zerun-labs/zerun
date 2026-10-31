@@ -90,6 +90,67 @@ printf '%s\n' "$foreground_output"
 test "$foreground_status" -eq 17
 grep -Fx foreground-ok <<<"$foreground_output" >/dev/null
 
+# PID/IPC/UTS sharing must be opt-in, and host-shared /dev/shm must be the
+# host's mount rather than a private tmpfs. The default private run is checked
+# against the host namespace identities, not just the visible hostname.
+host_pid_ns=$(readlink /proc/self/ns/pid)
+host_ipc_ns=$(readlink /proc/self/ns/ipc)
+host_uts_ns=$(readlink /proc/self/ns/uts)
+host_hostname=$(hostname)
+private_ns=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+  --pid private --ipc private --uts private -- /bin/sh -c \
+  'printf "%s\n%s\n%s\n" "$(/bin/busybox readlink /proc/self/ns/pid)" "$(/bin/busybox readlink /proc/self/ns/ipc)" "$(/bin/busybox readlink /proc/self/ns/uts)"')
+mapfile -t private_namespaces <<<"$private_ns"
+test "${private_namespaces[0]}" != "$host_pid_ns"
+test "${private_namespaces[1]}" != "$host_ipc_ns"
+test "${private_namespaces[2]}" != "$host_uts_ns"
+
+host_ns=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+  --pid host --ipc host --uts host -- /bin/sh -c \
+  'printf "%s\n%s\n%s\n%s\n" "$(/bin/busybox readlink /proc/self/ns/pid)" "$(/bin/busybox readlink /proc/self/ns/ipc)" "$(/bin/busybox readlink /proc/self/ns/uts)" "$(/bin/busybox hostname)"')
+mapfile -t host_namespaces <<<"$host_ns"
+test "${host_namespaces[0]}" = "$host_pid_ns"
+test "${host_namespaces[1]}" = "$host_ipc_ns"
+test "${host_namespaces[2]}" = "$host_uts_ns"
+test "${host_namespaces[3]}" = "$host_hostname"
+
+host_shm_marker="/dev/shm/zerun-ci-namespace-${BASHPID}"
+cleanup_paths+=("$host_shm_marker")
+private_shm=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+  --ipc private -- /bin/sh -c \
+  "if test -e '$host_shm_marker'; then exit 1; fi; printf private-shm-ok")
+grep -Fx private-shm-ok <<<"$private_shm" >/dev/null
+"${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay --ipc host -- \
+  /bin/sh -c "printf host-shm-ok > '$host_shm_marker'"
+grep -Fx host-shm-ok "$host_shm_marker" >/dev/null
+
+# A host PID namespace has no kernel-wide kill boundary when its top-level
+# process exits. The runtime must act as a subreaper and reap every remaining
+# descendant before returning, or a background workload would escape to the
+# host init process.
+host_orphan_log=$(mktemp)
+cleanup_paths+=("$host_orphan_log")
+"${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay --pid host -- \
+  /bin/sh -c '/bin/busybox sleep 30 & printf "%s\n" "$!"' >"$host_orphan_log"
+host_orphan_pid=$(cat "$host_orphan_log")
+if [[ ! $host_orphan_pid =~ ^[0-9]+$ ]]; then
+  echo "host-pid workload did not report its background PID" >&2
+  exit 1
+fi
+for _ in $(seq 1 100); do
+  [[ ! -e /proc/$host_orphan_pid ]] && break
+  sleep 0.02
+done
+if [[ -e /proc/$host_orphan_pid ]]; then
+  echo "--pid host left descendant $host_orphan_pid running" >&2
+  if (( EUID == 0 )); then
+    kill -KILL "$host_orphan_pid" >/dev/null 2>&1 || true
+  else
+    sudo kill -KILL "$host_orphan_pid" >/dev/null 2>&1 || true
+  fi
+  exit 1
+fi
+
 # A supervisor such as systemd stops a foreground run with SIGTERM. The parent
 # must translate that request into the resolved image/operator stop signal.
 foreground_stop_log=$(mktemp)
@@ -224,6 +285,22 @@ grep -Fq read-exec-it-stdin <<<"$exec_it"
 "${zerun[@]}" kill --signal TERM "$exec_id" >/dev/null
 "${zerun[@]}" wait "$exec_id" >/dev/null
 "${zerun[@]}" rm "$exec_id" >/dev/null
+
+# Detached exec must not try to re-enter namespaces the container shares with
+# the host. Re-entering them can fail for rootless callers or select the wrong
+# namespace, so verify the persisted modes drive the exec join mask.
+host_ns_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
+  --pid host --ipc host --uts host --init -- /bin/sh -c 'sleep 30')
+cleanup_ids+=("$host_ns_id")
+host_ns_exec=$("${zerun[@]}" exec "$host_ns_id" /bin/sh -c \
+  'printf "%s\n%s\n%s\n" "$(/bin/busybox readlink /proc/self/ns/pid)" "$(/bin/busybox readlink /proc/self/ns/ipc)" "$(/bin/busybox readlink /proc/self/ns/uts)"')
+mapfile -t host_ns_exec_namespaces <<<"$host_ns_exec"
+test "${host_ns_exec_namespaces[0]}" = "$host_pid_ns"
+test "${host_ns_exec_namespaces[1]}" = "$host_ipc_ns"
+test "${host_ns_exec_namespaces[2]}" = "$host_uts_ns"
+"${zerun[@]}" kill --signal TERM "$host_ns_id" >/dev/null
+"${zerun[@]}" wait "$host_ns_id" >/dev/null
+"${zerun[@]}" rm "$host_ns_id" >/dev/null
 
 # Restart must stop and resume the same detached record rather than creating a
 # replacement container. Verify that the workload ran once before and once

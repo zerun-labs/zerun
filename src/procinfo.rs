@@ -6,6 +6,7 @@
 //! by comparing `/proc/<pid>/ns/pid` link targets with the container init's.
 
 use crate::syscalls;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 
@@ -65,6 +66,40 @@ fn bad_link(text: &str) -> io::Error {
         io::ErrorKind::InvalidData,
         format!("malformed ns link {text}"),
     )
+}
+
+/// Return the direct children of `pid`, including children created by any of
+/// its threads. Linux exposes one `children` file per task, and a runtime
+/// process may have helper threads that fork container descendants.
+///
+/// This is used only after a `--pid host` workload's top-level process exits,
+/// when the runtime is a child subreaper and can reap otherwise orphaned
+/// container processes without a delegated cgroup.
+pub fn direct_child_pids(pid: i32) -> io::Result<Vec<i32>> {
+    if pid <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process id must be positive",
+        ));
+    }
+    let mut children = BTreeSet::new();
+    for entry in fs::read_dir(format!("/proc/{pid}/task"))? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(text) = fs::read_to_string(entry.path().join("children")) else {
+            continue;
+        };
+        for child in text
+            .split_whitespace()
+            .filter_map(|s| s.parse::<i32>().ok())
+        {
+            if child > 0 {
+                children.insert(child);
+            }
+        }
+    }
+    Ok(children.into_iter().collect())
 }
 
 /// Read the kernel starttime for a process from `/proc/<pid>/stat`.

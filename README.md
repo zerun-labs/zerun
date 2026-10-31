@@ -190,6 +190,11 @@ Run options (current subset):
 --device-write-iops DEV:COUNT cgroup v2 io.max
 --ulimit TYPE=SOFT[:HARD]     per-process rlimit (repeatable; -1/unlimited)
 -h, --hostname H     container hostname (new UTS namespace)
+--pid private|host   private PID namespace (default) or share the host PID namespace
+--ipc private|host   private IPC and /dev/shm (default) or share host IPC and /dev/shm
+--uts private|host   private UTS namespace (default) or share the host hostname
+                     (host PID/IPC/UTS sharing is security-sensitive; --hostname is
+                     incompatible with --uts host)
 -u, --user USER[:GROUP]
                      run as a container user (numeric or from the image's /etc/passwd;
                      image config USER applies automatically when --user is absent)

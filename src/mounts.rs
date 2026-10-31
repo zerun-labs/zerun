@@ -13,7 +13,7 @@ use libc::{
     MS_RELATIME, MS_REMOUNT, MS_STRICTATIME,
 };
 use std::fs::{File, OpenOptions};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -307,6 +307,8 @@ pub struct RootfsConfig<'a> {
     /// Directory to pivot into (== overlay.merged when an overlay is used).
     pub rootfs: &'a Path,
     pub hostname: Option<&'a str>,
+    /// Set the UTS hostname. False when sharing the host UTS namespace.
+    pub set_hostname: bool,
     /// rootless (NEWUSER) cannot mknod; bind-mount whitelisted host devices instead.
     pub rootless: bool,
     /// When set, first make `rootfs` a writable overlay whose lower is read-only.
@@ -315,6 +317,8 @@ pub struct RootfsConfig<'a> {
     pub volumes: &'a [BindMount],
     /// O_PATH handles for rootless host devices opened before pivot_root.
     pub device_sources: &'a [Option<File>],
+    /// Detached clone of the host `/dev/shm` mount for `--ipc host`.
+    pub host_shm: Option<RawFd>,
 }
 
 /// Full root migration + pseudo-filesystem assembly, run by the child inside the
@@ -354,12 +358,14 @@ pub fn setup_rootfs(cfg: &RootfsConfig) -> ZResult<()> {
     syscalls::chdir("/")?;
     trace::mark("child:pivot_root:done");
 
-    mount_pseudo_fs(cfg.rootless)?;
+    mount_pseudo_fs(cfg.rootless, cfg.host_shm)?;
     populate_dev(cfg.rootless, cfg.device_sources)?;
     apply_masked_and_readonly(cfg.rootless)?;
 
-    if let Some(h) = cfg.hostname {
-        syscalls::sethostname(h)?;
+    if cfg.set_hostname {
+        if let Some(h) = cfg.hostname {
+            syscalls::sethostname(h)?;
+        }
     }
     trace::mark("child:mount:done");
     Ok(())
@@ -494,11 +500,12 @@ fn setup_overlay(rootless: bool, ovl: &OverlayPaths) -> ZResult<()> {
 /// rootful: any critical mount failure is an error. rootless: locked-down hosts
 /// (or nested-container LSM policy) may refuse userns mounts of proc/sys; in that
 /// case warn and continue, with `doctor` explaining the environment limit.
-fn mount_pseudo_fs(rootless: bool) -> ZResult<()> {
+fn mount_pseudo_fs(rootless: bool, host_shm: Option<RawFd>) -> ZResult<()> {
     let common = MS_NOSUID | MS_NOEXEC | MS_NODEV;
 
-    // /proc must be mounted inside the new PID namespace, otherwise the container
-    // would see the host process list.
+    // /proc is remounted in the container's mount namespace. Under the default
+    // private PID namespace it shows only container processes; with --pid host
+    // it intentionally exposes the host process list.
     syscalls::mkdir_p("/proc", 0o555)?;
     let proc_res = syscalls::mount(
         Some("proc"),
@@ -540,17 +547,25 @@ fn mount_pseudo_fs(rootless: bool) -> ZResult<()> {
         "/dev/pts",
     )?;
     syscalls::mkdir_p("/dev/shm", 0o1777)?;
-    require_or_warn(
-        rootless,
-        syscalls::mount(
-            Some("shm"),
+    if let Some(source) = host_shm {
+        require_or_warn(
+            rootless,
+            syscalls::move_mount(source, "/dev/shm"),
+            "host /dev/shm for --ipc host",
+        )?;
+    } else {
+        require_or_warn(
+            rootless,
+            syscalls::mount(
+                Some("shm"),
+                "/dev/shm",
+                Some("tmpfs"),
+                MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                Some("mode=1777,size=65536k"),
+            ),
             "/dev/shm",
-            Some("tmpfs"),
-            MS_NOSUID | MS_NODEV | MS_NOEXEC,
-            Some("mode=1777,size=65536k"),
-        ),
-        "/dev/shm",
-    )?;
+        )?;
+    }
     syscalls::mkdir_p("/dev/mqueue", 0o755)?;
     require_or_warn(
         rootless,
@@ -654,6 +669,13 @@ pub fn open_rootless_device_sources(rootless: bool) -> Vec<Option<File>> {
             }
         })
         .collect()
+}
+
+/// Capture the host `/dev/shm` mount before pivot_root. `--ipc host` installs
+/// this detached clone after the private `/dev` tmpfs so POSIX shared memory
+/// remains shared with the host.
+pub fn clone_host_shm_mount() -> ZResult<std::os::fd::OwnedFd> {
+    syscalls::open_tree_clone("/dev/shm")
 }
 
 /// Minimal /dev device nodes and conventional symlinks.

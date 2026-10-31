@@ -24,12 +24,13 @@ use crate::mounts::{
 use crate::pty::PtyPair;
 use crate::seccomp::SeccompMode;
 use crate::security;
-use crate::state::ContainerMetrics;
+use crate::state::{ContainerMetrics, NamespaceMode, NamespaceModes};
 use crate::syscalls;
 use crate::trace;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NetMode {
@@ -48,6 +49,8 @@ pub struct RunSpec {
     pub rootfs: PathBuf,
     pub argv: Vec<String>,
     pub hostname: Option<String>,
+    /// PID/IPC/UTS namespace sharing for this container.
+    pub namespaces: NamespaceModes,
     pub net: NetMode,
     pub use_init: bool,
     pub limits: ResourceLimits,
@@ -214,9 +217,9 @@ where
         None
     };
 
-    // clone flags: PID/MNT/UTS/IPC/CGROUP on by default; NEWNET additionally
-    // for --net none and --net bridge. Non-root automatically adds NEWUSER (the
-    // kernel guarantees the user namespace is created first).
+    // clone flags: MNT/CGROUP are always private. PID/IPC/UTS/NET are private
+    // unless the operator explicitly selected host sharing. Non-root
+    // automatically adds NEWUSER (the kernel creates it first).
     if rootless && matches!(spec.net, NetMode::Bridge) {
         return Err(crate::zerr!(
             "--net bridge needs CAP_NET_ADMIN in the host network namespace; \
@@ -242,17 +245,13 @@ where
     } else {
         None
     };
-    let mut flags = libc::CLONE_NEWPID
-        | libc::CLONE_NEWNS
-        | libc::CLONE_NEWUTS
-        | libc::CLONE_NEWIPC
-        | libc::CLONE_NEWCGROUP
-        | libc::SIGCHLD;
-    if !matches!(spec.net, NetMode::Host) {
-        flags |= libc::CLONE_NEWNET;
-    }
-    if rootless {
-        flags |= libc::CLONE_NEWUSER;
+    let flags = clone_flags(rootless, spec.namespaces, spec.net);
+    if matches!(spec.namespaces.pid, NamespaceMode::Host) {
+        // In a private PID namespace, killing the namespace init kills every
+        // remaining task. With --pid host there is no such kernel boundary, so
+        // make this runtime a subreaper and explicitly sweep descendants after
+        // the top-level workload exits.
+        syscalls::become_child_subreaper()?;
     }
     // The host euid/egid must be captured before clone: once the child is inside
     // the new user namespace and before the mapping is written, geteuid() reports
@@ -333,6 +332,7 @@ where
         let msg = String::from_utf8_lossy(&buf[..n]);
         eprintln!("zerun: container setup failed: {msg}");
         let _ = wait_child(pid);
+        reap_host_pid_descendants(spec.namespaces);
         if let Some(net) = &host_net {
             crate::network::teardown_host_side(net);
         }
@@ -366,6 +366,7 @@ where
         // release every host-side resource before returning the error.
         let _ = syscalls::kill(pid, libc::SIGKILL);
         let _ = wait_child(pid);
+        reap_host_pid_descendants(spec.namespaces);
         if let Some(net) = &host_net {
             crate::network::teardown_host_side(net);
         }
@@ -391,6 +392,7 @@ where
                 // must follow the same cleanup path as a failed start hook.
                 let _ = syscalls::kill(pid, libc::SIGKILL);
                 let _ = wait_child(pid);
+                reap_host_pid_descendants(spec.namespaces);
                 if let Some(net) = &host_net {
                     crate::network::teardown_host_side(net);
                 }
@@ -404,7 +406,14 @@ where
     } else {
         None
     };
-    let code = wait_child(pid)?;
+    let code = match wait_child(pid) {
+        Ok(code) => code,
+        Err(error) => {
+            reap_host_pid_descendants(spec.namespaces);
+            return Err(error);
+        }
+    };
+    reap_host_pid_descendants(spec.namespaces);
     if let Some(net) = &host_net {
         crate::network::teardown_host_side(net);
     }
@@ -423,6 +432,60 @@ where
     }
     trace::mark("parent:end");
     Ok(RunExit { code, metrics })
+}
+
+/// Build the clone(2) namespace mask for one container launch.
+fn clone_flags(rootless: bool, namespaces: NamespaceModes, net: NetMode) -> libc::c_int {
+    let mut flags = libc::CLONE_NEWNS | libc::CLONE_NEWCGROUP | libc::SIGCHLD;
+    if matches!(namespaces.pid, NamespaceMode::Private) {
+        flags |= libc::CLONE_NEWPID;
+    }
+    if matches!(namespaces.uts, NamespaceMode::Private) {
+        flags |= libc::CLONE_NEWUTS;
+    }
+    if matches!(namespaces.ipc, NamespaceMode::Private) {
+        flags |= libc::CLONE_NEWIPC;
+    }
+    if !matches!(net, NetMode::Host) {
+        flags |= libc::CLONE_NEWNET;
+    }
+    if rootless {
+        flags |= libc::CLONE_NEWUSER;
+    }
+    flags
+}
+
+/// Kill and reap processes that were reparented to the runtime after a
+/// `--pid host` workload's top-level process exited. The runtime is a child
+/// subreaper in this mode, so each SIGKILL round exposes the next generation of
+/// descendants as direct children. Private PID namespaces do not need this
+/// sweep: the kernel kills every task when namespace init exits.
+fn reap_host_pid_descendants(namespaces: NamespaceModes) {
+    if !matches!(namespaces.pid, NamespaceMode::Host) {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let children = match crate::procinfo::direct_child_pids(crate::syscalls::process_id()) {
+            Ok(children) => children,
+            Err(error) => {
+                eprintln!("zerun: warning: inspect --pid host descendants: {error}");
+                return;
+            }
+        };
+        if children.is_empty() {
+            return;
+        }
+        for pid in children {
+            crate::syscalls::signal_process(pid, libc::SIGKILL);
+        }
+        while matches!(crate::syscalls::wait_pid(-1, libc::WNOHANG), Ok(Some(_))) {}
+        if Instant::now() >= deadline {
+            eprintln!("zerun: warning: some --pid host descendants did not exit after SIGKILL");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// Best-effort release of a bridge IP back to the file IPAM.
@@ -515,15 +578,25 @@ fn child_stage(
 
     // Open rootless device handles before pivot_root hides the host /dev.
     let device_sources = open_rootless_device_sources(identity.rootless);
+    // Host IPC shares the host POSIX shared-memory directory as well as SysV
+    // IPC. Clone the mount before pivot_root detaches the old root, then attach
+    // it after the private /dev is built.
+    let host_shm = if matches!(spec.namespaces.ipc, NamespaceMode::Host) {
+        Some(crate::mounts::clone_host_shm_mount()?)
+    } else {
+        None
+    };
 
     // 1. Root migration + pseudo-filesystems.
     let cfg = RootfsConfig {
         rootfs: &spec.rootfs,
         hostname: spec.hostname.as_deref(),
+        set_hostname: matches!(spec.namespaces.uts, NamespaceMode::Private),
         rootless: identity.rootless,
         overlay: spec.overlay.as_ref(),
         volumes: &spec.volumes,
         device_sources: &device_sources,
+        host_shm: host_shm.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
     };
     setup_rootfs(&cfg)?;
 
@@ -767,6 +840,44 @@ mod tests {
     use super::*;
     use crate::network::HostEntry;
     use std::net::IpAddr;
+
+    #[test]
+    fn clone_flags_create_private_namespaces_by_default() {
+        let flags = clone_flags(false, NamespaceModes::default(), NetMode::None);
+        for namespace in [
+            libc::CLONE_NEWNS,
+            libc::CLONE_NEWCGROUP,
+            libc::CLONE_NEWPID,
+            libc::CLONE_NEWUTS,
+            libc::CLONE_NEWIPC,
+            libc::CLONE_NEWNET,
+        ] {
+            assert_ne!(flags & namespace, 0);
+        }
+        assert_eq!(flags & libc::CLONE_NEWUSER, 0);
+        assert_ne!(flags & libc::SIGCHLD, 0);
+    }
+
+    #[test]
+    fn clone_flags_honor_host_namespace_modes() {
+        let modes = NamespaceModes {
+            pid: NamespaceMode::Host,
+            ipc: NamespaceMode::Host,
+            uts: NamespaceMode::Host,
+        };
+        let flags = clone_flags(true, modes, NetMode::Host);
+        for namespace in [
+            libc::CLONE_NEWPID,
+            libc::CLONE_NEWUTS,
+            libc::CLONE_NEWIPC,
+            libc::CLONE_NEWNET,
+        ] {
+            assert_eq!(flags & namespace, 0);
+        }
+        assert_ne!(flags & libc::CLONE_NEWNS, 0);
+        assert_ne!(flags & libc::CLONE_NEWCGROUP, 0);
+        assert_ne!(flags & libc::CLONE_NEWUSER, 0);
+    }
 
     #[test]
     fn supervisor_term_uses_the_resolved_stop_signal() {

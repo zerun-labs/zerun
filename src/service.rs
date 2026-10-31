@@ -114,6 +114,16 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--hostname".into());
         run_args.push(v.clone());
     }
+    for (flag, mode) in [
+        ("--pid", a.namespaces.pid),
+        ("--ipc", a.namespaces.ipc),
+        ("--uts", a.namespaces.uts),
+    ] {
+        if mode == crate::state::NamespaceMode::Host {
+            run_args.push(flag.into());
+            run_args.push(mode.label().into());
+        }
+    }
     if let Some(v) = &a.user {
         run_args.push("--user".into());
         run_args.push(v.clone());
@@ -551,6 +561,22 @@ mod tests {
         assert!(unit.contains("--group-add staff"));
         assert!(unit.contains("--group-add 44"));
         assert!(unit.contains("--group-add 1001"));
+    }
+
+    #[test]
+    fn renders_host_namespace_modes() {
+        let a = args(&[
+            "--pid=host",
+            "--ipc",
+            "host",
+            "--uts=host",
+            "alpine",
+            "true",
+        ]);
+        let unit = render(Path::new("/usr/local/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains("--pid host"));
+        assert!(unit.contains("--ipc host"));
+        assert!(unit.contains("--uts host"));
     }
 
     #[test]

@@ -5,8 +5,8 @@
 //!   * the CLI opens a pidfd for container PID 1, revalidates its persisted
 //!     process identity, then forks a joiner (C) with that stable task handle;
 //!   * C enters the target namespaces through that pidfd — the private `user`
-//!     namespace first (only rootless containers have one), then
-//!     mnt/uts/ipc/net/cgroup/pid in one operation;
+//!     namespace first (only rootless containers have one), then the private
+//!     mnt/uts/ipc/net/cgroup/pid namespaces in one operation;
 //!   * before joining the mount namespace, C opens the host cgroup's
 //!     `cgroup.procs` file; its descriptor remains valid after `/sys` becomes
 //!     the container view;
@@ -15,10 +15,11 @@
 //!     chdir()s to the container working directory and execve()s the requested command.
 //!
 //! Joining the mount namespace means D shares the container's live rootfs and
-//! its /proc /dev /sys mounts — exactly what `docker exec` shows. D is born as
-//! a child of the container's PID 1 from the namespace's point of view (its
-//! real parent C lives outside and reaps it through the host PID), so it is
-//! reaped like any other container process.
+//! its /proc /dev /sys mounts — exactly what `docker exec` shows. With a
+//! private PID namespace D is born as a child of the container's PID 1 from
+//! that namespace's point of view (its real parent C lives outside and reaps it
+//! through the host PID). With `--pid host` D remains an ordinary process in
+//! the host PID namespace.
 use crate::error::ZResult;
 use crate::pty::{self, PtyPair};
 use crate::state::{ContainerState, Status};
@@ -226,7 +227,14 @@ fn joiner(
         None => None,
     };
 
-    let (user_namespace, namespaces) = namespace_flags(state.rootless);
+    let (user_namespace, namespaces) =
+        match namespace_flags(state.rootless, state.namespaces, &state.net) {
+            Ok(flags) => flags,
+            Err(error) => {
+                eprintln!("zerun exec: {error}");
+                return 1;
+            }
+        };
     if let Some(user_namespace) = user_namespace {
         if let Err(error) = crate::syscalls::setns(pidfd, user_namespace) {
             eprintln!("zerun exec: setns(user): {error}");
@@ -237,8 +245,9 @@ fn joiner(
         eprintln!("zerun exec: setns(container namespaces): {error}");
         return 1;
     }
-    // Joining the PID namespace takes effect only for children; the worker
-    // fork below is therefore the first process created inside that namespace.
+    // Joining a private PID namespace takes effect only for children; the
+    // worker fork below is therefore the first process created inside it. When
+    // the container shares the host PID namespace, C is already in it.
 
     let tty_master = pty_pair.as_ref().map_or(-1, PtyPair::master);
     let tty_slave = pty_pair.as_ref().map_or(-1, PtyPair::slave);
@@ -294,15 +303,37 @@ fn joiner(
 
 /// Select pidfd `setns` flags. User namespaces must be entered separately
 /// first; joining PID takes effect only for children created afterward.
-fn namespace_flags(rootless: bool) -> (Option<libc::c_int>, libc::c_int) {
+/// Namespaces explicitly shared with the host are already occupied by `exec`
+/// and must not appear in the join mask (rootless callers may lack privileges
+/// in the host namespace that owns them).
+fn namespace_flags(
+    rootless: bool,
+    modes: crate::state::NamespaceModes,
+    net: &str,
+) -> ZResult<(Option<libc::c_int>, libc::c_int)> {
+    use crate::state::NamespaceMode;
+
     let user = rootless.then_some(libc::CLONE_NEWUSER);
-    let rest = libc::CLONE_NEWNS
-        | libc::CLONE_NEWUTS
-        | libc::CLONE_NEWIPC
-        | libc::CLONE_NEWNET
-        | libc::CLONE_NEWCGROUP
-        | libc::CLONE_NEWPID;
-    (user, rest)
+    let mut rest = libc::CLONE_NEWNS | libc::CLONE_NEWCGROUP;
+    if matches!(modes.uts, NamespaceMode::Private) {
+        rest |= libc::CLONE_NEWUTS;
+    }
+    if matches!(modes.ipc, NamespaceMode::Private) {
+        rest |= libc::CLONE_NEWIPC;
+    }
+    match net {
+        "host" => {}
+        "none" | "bridge" => rest |= libc::CLONE_NEWNET,
+        other => {
+            return Err(crate::zerr!(
+                "container has invalid persisted network mode '{other}'"
+            ))
+        }
+    }
+    if matches!(modes.pid, NamespaceMode::Private) {
+        rest |= libc::CLONE_NEWPID;
+    }
+    Ok((user, rest))
 }
 
 /// The in-container worker: cgroup join, cwd, env, hardening, exec.
@@ -545,10 +576,12 @@ fn upsert(env: &mut Vec<(String, String)>, key: &str, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::{join_cgroup, namespace_flags, open_cgroup_procs, read_exec_pid};
+    use crate::state::{NamespaceMode, NamespaceModes};
 
     #[test]
     fn user_namespace_is_joined_separately_before_other_namespaces() {
-        let (user_namespace, namespaces) = namespace_flags(true);
+        let (user_namespace, namespaces) =
+            namespace_flags(true, NamespaceModes::default(), "none").unwrap();
         assert_eq!(user_namespace, Some(libc::CLONE_NEWUSER));
         assert_eq!(
             namespaces,
@@ -563,10 +596,32 @@ mod tests {
 
     #[test]
     fn rootful_namespace_join_skips_the_initial_user_namespace() {
-        let (user_namespace, namespaces) = namespace_flags(false);
+        let (user_namespace, namespaces) =
+            namespace_flags(false, NamespaceModes::default(), "bridge").unwrap();
         assert_eq!(user_namespace, None);
         assert_ne!(namespaces & libc::CLONE_NEWUSER, libc::CLONE_NEWUSER);
         assert_ne!(namespaces & libc::CLONE_NEWPID, 0);
+    }
+
+    #[test]
+    fn host_shared_namespaces_are_not_rejoined_by_exec() {
+        let modes = NamespaceModes {
+            pid: NamespaceMode::Host,
+            ipc: NamespaceMode::Host,
+            uts: NamespaceMode::Host,
+        };
+        let (_, flags) = namespace_flags(false, modes, "host").unwrap();
+        assert_eq!(flags & libc::CLONE_NEWPID, 0);
+        assert_eq!(flags & libc::CLONE_NEWIPC, 0);
+        assert_eq!(flags & libc::CLONE_NEWUTS, 0);
+        assert_eq!(flags & libc::CLONE_NEWNET, 0);
+        assert_ne!(flags & libc::CLONE_NEWNS, 0);
+        assert_ne!(flags & libc::CLONE_NEWCGROUP, 0);
+    }
+
+    #[test]
+    fn malformed_persisted_network_mode_is_rejected() {
+        assert!(namespace_flags(false, NamespaceModes::default(), "network-ish").is_err());
     }
 
     #[test]

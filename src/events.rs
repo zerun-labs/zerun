@@ -281,6 +281,7 @@ mod tests {
             finished: exit.map(|_| "2026-09-10T00:00:05Z".to_string()),
             rootless: false,
             net: "none".to_string(),
+            namespaces: Default::default(),
             ports: vec![],
             port_protocols: None,
             port_ips: None,
