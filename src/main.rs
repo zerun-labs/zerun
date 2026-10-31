@@ -566,10 +566,6 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     Ok(a)
 }
 
-/// Parse `-p`/`--publish` values. Supported forms:
-///   HOST[:CONTAINER][/tcp|/udp]
-///   ADDRESS:HOST[:CONTAINER][/tcp|/udp]
-/// IPv6 addresses are bracketed (`[::1]:8080:80`).
 fn append_group_additions(target: &mut Vec<String>, raw: &str) -> Result<(), String> {
     for group in
         security::parse_group_add_values(raw).map_err(|error| format!("--group-add: {error}"))?
@@ -581,6 +577,10 @@ fn append_group_additions(target: &mut Vec<String>, raw: &str) -> Result<(), Str
     Ok(())
 }
 
+/// Parse `-p`/`--publish` values. Supported forms:
+///   HOST[:CONTAINER][/tcp|/udp]
+///   ADDRESS:HOST[:CONTAINER][/tcp|/udp]
+/// IPv6 addresses are bracketed (`[::1]:8080:80`).
 fn parse_publish(v: &str) -> Result<network::PublishedPort, String> {
     use std::net::IpAddr;
 
