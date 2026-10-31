@@ -78,6 +78,9 @@ pub struct RunSpec {
     /// "1000:1000". None keeps the root user (mapped to the host user in
     /// rootless mode).
     pub user: Option<String>,
+    /// Additional supplementary groups (`--group-add`), resolved inside the
+    /// container mount namespace before hardening.
+    pub group_add: Vec<String>,
     /// Remount the container root read-only before exec (`--read-only`);
     /// separate volume/tmpfs mounts stay writable.
     pub readonly: bool,
@@ -577,8 +580,16 @@ fn child_stage(
     trace::mark("child:ulimit:done");
 
     // 3. Security hardening: no_new_privs -> supplementary groups -> capability
-    //    drop -> seccomp profile.
-    security::harden(spec.seccomp, &spec.capabilities, identity.rootless)?;
+    //    drop -> seccomp profile. Group names resolve against the container's
+    //    own /etc/group after pivot_root.
+    let supplementary_groups =
+        security::resolve_group_additions(&spec.group_add, identity.rootless)?;
+    security::harden(
+        spec.seccomp,
+        &spec.capabilities,
+        identity.rootless,
+        &supplementary_groups,
+    )?;
 
     // 3a. Drop to the requested container user while CAP_SETUID/SETGID are still
     // effective (the capability set was trimmed but these two are retained).

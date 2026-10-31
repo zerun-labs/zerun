@@ -289,6 +289,7 @@ mod tests {
             env: vec![],
             cwd: None,
             user: None,
+            group_add: None,
             stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
             stop_timeout: crate::state::DEFAULT_STOP_TIMEOUT_SECS,
             restart_policy: crate::restart::RestartPolicy::No,

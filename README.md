@@ -193,6 +193,8 @@ Run options (current subset):
 -u, --user USER[:GROUP]
                      run as a container user (numeric or from the image's /etc/passwd;
                      image config USER applies automatically when --user is absent)
+--group-add NAME|GID add a supplementary group (repeatable/comma-separated; names
+                     resolve in the container's /etc/group)
 --stop-signal SIGNAL stop/restart signal name or number 1-64 (image STOPSIGNAL;
                      default SIGTERM; SIGTERM sent to a foreground supervisor is
                      translated to this signal)
@@ -242,6 +244,12 @@ limit defaults to the soft value, `-1`/`unlimited` removes the ceiling, and a
 repeated type uses its last value. Detached restart and `exec` restore the
 persisted limits; raising a hard limit above the host ceiling still requires
 the corresponding host privilege and otherwise fails explicitly.
+
+`--group-add` replaces the inherited supplementary group list, whether the workload
+runs as root or another user. Names are resolved against the container's `/etc/group`
+after `pivot_root`; numeric gids need no group file. Rootless containers deny `setgroups`
+and map only gid 0, so group additions fail explicitly. Detached restart/exec and generated
+service units retain the same launch policy.
 
 `ZERUN_REGISTRY_MIRRORS` (comma-separated), a zerun config file
 (`/etc/zerun/config.toml` with `[registry] mirrors = [...]`, overridable via

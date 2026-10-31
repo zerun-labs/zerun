@@ -132,9 +132,22 @@ if command -v setpriv >/dev/null 2>&1; then
   fi
   inherited_groups=$("${grouped_zerun[@]}" run --rootfs "$rootfs" --net none     --no-overlay --cap-drop ALL -- /bin/sh -c '/bin/busybox id -G')
   grep -Fx 0 <<<"$inherited_groups" >/dev/null
+  explicit_groups=$("${grouped_zerun[@]}" run --rootfs "$rootfs" --net none     --no-overlay --group-add testgroup -- /bin/busybox id -G)
+  grep -qw 4343 <<<"$explicit_groups"
+  if grep -qw 4242 <<<"$explicit_groups"; then
+    echo "explicit --group-add did not replace the inherited host groups: $explicit_groups" >&2
+    exit 1
+  fi
 else
   echo "setpriv unavailable; skipping supplementary-group isolation check" >&2
 fi
+
+# Explicit supplementary groups are resolved in the container and replace the
+# inherited host list.
+group_add_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+  --user testuser --group-add testgroup --group-add 4344 -- /bin/busybox id -G)
+grep -qw 4343 <<<"$group_add_output"
+grep -qw 4344 <<<"$group_add_output"
 
 # The default writable path must use overlayfs (or the documented rootless
 # fallback) and allow writes without modifying the source rootfs.
@@ -177,13 +190,16 @@ grep -Fx 'soft=64 hard=96' <<<"$ulimit_output" >/dev/null
 # Detached exec must join the same cgroup as the container. This also guards
 # the persisted cgroup-path validation used by the exec joiner.
 exec_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
-  --pids 32 --ulimit nofile=64:96 --init -- /bin/sh -c 'sleep 30')
+  --pids 32 --ulimit nofile=64:96 --group-add testgroup --init -- \
+  /bin/sh -c 'sleep 30')
 cleanup_ids+=("$exec_id")
 exec_output=$("${zerun[@]}" exec "$exec_id" /bin/sh -c 'printf "exec-ok\\n"')
 grep -Fx exec-ok <<<"$exec_output" >/dev/null
 exec_limits=$("${zerun[@]}" exec "$exec_id" /bin/sh -c \
   'printf "soft=%s hard=%s\n" "$(ulimit -Sn)" "$(ulimit -Hn)"')
 grep -Fx 'soft=64 hard=96' <<<"$exec_limits" >/dev/null
+exec_groups=$("${zerun[@]}" exec "$exec_id" /bin/busybox id -G)
+grep -qw 4343 <<<"$exec_groups"
 exec_uid=$("${zerun[@]}" exec --user testuser "$exec_id" /bin/busybox id -u)
 exec_gid=$("${zerun[@]}" exec --user testuser "$exec_id" /bin/busybox id -g)
 test "$exec_uid:$exec_gid" = 4242:4344

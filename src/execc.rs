@@ -416,6 +416,16 @@ fn worker(
         None => crate::security::CapabilitySet::default(),
     };
     let seccomp = state.seccomp.unwrap_or_default();
+    let supplementary_groups = match state.group_add.as_deref() {
+        Some(specs) => match crate::security::resolve_group_additions(specs, state.rootless) {
+            Ok(groups) => groups,
+            Err(error) => {
+                eprintln!("zerun exec: {error}");
+                return 1;
+            }
+        },
+        None => Vec::new(),
+    };
     if let Some(specs) = state.ulimits.as_deref() {
         let limits = match crate::rlimit::UlimitSet::from_specs(specs) {
             Ok(limits) => limits,
@@ -429,7 +439,12 @@ fn worker(
             return 1;
         }
     }
-    if let Err(e) = crate::security::harden(seccomp, &capabilities, state.rootless) {
+    if let Err(e) = crate::security::harden(
+        seccomp,
+        &capabilities,
+        state.rootless,
+        &supplementary_groups,
+    ) {
         eprintln!("zerun exec: {e}");
         return 1;
     }

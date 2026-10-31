@@ -348,6 +348,10 @@ pub struct ContainerState {
     /// exec; `zerun exec` re-applies it. None = root.
     #[serde(default)]
     pub user: Option<String>,
+    /// Additional supplementary group names or numeric gids (`--group-add`).
+    /// None = legacy record with only the primary group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_add: Option<Vec<String>>,
     /// Signal used by `stop`/`restart` before escalating to SIGKILL. Older
     /// records and the default configuration use SIGTERM.
     #[serde(default = "default_stop_signal")]
@@ -695,6 +699,7 @@ mod tests {
             env: Vec::new(),
             cwd: None,
             user: None,
+            group_add: None,
             stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
             stop_timeout: DEFAULT_STOP_TIMEOUT_SECS,
             restart_policy: crate::restart::RestartPolicy::No,
@@ -726,6 +731,7 @@ mod tests {
         value.as_object_mut().unwrap().remove("reaper_pid");
         value.as_object_mut().unwrap().remove("reaper_start_time");
         value.as_object_mut().unwrap().remove("ulimits");
+        value.as_object_mut().unwrap().remove("group_add");
         let state: ContainerState = serde_json::from_value(value).unwrap();
         assert_eq!(state.stop_signal, libc::SIGTERM);
         assert_eq!(state.stop_timeout, DEFAULT_STOP_TIMEOUT_SECS);
@@ -735,6 +741,7 @@ mod tests {
         assert_eq!(state.reaper_pid, None);
         assert_eq!(state.reaper_start_time, None);
         assert_eq!(state.ulimits, None);
+        assert_eq!(state.group_add, None);
     }
 
     #[test]
@@ -808,6 +815,7 @@ mod tests {
             env: vec![],
             cwd: None,
             user: None,
+            group_add: None,
             stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
             stop_timeout: DEFAULT_STOP_TIMEOUT_SECS,
             restart_policy: crate::restart::RestartPolicy::No,
@@ -904,6 +912,7 @@ mod tests {
             env: vec![],
             cwd: None,
             user: None,
+            group_add: None,
             stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
             stop_timeout: DEFAULT_STOP_TIMEOUT_SECS,
             restart_policy: crate::restart::RestartPolicy::No,

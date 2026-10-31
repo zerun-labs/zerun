@@ -150,6 +150,8 @@ struct RunArgs {
     /// Container user (`--user USER[:GROUP]`; image `config.User` wins when no
     /// explicit flag is given).
     user: Option<String>,
+    /// Additional container groups (`--group-add NAME|GID`).
+    group_add: Vec<String>,
     /// Signal used by `stop`/`restart` (`--stop-signal`); an image
     /// `config.StopSignal` is used when this is absent.
     stop_signal: Option<i32>,
@@ -268,6 +270,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 a.ulimits
                     .insert_spec(&value)
                     .map_err(|error| format!("--ulimit: {error}"))?;
+            }
+            "--group-add" => {
+                let value = next_value(args, &mut i, "--group-add")?;
+                append_group_additions(&mut a.group_add, &value)?;
             }
             "--cpus" => {
                 let v = next_value(args, &mut i, "--cpus")?;
@@ -514,6 +520,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                     .map_err(|error| format!("--ulimit: {error}"))?;
                 i += 1;
             }
+            other if other.starts_with("--group-add=") => {
+                append_group_additions(&mut a.group_add, &other["--group-add=".len()..])?;
+                i += 1;
+            }
             other if other.starts_with("--cap-add=") => {
                 a.cap_add.extend(security::parse_capability_list(
                     &other["--cap-add=".len()..],
@@ -560,6 +570,17 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
 ///   HOST[:CONTAINER][/tcp|/udp]
 ///   ADDRESS:HOST[:CONTAINER][/tcp|/udp]
 /// IPv6 addresses are bracketed (`[::1]:8080:80`).
+fn append_group_additions(target: &mut Vec<String>, raw: &str) -> Result<(), String> {
+    for group in
+        security::parse_group_add_values(raw).map_err(|error| format!("--group-add: {error}"))?
+    {
+        if !target.contains(&group) {
+            target.push(group);
+        }
+    }
+    Ok(())
+}
+
 fn parse_publish(v: &str) -> Result<network::PublishedPort, String> {
     use std::net::IpAddr;
 
@@ -1122,6 +1143,10 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
     } else {
         a.ulimits.clone()
     };
+    let group_add = match resume.as_ref().and_then(|st| st.group_add.as_ref()) {
+        Some(values) => values.clone(),
+        None => a.group_add.clone(),
+    };
 
     drop(image_store_lease);
     let container_fs = if let Some(st) = &resume {
@@ -1213,6 +1238,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         seccomp,
         capabilities,
         ulimits,
+        group_add,
         tty: a.tty,
         interactive: a.interactive,
         overlay,
@@ -1639,6 +1665,7 @@ fn run_detached(
         env: Vec::new(),
         cwd: None,
         user: None,
+        group_add: None,
         stop_signal: signal::DEFAULT_STOP_SIGNAL,
         stop_timeout: state::DEFAULT_STOP_TIMEOUT_SECS,
         restart_policy: restart::RestartPolicy::No,
@@ -1702,6 +1729,7 @@ fn run_detached(
     st.capabilities = Some(spec.capabilities.names());
     st.seccomp = Some(spec.seccomp);
     st.ulimits = (!spec.ulimits.is_empty()).then(|| spec.ulimits.canonical());
+    st.group_add = (!spec.group_add.is_empty()).then(|| spec.group_add.clone());
     st.labels = info.labels;
     st.log = log_path.display().to_string();
     st.log_max_size = Some(info.log.max_size);
@@ -1901,6 +1929,9 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     }
     if let Some(v) = &a.user {
         args.extend(["--user".to_string(), v.clone()]);
+    }
+    for value in &a.group_add {
+        args.extend(["--group-add".to_string(), value.clone()]);
     }
     if let Some(v) = a.stop_signal {
         args.extend(["--stop-signal".to_string(), signal::name(v)]);
@@ -6606,6 +6637,7 @@ RUN OPTIONS:\n  \
   --ulimit TYPE=SOFT[:HARD]      per-process rlimit (repeatable; -1 = unlimited)\n  \
   -h, --hostname H    container hostname (new UTS namespace)\n  \
   -u, --user USER[:GROUP]  run as container user (numeric or /etc/passwd name)\n  \
+  --group-add NAME|GID     add a supplementary group (repeatable/comma-separated)\n  \
   --stop-signal SIGNAL     stop/restart signal (image StopSignal; default SIGTERM)\n  \
   --stop-timeout S         seconds before stop/restart sends SIGKILL (default 10)\n  \
   --restart POLICY        detached restart policy (no|on-failure[:max]|always|unless-stopped)\n  \
@@ -7305,6 +7337,41 @@ mod tests {
         let launch_args = detached_launch_args(&a, Path::new("/tmp/rootfs"));
         assert!(launch_args.contains(&"--user".to_string()));
         assert!(launch_args.contains(&"1000:1000".to_string()));
+    }
+
+    #[test]
+    fn parses_and_captures_group_additions() {
+        let args: Vec<_> = [
+            "--group-add",
+            "staff",
+            "--group-add=0044,1001",
+            "--group-add",
+            "44",
+            "alpine",
+            "id",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_run_args(&args).expect("--group-add");
+        assert_eq!(a.group_add, vec!["staff", "44", "1001"]);
+        let launch_args = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+        assert_eq!(
+            launch_args
+                .windows(2)
+                .filter(|pair| pair[0] == "--group-add")
+                .map(|pair| pair[1].as_str())
+                .collect::<Vec<_>>(),
+            vec!["staff", "44", "1001"]
+        );
+
+        for value in ["", "staff,", "staff:100", "-1", "4294967296"] {
+            let args: Vec<_> = ["--group-add", value, "alpine", "true"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            assert!(parse_run_args(&args).is_err(), "{value} should be rejected");
+        }
     }
 
     #[test]

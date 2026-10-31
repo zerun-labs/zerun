@@ -262,21 +262,22 @@ fn ensure_supported(cap: i32, last: i32) -> ZResult<()> {
 }
 
 /// Security sequence before the workload execs. Order matters: NO_NEW_PRIVS first,
-/// then inherited supplementary groups, capabilities, and seccomp. Clearing groups
-/// before the capability drop keeps `--cap-drop SETGID` usable for containers that
-/// remain uid/gid 0, while still preventing host group memberships from granting
+/// then the resolved supplementary groups, capabilities, and seccomp. Replacing
+/// groups before the capability drop keeps `--cap-drop SETGID` usable for containers
+/// that remain uid/gid 0, while still preventing host group memberships from granting
 /// access through group-owned bind mounts. Rootless user namespaces have
 /// `setgroups=deny` and only map gid 0, so they cannot and need not perform it.
 pub fn harden(
     seccomp_mode: SeccompMode,
     capabilities: &CapabilitySet,
     rootless: bool,
+    supplementary_groups: &[u32],
 ) -> ZResult<()> {
     trace::mark("child:security:begin");
     no_new_privs()?;
     trace::mark("child:nnp:done");
     if !rootless {
-        syscalls::clear_supplementary_groups()?;
+        syscalls::set_supplementary_groups(supplementary_groups)?;
     }
     trace::mark("child:groups:done");
     apply_capabilities(capabilities)?;
@@ -389,6 +390,72 @@ fn resolve_user_spec(raw: &str) -> ZResult<ResolvedUser> {
     Ok(ResolvedUser { uid, gid })
 }
 
+/// Split Docker-style `--group-add` values into validated, canonical entries.
+///
+/// Commas are accepted because Docker's string-slice flag treats them as
+/// repeated values. Numeric ids are normalized before persistence so `0043` and
+/// `43` cannot create duplicate state entries.
+pub fn parse_group_add_values(raw: &str) -> Result<Vec<String>, String> {
+    let mut values = Vec::new();
+    for part in raw.split(',') {
+        let value = part.trim();
+        if value.is_empty() {
+            return Err("group name or id cannot be empty".to_string());
+        }
+        if value.len() > 255 {
+            return Err(format!("group name or id '{value}' is too long"));
+        }
+        if value.contains(':')
+            || value
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+        {
+            return Err(format!(
+                "invalid group '{value}' (expected a name from /etc/group or a numeric gid)"
+            ));
+        }
+        let canonical = if value.bytes().all(|byte| byte.is_ascii_digit()) {
+            value
+                .parse::<u32>()
+                .map_err(|_| format!("group id '{value}' exceeds the gid range"))?
+                .to_string()
+        } else {
+            if value.starts_with('-') || value.starts_with('+') {
+                return Err(format!("invalid group id '{value}'"));
+            }
+            value.to_string()
+        };
+        if !values.contains(&canonical) {
+            values.push(canonical);
+        }
+    }
+    Ok(values)
+}
+
+/// Resolve additional group names against the container's `/etc/group`.
+///
+/// The caller must already be inside the container mount namespace. Rootless
+/// user namespaces map only gid 0 and deny `setgroups`, so any addition fails
+/// explicitly instead of producing a silently incomplete group set.
+pub fn resolve_group_additions(specs: &[String], rootless: bool) -> ZResult<Vec<u32>> {
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    if rootless {
+        return Err(crate::zerr!(
+            "--group-add is unavailable in rootless mode; run rootful"
+        ));
+    }
+    let mut groups = BTreeSet::new();
+    for spec in specs {
+        let gid = parse_id(spec)
+            .or_else(|| lookup_group_gid(spec))
+            .ok_or_else(|| crate::zerr!("unknown --group-add '{spec}' in container /etc/group"))?;
+        groups.insert(gid);
+    }
+    Ok(groups.into_iter().collect())
+}
+
 fn parse_id(value: &str) -> Option<u32> {
     if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -486,6 +553,20 @@ mod user_tests {
         assert!(resolve_user_spec("1000:").is_err());
         assert!(resolve_user_spec("1000:1000:extra").is_err());
         assert!(resolve_user_spec("-1").is_err());
+    }
+
+    #[test]
+    fn group_add_values_are_validated_canonicalized_and_deduplicated() {
+        assert_eq!(
+            parse_group_add_values("staff,0044, 44,1001").unwrap(),
+            vec!["staff", "44", "1001"]
+        );
+        for value in ["", "staff,", "staff:100", "-1", "+1", "a b", "4294967296"] {
+            assert!(parse_group_add_values(value).is_err(), "{value}");
+        }
+        assert!(resolve_group_additions(&[], true).unwrap().is_empty());
+        assert!(resolve_group_additions(&["0".to_string()], true).is_err());
+        assert!(resolve_group_additions(&["1".to_string()], true).is_err());
     }
 
     #[test]

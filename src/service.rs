@@ -118,6 +118,10 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--user".into());
         run_args.push(v.clone());
     }
+    for value in &a.group_add {
+        run_args.push("--group-add".into());
+        run_args.push(value.clone());
+    }
     if let Some(v) = a.stop_signal {
         run_args.push("--stop-signal".into());
         run_args.push(crate::signal::name(v));
@@ -529,6 +533,24 @@ mod tests {
         let unit = render(&PathBuf::from("/usr/local/bin/zerun"), &a, true).unwrap();
         assert!(unit.contains("--cpuset-cpus 0-1"));
         assert!(unit.contains("--cpuset-mems 0"));
+    }
+
+    #[test]
+    fn renders_group_additions() {
+        let a = args(&[
+            "--user",
+            "1000:1000",
+            "--group-add",
+            "staff",
+            "--group-add=0044,1001",
+            "alpine",
+            "true",
+        ]);
+        let unit = render(Path::new("/usr/local/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains("--user 1000:1000"));
+        assert!(unit.contains("--group-add staff"));
+        assert!(unit.contains("--group-add 44"));
+        assert!(unit.contains("--group-add 1001"));
     }
 
     #[test]

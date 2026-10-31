@@ -444,9 +444,31 @@ pub fn prctl_drop_cap(cap: c_int) -> ZResult<()> {
     Ok(())
 }
 
-/// Clear supplementary groups before changing the primary group/UID.
-pub fn clear_supplementary_groups() -> ZResult<()> {
-    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+/// Replace the supplementary group list before changing the primary group/UID.
+///
+/// An empty slice clears every inherited group. Linux rejects lists larger than
+/// `NGROUPS_MAX`; reject them here before allocating the C-layout copy.
+pub fn set_supplementary_groups(groups: &[u32]) -> ZResult<()> {
+    const NGROUPS_MAX: usize = 65_536;
+    if groups.len() > NGROUPS_MAX {
+        return Err(crate::zerr!(
+            "too many supplementary groups ({}, maximum {NGROUPS_MAX})",
+            groups.len()
+        ));
+    }
+    let groups = groups
+        .iter()
+        .map(|group| {
+            libc::gid_t::try_from(*group)
+                .map_err(|_| crate::zerr!("supplementary group {group} does not fit gid_t"))
+        })
+        .collect::<ZResult<Vec<_>>>()?;
+    let pointer = if groups.is_empty() {
+        std::ptr::null()
+    } else {
+        groups.as_ptr()
+    };
+    if unsafe { libc::setgroups(groups.len(), pointer) } != 0 {
         return Err(last_err("setgroups"));
     }
     Ok(())
