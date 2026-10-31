@@ -6072,74 +6072,124 @@ fn cmd_attach(args: &[String]) -> i32 {
     }
 }
 
-fn cmd_exec(args: &[String]) -> i32 {
-    let mut env_extra: Vec<String> = Vec::new();
-    let mut workdir: Option<String> = None;
+#[derive(Debug, Default)]
+struct ExecArgs {
+    env_files: Vec<String>,
+    env: Vec<String>,
+    workdir: Option<String>,
+    target: String,
+    cmd: Vec<String>,
+}
+
+#[derive(Debug)]
+enum ParsedExec {
+    Help,
+    Run(ExecArgs),
+}
+
+fn parse_exec_args(args: &[String]) -> Result<ParsedExec, String> {
+    let mut parsed = ExecArgs::default();
     let mut i = 0;
     while i < args.len() {
-        let a = args[i].as_str();
-        match a {
-            "-e" | "--env" => match next_value(args, &mut i, a) {
-                Ok(v) => {
-                    if let Err(e) = workload::validate_env_spec(&v) {
-                        eprintln!("zerun exec: invalid --env '{v}': {e}");
-                        return 2;
-                    }
-                    env_extra.push(v);
+        let arg = args[i].as_str();
+        match arg {
+            "-e" | "--env" => {
+                let value = next_value(args, &mut i, arg)?;
+                workload::validate_env_spec(&value)
+                    .map_err(|error| format!("invalid --env '{value}': {error}"))?;
+                parsed.env.push(value);
+            }
+            "--env-file" => {
+                let value = next_value(args, &mut i, arg)?;
+                if value.is_empty() {
+                    return Err("--env-file path cannot be empty".to_string());
                 }
-                Err(e) => {
-                    eprintln!("zerun exec: {e}");
-                    return 2;
+                parsed.env_files.push(value);
+            }
+            "-w" | "--workdir" => {
+                parsed.workdir = Some(next_value(args, &mut i, arg)?);
+            }
+            "-h" | "--help" => return Ok(ParsedExec::Help),
+            other if other.starts_with("--env-file=") => {
+                let value = &other["--env-file=".len()..];
+                if value.is_empty() {
+                    return Err("--env-file path cannot be empty".to_string());
                 }
-            },
-            "-w" | "--workdir" => match next_value(args, &mut i, a) {
-                Ok(v) => workdir = Some(v),
-                Err(e) => {
-                    eprintln!("zerun exec: {e}");
-                    return 2;
-                }
-            },
-            "-h" | "--help" => {
-                println!("usage: zerun exec [-e NAME=VAL] [-w DIR] CONTAINER CMD [ARG...]");
-                return 0;
+                parsed.env_files.push(value.to_string());
+                i += 1;
             }
             other if other.starts_with('-') && other.len() > 1 => {
-                eprintln!("zerun exec: unknown option {other}");
-                return 2;
+                return Err(format!("unknown option {other}"));
             }
             _ => {
-                let container = args[i].clone();
-                let cmd = args[i + 1..].to_vec();
-                if cmd.is_empty() {
-                    eprintln!("zerun exec: a command is required after CONTAINER");
-                    return 2;
+                parsed.target = args[i].clone();
+                parsed.cmd = args[i + 1..].to_vec();
+                if parsed.cmd.is_empty() {
+                    return Err("a command is required after CONTAINER".to_string());
                 }
-                let store = match Store::detect() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("zerun: {e}");
-                        return 1;
-                    }
-                };
-                let st = match state::resolve(&store, &container) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("zerun exec: {e}");
-                        return 1;
-                    }
-                };
-                return match execc::run(&st, &env_extra, workdir.as_deref(), &cmd) {
-                    Ok(code) => code,
-                    Err(e) => {
-                        eprintln!("zerun exec: {e}");
-                        1
-                    }
-                };
+                return Ok(ParsedExec::Run(parsed));
             }
         }
     }
-    eprintln!("zerun exec: CONTAINER and COMMAND are required");
-    2
+    Err("CONTAINER and COMMAND are required".to_string())
+}
+
+/// Materialize `exec --env-file` entries before explicit `-e` values.
+fn exec_env(env_files: &[String], explicit: &[String]) -> Result<Vec<String>, String> {
+    let paths = workload::resolve_env_file_paths(env_files)?;
+    let entries = workload::load_env_files(&paths)?;
+    let mut env = Vec::with_capacity(entries.len() + explicit.len());
+    env.extend(
+        entries
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}")),
+    );
+    env.extend(explicit.iter().cloned());
+    Ok(env)
+}
+
+fn cmd_exec(args: &[String]) -> i32 {
+    let parsed = match parse_exec_args(args) {
+        Ok(ParsedExec::Help) => {
+            println!(
+                "usage: zerun exec [-e NAME=VAL] [--env-file FILE] [-w DIR] CONTAINER CMD [ARG...]"
+            );
+            return 0;
+        }
+        Ok(ParsedExec::Run(parsed)) => parsed,
+        Err(error) => {
+            eprintln!("zerun exec: {error}");
+            return 2;
+        }
+    };
+    let env_extra = match exec_env(&parsed.env_files, &parsed.env) {
+        Ok(env) => env,
+        Err(error) => {
+            eprintln!("zerun exec: {error}");
+            return 2;
+        }
+    };
+    let store = match Store::detect() {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("zerun: {error}");
+            return 1;
+        }
+    };
+    let st = match state::resolve(&store, &parsed.target) {
+        Ok(st) => st,
+        Err(error) => {
+            eprintln!("zerun exec: {error}");
+            return 1;
+        }
+    };
+    match execc::run(&st, &env_extra, parsed.workdir.as_deref(), &parsed.cmd) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("zerun exec: {error}");
+            1
+        }
+    }
 }
 
 // --- shared helpers for the lifecycle commands -------------------------------
@@ -6449,7 +6499,7 @@ USAGE:\n  \
   zerun events [--filter KEY=VALUE] [--since TIME] [--until TIME]\n  \
                                          stream/replay container lifecycle events\n  \
   zerun attach CONTAINER                 stream a detached container's output\n  \
-  zerun exec [-e K=V] [-w DIR] CONTAINER CMD [ARG...]\n  \
+  zerun exec [-e K=V] [--env-file FILE] [-w DIR] CONTAINER CMD [ARG...]\n  \
                                         run a command in a running container\n  \
   zerun pull [--platform ...] IMAGE...   pull OCI images (Docker Hub, mirrors)\n  \
   zerun login [REGISTRY] [-u USER] [--password-stdin]\n  \
@@ -6776,6 +6826,73 @@ mod tests {
             ]
         );
         assert!(state_env(&["MALFORMED".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parses_exec_environment_files_and_workload_arguments() {
+        let args: Vec<_> = [
+            "--env-file",
+            "first.env",
+            "-e",
+            "MODE=explicit",
+            "--env-file=second.env",
+            "-w",
+            "/srv/app",
+            "box",
+            "env",
+            "--env-file",
+            "literal-command-argument",
+        ]
+        .iter()
+        .map(|value| value.to_string())
+        .collect();
+        let ParsedExec::Run(parsed) = parse_exec_args(&args).unwrap() else {
+            panic!("expected exec invocation");
+        };
+        assert_eq!(parsed.env_files, ["first.env", "second.env"]);
+        assert_eq!(parsed.env, ["MODE=explicit"]);
+        assert_eq!(parsed.workdir.as_deref(), Some("/srv/app"));
+        assert_eq!(parsed.target, "box");
+        assert_eq!(
+            parsed.cmd,
+            ["env", "--env-file", "literal-command-argument"]
+        );
+
+        assert!(matches!(
+            parse_exec_args(&["--unknown".to_string(), "box".to_string()]).unwrap_err(),
+            error if error.contains("unknown option")
+        ));
+        assert!(parse_exec_args(&["box".to_string()]).is_err());
+        assert!(parse_exec_args(&[]).is_err());
+        assert!(parse_exec_args(&["--env-file=".to_string(), "box".to_string()]).is_err());
+    }
+
+    #[test]
+    fn exec_environment_files_precede_explicit_overrides() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-exec-env-file-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.env");
+        let second = root.join("second.env");
+        std::fs::write(&first, "A=first\nB=first\n").unwrap();
+        std::fs::write(&second, "B=second\nC=second\n").unwrap();
+
+        let env = exec_env(
+            &[first.display().to_string(), second.display().to_string()],
+            &["B=explicit".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            env,
+            ["A=first", "B=first", "B=second", "C=second", "B=explicit"]
+        );
+        assert!(exec_env(&[String::new()], &[]).is_err());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
