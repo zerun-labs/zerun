@@ -323,6 +323,7 @@ sudo target/release/zerun attach web                  # stream live container ou
 sudo target/release/zerun stats web                   # one-shot resource metrics
 sudo target/release/zerun exec web /bin/sh            # join the container
 sudo target/release/zerun exec --env-file app.env web env  # environment overrides
+sudo target/release/zerun exec -u 1000:1000 web id    # one-off user override
 sudo target/release/zerun diff web                    # changed/added/deleted paths
 sudo target/release/zerun stop --time 3 web           # configured signal, then SIGKILL
 sudo target/release/zerun stop --signal USR1 web      # one-off signal override

@@ -379,8 +379,10 @@ jobs:
         run: |
           set -euo pipefail
           rootfs="$RUNNER_TEMP/zerun-integration-rootfs"
-          mkdir -p "$rootfs/bin" "$rootfs/srv"
+          mkdir -p "$rootfs/bin" "$rootfs/etc" "$rootfs/srv"
           install -m 0755 /usr/bin/busybox "$rootfs/bin/busybox"
+          printf 'testuser:x:4242:4344::/:/bin/sh\n' >"$rootfs/etc/passwd"
+          printf 'testuser:x:4344:\ntestgroup:x:4343:\n' >"$rootfs/etc/group"
           for applet in sh httpd ip grep cat sleep; do
             ln -s busybox "$rootfs/bin/$applet"
           done

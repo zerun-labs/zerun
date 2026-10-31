@@ -6076,6 +6076,7 @@ fn cmd_attach(args: &[String]) -> i32 {
 struct ExecArgs {
     env_files: Vec<String>,
     env: Vec<String>,
+    user: Option<String>,
     workdir: Option<String>,
     target: String,
     cmd: Vec<String>,
@@ -6105,6 +6106,13 @@ fn parse_exec_args(args: &[String]) -> Result<ParsedExec, String> {
                     return Err("--env-file path cannot be empty".to_string());
                 }
                 parsed.env_files.push(value);
+            }
+            "-u" | "--user" => {
+                let value = next_value(args, &mut i, arg)?;
+                if value.trim().is_empty() {
+                    return Err("--user cannot be empty".to_string());
+                }
+                parsed.user = Some(value);
             }
             "-w" | "--workdir" => {
                 parsed.workdir = Some(next_value(args, &mut i, arg)?);
@@ -6152,7 +6160,7 @@ fn cmd_exec(args: &[String]) -> i32 {
     let parsed = match parse_exec_args(args) {
         Ok(ParsedExec::Help) => {
             println!(
-                "usage: zerun exec [-e NAME=VAL] [--env-file FILE] [-w DIR] CONTAINER CMD [ARG...]"
+                "usage: zerun exec [-e NAME=VAL] [--env-file FILE] [-u USER[:GROUP]] [-w DIR] CONTAINER CMD [ARG...]"
             );
             return 0;
         }
@@ -6183,7 +6191,13 @@ fn cmd_exec(args: &[String]) -> i32 {
             return 1;
         }
     };
-    match execc::run(&st, &env_extra, parsed.workdir.as_deref(), &parsed.cmd) {
+    match execc::run(
+        &st,
+        &env_extra,
+        parsed.user.as_deref(),
+        parsed.workdir.as_deref(),
+        &parsed.cmd,
+    ) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("zerun exec: {error}");
@@ -6499,7 +6513,7 @@ USAGE:\n  \
   zerun events [--filter KEY=VALUE] [--since TIME] [--until TIME]\n  \
                                          stream/replay container lifecycle events\n  \
   zerun attach CONTAINER                 stream a detached container's output\n  \
-  zerun exec [-e K=V] [--env-file FILE] [-w DIR] CONTAINER CMD [ARG...]\n  \
+  zerun exec [-e K=V] [--env-file FILE] [-u USER[:GROUP]] [-w DIR] CONTAINER CMD [ARG...]\n  \
                                         run a command in a running container\n  \
   zerun pull [--platform ...] IMAGE...   pull OCI images (Docker Hub, mirrors)\n  \
   zerun login [REGISTRY] [-u USER] [--password-stdin]\n  \
@@ -6836,6 +6850,8 @@ mod tests {
             "-e",
             "MODE=explicit",
             "--env-file=second.env",
+            "-u",
+            "1000:1000",
             "-w",
             "/srv/app",
             "box",
@@ -6851,6 +6867,7 @@ mod tests {
         };
         assert_eq!(parsed.env_files, ["first.env", "second.env"]);
         assert_eq!(parsed.env, ["MODE=explicit"]);
+        assert_eq!(parsed.user.as_deref(), Some("1000:1000"));
         assert_eq!(parsed.workdir.as_deref(), Some("/srv/app"));
         assert_eq!(parsed.target, "box");
         assert_eq!(
@@ -6865,6 +6882,7 @@ mod tests {
         assert!(parse_exec_args(&["box".to_string()]).is_err());
         assert!(parse_exec_args(&[]).is_err());
         assert!(parse_exec_args(&["--env-file=".to_string(), "box".to_string()]).is_err());
+        assert!(parse_exec_args(&["-u".to_string(), "  ".to_string(), "box".to_string()]).is_err());
     }
 
     #[test]

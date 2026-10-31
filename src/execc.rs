@@ -31,6 +31,7 @@ use std::path::Path;
 pub fn run(
     state: &ContainerState,
     env_extra: &[String],
+    user_override: Option<&str>,
     workdir: Option<&str>,
     argv: &[String],
 ) -> ZResult<i32> {
@@ -111,6 +112,7 @@ pub fn run(
                 pidfd.as_raw_fd(),
                 cgroup_path.as_deref(),
                 env_extra,
+                user_override,
                 workdir,
                 argv,
             );
@@ -135,6 +137,7 @@ fn joiner(
     pidfd: std::os::fd::RawFd,
     cgroup_path: Option<&Path>,
     env_extra: &[String],
+    user_override: Option<&str>,
     workdir: Option<&str>,
     argv: &[String],
 ) -> i32 {
@@ -174,7 +177,14 @@ fn joiner(
             1
         }
         Ok(0) => {
-            let code = worker(state, cgroup_procs.as_ref(), env_extra, workdir, argv);
+            let code = worker(
+                state,
+                cgroup_procs.as_ref(),
+                env_extra,
+                user_override,
+                workdir,
+                argv,
+            );
             crate::syscalls::exit_process(code)
         }
         Ok(d) => {
@@ -213,6 +223,7 @@ fn worker(
     state: &ContainerState,
     cgroup_procs: Option<&File>,
     env_extra: &[String],
+    user_override: Option<&str>,
     workdir: Option<&str>,
     argv: &[String],
 ) -> i32 {
@@ -300,9 +311,12 @@ fn worker(
         return 1;
     }
 
-    // Drop to the container's configured user (same sequence as `run`), so
-    // exec'd commands see the image/container identity instead of host root.
-    if let Err(e) = crate::security::switch_user(state.user.as_deref(), state.rootless) {
+    // Drop to the requested user, falling back to the container's configured
+    // identity. Resolution happens after entering the mount namespace so
+    // named users come from the container's own /etc/passwd and /etc/group.
+    if let Err(e) =
+        crate::security::switch_user(user_override.or(state.user.as_deref()), state.rootless)
+    {
         eprintln!("zerun exec: {e}");
         return 1;
     }

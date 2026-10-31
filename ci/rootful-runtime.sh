@@ -175,6 +175,12 @@ exec_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
 cleanup_ids+=("$exec_id")
 exec_output=$("${zerun[@]}" exec "$exec_id" /bin/sh -c 'printf "exec-ok\\n"')
 grep -Fx exec-ok <<<"$exec_output" >/dev/null
+exec_uid=$("${zerun[@]}" exec --user testuser "$exec_id" /bin/busybox id -u)
+exec_gid=$("${zerun[@]}" exec --user testuser "$exec_id" /bin/busybox id -g)
+test "$exec_uid:$exec_gid" = 4242:4344
+exec_uid=$("${zerun[@]}" exec -u testuser:testgroup "$exec_id" /bin/busybox id -u)
+exec_gid=$("${zerun[@]}" exec -u testuser:testgroup "$exec_id" /bin/busybox id -g)
+test "$exec_uid:$exec_gid" = 4242:4343
 "${zerun[@]}" kill --signal TERM "$exec_id" >/dev/null
 "${zerun[@]}" wait "$exec_id" >/dev/null
 "${zerun[@]}" rm "$exec_id" >/dev/null
