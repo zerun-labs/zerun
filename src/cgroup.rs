@@ -270,6 +270,77 @@ impl CgroupV2 {
         self.write("cgroup.freeze", if frozen { "1" } else { "0" }.to_string())
     }
 
+    /// SIGKILL every task in this cgroup and wait for the kernel to report it
+    /// empty. `cgroup.kill` is atomic and prevents new forks; kernels before
+    /// its introduction fall back to freezing the cgroup before enumerating
+    /// `cgroup.procs`, which closes the same fork race.
+    ///
+    /// A task stuck in uninterruptible sleep can outlive the bounded wait. In
+    /// that case the caller must retain the cgroup path for a later retry.
+    pub fn kill_all(&self) -> ZResult<()> {
+        const KILL_WAIT: Duration = Duration::from_secs(2);
+        // A missing leaf means there is nothing left to terminate. This is a
+        // normal outcome when reconciliation races an already-finished cleanup.
+        if !self.path.exists() {
+            return Ok(());
+        }
+        let kill_path = self.path.join("cgroup.kill");
+        // Check first instead of relying on ENOENT: a diagnostic directory (or
+        // a future non-cgroupfs backend used by tests) would let fs::write
+        // create a regular file where cgroupfs reports the control file absent.
+        if kill_path.exists() {
+            match fs::write(&kill_path, b"1") {
+                Ok(()) => return self.wait_populated(false, KILL_WAIT),
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                    // The leaf or control file was removed concurrently.
+                    if !self.path.exists() {
+                        return Ok(());
+                    }
+                }
+                Err(error) => {
+                    return Err(crate::zerr!(
+                        "write {} = 1 failed: {error}",
+                        kill_path.display()
+                    ))
+                }
+            }
+        }
+
+        self.freeze(true)?;
+        let procs_path = self.path.join("cgroup.procs");
+        let procs = fs::read_to_string(&procs_path)
+            .map_err(|error| crate::zerr!("read {} failed: {error}", procs_path.display()))?;
+        for value in procs.split_whitespace() {
+            let pid = value.parse::<libc::pid_t>().map_err(|_| {
+                crate::zerr!("parse PID {value:?} from {} failed", procs_path.display())
+            })?;
+            if let Err(error) = crate::syscalls::kill_if_exists(pid, libc::SIGKILL) {
+                return Err(crate::zerr!(
+                    "kill process {pid} in {} failed: {error}",
+                    self.path.display()
+                ));
+            }
+        }
+        self.wait_populated(false, KILL_WAIT)
+    }
+
+    fn wait_populated(&self, want: bool, timeout: Duration) -> ZResult<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if read_populated(&self.path) == Some(want) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(crate::zerr!(
+                    "timed out waiting for cgroup {} to become {}",
+                    self.path.display(),
+                    if want { "populated" } else { "empty" }
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Benchmark helper: read peak memory usage (used by the bench harness).
     #[allow(dead_code)]
     pub fn read_peak(&self) -> ZResult<String> {
@@ -281,6 +352,15 @@ impl CgroupV2 {
     /// that document the end of the run; [`Drop`] also performs the cleanup so
     /// setup failures cannot leak a cgroup.
     pub fn cleanup(mut self) {
+        // Cleanup is a process-tree boundary, not just directory removal. This
+        // is essential for host PID namespaces and for exec workers that are
+        // not descendants of the container's top-level process.
+        if let Err(error) = self.kill_all() {
+            eprintln!(
+                "zerun: warning: terminate cgroup {} before cleanup: {error}",
+                self.path.display()
+            );
+        }
         self.cleanup_on_drop = true;
     }
 }
@@ -303,6 +383,14 @@ fn read_frozen(path: &Path) -> Option<bool> {
     events.lines().find_map(|line| {
         let (key, value) = line.split_once(' ')?;
         (key == "frozen").then(|| value.trim() == "1")
+    })
+}
+
+fn read_populated(path: &Path) -> Option<bool> {
+    let events = fs::read_to_string(path.join("cgroup.events")).ok()?;
+    events.lines().find_map(|line| {
+        let (key, value) = line.split_once(' ')?;
+        (key == "populated").then(|| value.trim() != "0")
     })
 }
 
@@ -901,5 +989,69 @@ mod tests {
             "0"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kill_all_prefers_the_atomic_cgroup_kill_control_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-cgroup-kill-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cgroup.kill"), b"0").unwrap();
+        std::fs::write(dir.join("cgroup.events"), b"populated 0\n").unwrap();
+        let cg = CgroupV2::open(&dir).unwrap();
+
+        cg.kill_all().unwrap();
+
+        assert_eq!(std::fs::read(dir.join("cgroup.kill")).unwrap(), b"1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kill_all_falls_back_when_cgroup_kill_is_unavailable() {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-cgroup-kill-fallback-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cgroup.freeze"), b"0").unwrap();
+        std::fs::write(
+            dir.join("cgroup.events"),
+            b"populated 0\nfrozen 1\nfrozen_effective 1\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("cgroup.procs"), b"").unwrap();
+        let cg = CgroupV2::open(&dir).unwrap();
+
+        cg.kill_all().unwrap();
+
+        assert_eq!(std::fs::read(dir.join("cgroup.freeze")).unwrap(), b"1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kill_all_treats_a_missing_cgroup_as_already_clean() {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-cgroup-kill-missing-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cg = CgroupV2::open(&dir);
+        assert!(cg.is_err());
+
+        // Construct the handle directly: open() intentionally rejects missing
+        // lifecycle cgroups, but reconciliation can race their removal after
+        // the persisted path has already been validated.
+        let cg = CgroupV2 {
+            path: dir,
+            cleanup_on_drop: false,
+        };
+        cg.kill_all().unwrap();
     }
 }

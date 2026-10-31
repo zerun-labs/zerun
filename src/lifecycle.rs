@@ -724,7 +724,7 @@ pub fn reconcile_stale(store: &Store, st: &mut ContainerState) -> bool {
             if path.exists() {
                 st.metrics = Some(state::ContainerMetrics::from_cgroup_path(path));
             }
-            if let Err(error) = crate::cgroup::CgroupV2::remove_for_container(&st.id, path) {
+            if let Err(error) = terminate_and_remove_cgroup(&st.id, path) {
                 eprintln!(
                     "zerun: warn: failed to reclaim cgroup {} for container {}: {error}",
                     path.display(),
@@ -805,7 +805,7 @@ pub fn reclaim_resources(store: &Store, st: &ContainerState) {
     }
     if let Some(cg) = st.cgroup.as_deref() {
         let path = Path::new(cg);
-        if let Err(error) = crate::cgroup::CgroupV2::remove_for_container(&st.id, path) {
+        if let Err(error) = terminate_and_remove_cgroup(&st.id, path) {
             eprintln!(
                 "zerun: warn: failed to reclaim cgroup {} for container {}: {error}",
                 path.display(),
@@ -816,6 +816,19 @@ pub fn reclaim_resources(store: &Store, st: &ContainerState) {
     if st.net == "bridge" {
         crate::network::release_ip(store.run_root(), &st.id);
     }
+}
+
+/// Terminate any tasks still attached to a validated lifecycle cgroup before
+/// removing it. A host PID namespace has no kernel-wide kill boundary, and an
+/// exec worker can outlive the top-level workload even for private PID
+/// namespaces. Keep the cgroup path in state when either step fails so a later
+/// reconciliation can retry instead of orphaning the tasks.
+fn terminate_and_remove_cgroup(id: &str, path: &Path) -> ZResult<()> {
+    if path.exists() {
+        let cgroup = crate::cgroup::CgroupV2::open_for_container(id, path)?;
+        cgroup.kill_all()?;
+    }
+    crate::cgroup::CgroupV2::remove_for_container(id, path)
 }
 
 /// Write all of `buf` to `fd`, tolerating EINTR (best effort).

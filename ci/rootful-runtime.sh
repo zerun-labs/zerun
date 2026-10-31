@@ -298,9 +298,32 @@ mapfile -t host_ns_exec_namespaces <<<"$host_ns_exec"
 test "${host_ns_exec_namespaces[0]}" = "$host_pid_ns"
 test "${host_ns_exec_namespaces[1]}" = "$host_ipc_ns"
 test "${host_ns_exec_namespaces[2]}" = "$host_uts_ns"
+
+# An exec worker is not a descendant of the container's top-level process. If
+# it daemonizes in host PID mode, only cgroup-wide teardown can prevent it from
+# surviving the container.
+host_ns_exec_orphan=$("${zerun[@]}" exec "$host_ns_id" /bin/sh -c \
+  '/bin/busybox start-stop-daemon -S -b -m -p /tmp/zerun-exec-orphan.pid -x /bin/sleep -- 30; cat /tmp/zerun-exec-orphan.pid')
+if [[ ! $host_ns_exec_orphan =~ ^[0-9]+$ ]]; then
+  echo "host-pid exec did not report its background PID" >&2
+  exit 1
+fi
 "${zerun[@]}" kill --signal TERM "$host_ns_id" >/dev/null
 "${zerun[@]}" wait "$host_ns_id" >/dev/null
 "${zerun[@]}" rm "$host_ns_id" >/dev/null
+for _ in $(seq 1 100); do
+  [[ ! -e /proc/$host_ns_exec_orphan ]] && break
+  sleep 0.02
+done
+if [[ -e /proc/$host_ns_exec_orphan ]]; then
+  echo "--pid host left exec descendant $host_ns_exec_orphan running" >&2
+  if (( EUID == 0 )); then
+    kill -KILL "$host_ns_exec_orphan" >/dev/null 2>&1 || true
+  else
+    sudo kill -KILL "$host_ns_exec_orphan" >/dev/null 2>&1 || true
+  fi
+  exit 1
+fi
 
 # Restart must stop and resume the same detached record rather than creating a
 # replacement container. Verify that the workload ran once before and once

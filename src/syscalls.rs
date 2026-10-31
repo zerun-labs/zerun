@@ -713,6 +713,21 @@ pub fn kill(pid: libc::pid_t, signal: c_int) -> ZResult<()> {
     Ok(())
 }
 
+/// Send a signal to a process that may have exited concurrently.
+///
+/// `ESRCH` is a successful outcome for process-tree cleanup because the target
+/// is already gone. Other errors remain visible to the caller.
+pub fn kill_if_exists(pid: libc::pid_t, signal: c_int) -> ZResult<()> {
+    if unsafe { libc::kill(pid, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(error.into())
+}
+
 /// Best-effort signal delivery for an async signal handler.
 ///
 /// The handler must not allocate or format an error, so this intentionally

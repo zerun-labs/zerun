@@ -182,9 +182,14 @@ where
         || spec.limits.pids.is_some()
         || spec.limits.oom_group
         || !spec.limits.io.is_empty();
+    // Host PID sharing has no namespace-wide kill boundary. Keep a cgroup
+    // where possible so runtime teardown and crash reconciliation can terminate
+    // exec workers and other processes that did not descend from the workload.
+    let needs_lifecycle_cgroup =
+        spec.lifecycle_cgroup || matches!(spec.namespaces.pid, NamespaceMode::Host);
     let cg = if has_limits {
         Some(CgroupV2::create(&spec.id, &spec.limits)?)
-    } else if spec.lifecycle_cgroup {
+    } else if needs_lifecycle_cgroup {
         match CgroupV2::create(&spec.id, &spec.limits) {
             Ok(cg) => Some(cg),
             Err(_) if rootless => {
@@ -193,7 +198,8 @@ where
             }
             Err(e) => {
                 eprintln!(
-                    "zerun: warning: lifecycle cgroup unavailable; pause/unpause disabled: {e}"
+                    "zerun: warning: lifecycle cgroup unavailable; \
+                     process-tree cleanup and pause/unpause may be limited: {e}"
                 );
                 None
             }
@@ -409,10 +415,31 @@ where
     let code = match wait_child(pid) {
         Ok(code) => code,
         Err(error) => {
+            if let Some(cg) = &cg {
+                if let Err(kill_error) = cg.kill_all() {
+                    eprintln!("zerun: warning: terminate cgroup after wait failure: {kill_error}");
+                }
+            }
             reap_host_pid_descendants(spec.namespaces);
+            if let Some(net) = &host_net {
+                crate::network::teardown_host_side(net);
+            }
+            if let Some(cg) = cg {
+                cg.cleanup();
+            }
+            release_bridge_ip(&spec);
             return Err(error);
         }
     };
+    // The top-level process has exited. In a private PID namespace the kernel
+    // already killed its namespace peers, but a host PID namespace has no such
+    // boundary and exec workers are not necessarily descendants. Kill the
+    // complete cgroup before reclaiming the rest of the run resources.
+    if let Some(cg) = &cg {
+        if let Err(error) = cg.kill_all() {
+            eprintln!("zerun: warning: terminate container processes: {error}");
+        }
+    }
     reap_host_pid_descendants(spec.namespaces);
     if let Some(net) = &host_net {
         crate::network::teardown_host_side(net);
