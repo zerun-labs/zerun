@@ -324,6 +324,7 @@ sudo target/release/zerun stats web                   # one-shot resource metric
 sudo target/release/zerun exec web /bin/sh            # join the container
 sudo target/release/zerun exec --env-file app.env web env  # environment overrides
 sudo target/release/zerun exec -u 1000:1000 web id    # one-off user override
+sudo target/release/zerun exec -it web /bin/sh         # interactive terminal
 sudo target/release/zerun diff web                    # changed/added/deleted paths
 sudo target/release/zerun stop --time 3 web           # configured signal, then SIGKILL
 sudo target/release/zerun stop --signal USR1 web      # one-off signal override
@@ -393,7 +394,8 @@ command line and environment. When the workload exits, a final control frame clo
 and the attach command returns the container's exit code without mixing runtime metadata into
 output. Up to 32 clients may attach to one container; disconnected clients are pruned as new
 connections arrive so the reaper's descriptor and memory use stay bounded.
-Use `exec` for interactive input.
+`exec -i` forwards stdin, `exec -t` allocates a PTY, and `exec -it` combines them;
+without `-i`, the command receives `/dev/null` as stdin.
 `commit` produces a single-layer OCI image from the container rootfs. Exited detached
 containers retain their writable layer until `rm`; `--rm` still removes it on exit.
 

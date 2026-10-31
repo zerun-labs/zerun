@@ -181,6 +181,21 @@ test "$exec_uid:$exec_gid" = 4242:4344
 exec_uid=$("${zerun[@]}" exec -u testuser:testgroup "$exec_id" /bin/busybox id -u)
 exec_gid=$("${zerun[@]}" exec -u testuser:testgroup "$exec_id" /bin/busybox id -g)
 test "$exec_uid:$exec_gid" = 4242:4343
+exec_stdin=$(printf 'exec-stdin-ok\n' | "${zerun[@]}" exec -i "$exec_id" /bin/sh -c \
+  'IFS= read -r line; printf "read-%s\n" "$line"')
+grep -Fxq read-exec-stdin-ok <<<"$exec_stdin"
+exec_tty=$("${zerun[@]}" exec -t "$exec_id" /bin/sh -c \
+  'test -t 0 && test -t 1 && test -t 2 && printf "exec-tty-ok\n"')
+grep -Fq exec-tty-ok <<<"$exec_tty"
+command -v script >/dev/null || {
+  echo "interactive exec check requires util-linux script" >&2
+  exit 1
+}
+printf -v exec_it_command '%q ' "${zerun[@]}" exec -it "$exec_id" /bin/sh -c \
+  'test -t 0 && test -t 1 && test -t 2; printf "exec-it-ready\n"; IFS= read -r line; printf "read-%s\n" "$line"'
+exec_it=$({ printf 'exec-it-stdin\n'; sleep 1; } | script -qefc "$exec_it_command" /dev/null)
+grep -Fq exec-it-ready <<<"$exec_it"
+grep -Fq read-exec-it-stdin <<<"$exec_it"
 "${zerun[@]}" kill --signal TERM "$exec_id" >/dev/null
 "${zerun[@]}" wait "$exec_id" >/dev/null
 "${zerun[@]}" rm "$exec_id" >/dev/null

@@ -1,4 +1,4 @@
-//! Host-side PTY support for `run -t`.
+//! Host-side PTY support for `run -t` and `exec -t`.
 //!
 //! The container child receives the PTY slave as stdin/stdout/stderr and makes
 //! it its controlling terminal. The foreground CLI remains outside the
@@ -6,9 +6,59 @@
 //! the PTY master. Raw mode is only enabled for a genuinely bidirectional
 //! interactive session; output-only `-t` stays in the caller's terminal mode.
 
+use crate::error::ZResult;
 use crate::syscalls;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
+
+/// Owns the parent-side ends of a PTY during clone/setup.
+pub(crate) struct PtyPair {
+    master: Option<RawFd>,
+    slave: RawFd,
+    child_owns_slave: bool,
+}
+
+impl PtyPair {
+    pub(crate) fn open() -> ZResult<Self> {
+        let (master, slave) = syscalls::open_pty()?;
+        Ok(Self {
+            master: Some(master),
+            slave,
+            child_owns_slave: false,
+        })
+    }
+
+    pub(crate) fn master(&self) -> RawFd {
+        self.master.unwrap_or(-1)
+    }
+
+    pub(crate) fn slave(&self) -> RawFd {
+        self.slave
+    }
+
+    /// After a successful clone the parent must release the slave so the
+    /// container's exit can close the last slave-side descriptor.
+    pub(crate) fn release_slave(&mut self) {
+        syscalls::close(self.slave);
+        self.child_owns_slave = true;
+    }
+
+    /// Transfer the master to the pump. The pair will no longer close it.
+    pub(crate) fn take_master(&mut self) -> RawFd {
+        self.master.take().unwrap_or(-1)
+    }
+}
+
+impl Drop for PtyPair {
+    fn drop(&mut self) {
+        if let Some(master) = self.master.take() {
+            syscalls::close(master);
+        }
+        if !self.child_owns_slave {
+            syscalls::close(self.slave);
+        }
+    }
+}
 
 /// Restore host terminal settings when an attached PTY session ends.
 struct RawTerminalGuard {
@@ -16,7 +66,7 @@ struct RawTerminalGuard {
 }
 
 impl RawTerminalGuard {
-    fn attach(master: RawFd, interactive: bool) -> crate::error::ZResult<Self> {
+    fn attach(master: RawFd, interactive: bool) -> ZResult<Self> {
         if syscalls::is_terminal(libc::STDIN_FILENO) {
             syscalls::copy_window_size(libc::STDIN_FILENO, master)?;
             install_resize_handler(master);
@@ -62,10 +112,7 @@ fn install_resize_handler(master: RawFd) {
 /// Interactive mode pumps both directions and switches the host terminal to
 /// raw mode. Output-only mode leaves stdin alone, matching `run -t` without
 /// `-i`; the pump stops when the container closes its PTY.
-pub fn attach(
-    master: RawFd,
-    interactive: bool,
-) -> crate::error::ZResult<std::thread::JoinHandle<()>> {
+pub fn attach(master: RawFd, interactive: bool) -> ZResult<std::thread::JoinHandle<()>> {
     let guard = if interactive {
         match RawTerminalGuard::attach(master, interactive) {
             Ok(g) => Some(g),

@@ -6078,6 +6078,8 @@ struct ExecArgs {
     env: Vec<String>,
     user: Option<String>,
     workdir: Option<String>,
+    interactive: bool,
+    tty: bool,
     target: String,
     cmd: Vec<String>,
 }
@@ -6116,6 +6118,19 @@ fn parse_exec_args(args: &[String]) -> Result<ParsedExec, String> {
             }
             "-w" | "--workdir" => {
                 parsed.workdir = Some(next_value(args, &mut i, arg)?);
+            }
+            "-i" | "--interactive" => {
+                parsed.interactive = true;
+                i += 1;
+            }
+            "-t" | "--tty" => {
+                parsed.tty = true;
+                i += 1;
+            }
+            "-it" | "-ti" => {
+                parsed.interactive = true;
+                parsed.tty = true;
+                i += 1;
             }
             "-h" | "--help" => return Ok(ParsedExec::Help),
             other if other.starts_with("--env-file=") => {
@@ -6160,7 +6175,7 @@ fn cmd_exec(args: &[String]) -> i32 {
     let parsed = match parse_exec_args(args) {
         Ok(ParsedExec::Help) => {
             println!(
-                "usage: zerun exec [-e NAME=VAL] [--env-file FILE] [-u USER[:GROUP]] [-w DIR] CONTAINER CMD [ARG...]"
+                "usage: zerun exec [-e NAME=VAL] [--env-file FILE] [-u USER[:GROUP]] [-w DIR] [-it] CONTAINER CMD [ARG...]"
             );
             return 0;
         }
@@ -6191,13 +6206,15 @@ fn cmd_exec(args: &[String]) -> i32 {
             return 1;
         }
     };
-    match execc::run(
-        &st,
-        &env_extra,
-        parsed.user.as_deref(),
-        parsed.workdir.as_deref(),
-        &parsed.cmd,
-    ) {
+    match execc::run(execc::ExecRequest {
+        state: &st,
+        env_extra: &env_extra,
+        user_override: parsed.user.as_deref(),
+        workdir: parsed.workdir.as_deref(),
+        tty: parsed.tty,
+        interactive: parsed.interactive,
+        argv: &parsed.cmd,
+    }) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("zerun exec: {error}");
@@ -6513,7 +6530,7 @@ USAGE:\n  \
   zerun events [--filter KEY=VALUE] [--since TIME] [--until TIME]\n  \
                                          stream/replay container lifecycle events\n  \
   zerun attach CONTAINER                 stream a detached container's output\n  \
-  zerun exec [-e K=V] [--env-file FILE] [-u USER[:GROUP]] [-w DIR] CONTAINER CMD [ARG...]\n  \
+  zerun exec [-e K=V] [--env-file FILE] [-u USER[:GROUP]] [-w DIR] [-it] CONTAINER CMD [ARG...]\n  \
                                         run a command in a running container\n  \
   zerun pull [--platform ...] IMAGE...   pull OCI images (Docker Hub, mirrors)\n  \
   zerun login [REGISTRY] [-u USER] [--password-stdin]\n  \
@@ -6854,6 +6871,7 @@ mod tests {
             "1000:1000",
             "-w",
             "/srv/app",
+            "-it",
             "box",
             "env",
             "--env-file",
@@ -6869,6 +6887,8 @@ mod tests {
         assert_eq!(parsed.env, ["MODE=explicit"]);
         assert_eq!(parsed.user.as_deref(), Some("1000:1000"));
         assert_eq!(parsed.workdir.as_deref(), Some("/srv/app"));
+        assert!(parsed.interactive);
+        assert!(parsed.tty);
         assert_eq!(parsed.target, "box");
         assert_eq!(
             parsed.cmd,
@@ -6883,6 +6903,16 @@ mod tests {
         assert!(parse_exec_args(&[]).is_err());
         assert!(parse_exec_args(&["--env-file=".to_string(), "box".to_string()]).is_err());
         assert!(parse_exec_args(&["-u".to_string(), "  ".to_string(), "box".to_string()]).is_err());
+
+        let flags: Vec<_> = ["--interactive", "--tty", "box", "id"]
+            .iter()
+            .map(|value| value.to_string())
+            .collect();
+        let ParsedExec::Run(flags) = parse_exec_args(&flags).unwrap() else {
+            panic!("expected exec invocation");
+        };
+        assert!(flags.interactive);
+        assert!(flags.tty);
     }
 
     #[test]

@@ -20,21 +20,36 @@
 //! real parent C lives outside and reaps it through the host PID), so it is
 //! reaped like any other container process.
 use crate::error::ZResult;
+use crate::pty::{self, PtyPair};
 use crate::state::{ContainerState, Status};
 use crate::workload;
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
-/// Join the running container described by `state` and run `argv` with the
-/// container environment. Returns the command's exit code.
-pub fn run(
-    state: &ContainerState,
-    env_extra: &[String],
-    user_override: Option<&str>,
-    workdir: Option<&str>,
-    argv: &[String],
-) -> ZResult<i32> {
+/// One `zerun exec` invocation. Keeping the borrowed inputs together avoids
+/// threading the same state/environment/stdio context through every fork stage.
+#[derive(Clone, Copy)]
+pub struct ExecRequest<'a> {
+    pub state: &'a ContainerState,
+    pub env_extra: &'a [String],
+    pub user_override: Option<&'a str>,
+    pub workdir: Option<&'a str>,
+    pub tty: bool,
+    pub interactive: bool,
+    pub argv: &'a [String],
+}
+
+/// Join the running container and run `request.argv` with its environment.
+/// Returns the command's exit code.
+pub fn run(request: ExecRequest<'_>) -> ZResult<i32> {
+    let ExecRequest {
+        state,
+        tty,
+        interactive,
+        argv,
+        ..
+    } = request;
     if state.status != Status::Running {
         return Err(crate::zerr!(
             "container {} is not running (status {})",
@@ -103,25 +118,81 @@ pub fn run(
         }
     }
 
+    // The CLI owns the PTY master and pump. A thread cannot be created in C
+    // after it joins the container's PID namespace: the new thread would be a
+    // child in that namespace while sharing C's address space, which the kernel
+    // rejects. C therefore reports D's host PID so the CLI can pump host stdio
+    // and kill D if attaching the PTY fails.
+    let pty_pair = if tty { Some(PtyPair::open()?) } else { None };
+    let (pid_r, pid_w) = if tty {
+        crate::syscalls::pipe2_cloexec()?
+    } else {
+        (-1, -1)
+    };
+
     // The joiner C.
     match crate::syscalls::fork_process() {
-        Err(error) => Err(crate::zerr!("exec: fork: {error}")),
+        Err(error) => {
+            if pid_r >= 0 {
+                crate::syscalls::close(pid_r);
+                crate::syscalls::close(pid_w);
+            }
+            Err(crate::zerr!("exec: fork: {error}"))
+        }
         Ok(0) => {
+            if pid_r >= 0 {
+                crate::syscalls::close(pid_r);
+            }
             let code = joiner(
-                state,
+                request,
                 pidfd.as_raw_fd(),
                 cgroup_path.as_deref(),
-                env_extra,
-                user_override,
-                workdir,
-                argv,
+                pty_pair,
+                pid_w,
             );
             crate::syscalls::exit_process(code)
         }
         Ok(parent) => {
+            if pid_w >= 0 {
+                crate::syscalls::close(pid_w);
+            }
+            let exec_pid = if pid_r >= 0 {
+                let result = read_exec_pid(pid_r);
+                crate::syscalls::close(pid_r);
+                match result {
+                    Ok(pid) => pid,
+                    Err(error) => {
+                        let _ = crate::syscalls::kill(parent, libc::SIGKILL);
+                        let _ = crate::syscalls::wait_pid(parent, 0);
+                        return Err(crate::zerr!("exec: worker pid pipe: {error}"));
+                    }
+                }
+            } else {
+                None
+            };
+
+            let mut pty_pair = pty_pair;
+            let pump = if let Some(exec_pid) = exec_pid {
+                match start_pty_pump(&mut pty_pair, interactive) {
+                    Ok(pump) => pump,
+                    Err(error) => {
+                        let _ = crate::syscalls::kill(exec_pid, libc::SIGKILL);
+                        let _ = crate::syscalls::wait_pid(parent, 0);
+                        return Err(error);
+                    }
+                }
+            } else {
+                // C failed before forking D; there is no PTY consumer.
+                drop(pty_pair);
+                None
+            };
+
             // Wait for C, which exits with D's code.
             let (_, status) = crate::syscalls::wait_pid(parent, 0)?
                 .ok_or_else(|| crate::zerr!("exec: waitpid returned no child"))?;
+            if let Some(handle) = pump {
+                let _ = handle.join();
+            }
             Ok(crate::syscalls::wait_status_code(status).unwrap_or(1))
         }
     }
@@ -133,14 +204,13 @@ pub fn run(
 /// Joining the PID namespace only affects children, so the worker is forked
 /// afterward.
 fn joiner(
-    state: &ContainerState,
+    request: ExecRequest<'_>,
     pidfd: std::os::fd::RawFd,
     cgroup_path: Option<&Path>,
-    env_extra: &[String],
-    user_override: Option<&str>,
-    workdir: Option<&str>,
-    argv: &[String],
+    mut pty_pair: Option<PtyPair>,
+    pid_w: std::os::fd::RawFd,
 ) -> i32 {
+    let state = request.state;
     // After `setns(mnt)`, `/sys/fs/cgroup` resolves inside the container's
     // mount namespace, where the host cgroup path in lifecycle state is not
     // visible. Open the already-validated host cgroup file now and retain its
@@ -170,6 +240,9 @@ fn joiner(
     // Joining the PID namespace takes effect only for children; the worker
     // fork below is therefore the first process created inside that namespace.
 
+    let tty_master = pty_pair.as_ref().map_or(-1, PtyPair::master);
+    let tty_slave = pty_pair.as_ref().map_or(-1, PtyPair::slave);
+
     // Second fork: D is born inside the container's PID namespace.
     match crate::syscalls::fork_process() {
         Err(error) => {
@@ -177,17 +250,31 @@ fn joiner(
             1
         }
         Ok(0) => {
-            let code = worker(
-                state,
-                cgroup_procs.as_ref(),
-                env_extra,
-                user_override,
-                workdir,
-                argv,
-            );
+            let code = worker(request, cgroup_procs.as_ref(), tty_master, tty_slave);
             crate::syscalls::exit_process(code)
         }
         Ok(d) => {
+            if pid_w >= 0 {
+                let result = crate::syscalls::write_all_fd(pid_w, &d.to_ne_bytes());
+                crate::syscalls::close(pid_w);
+                if let Err(error) = result {
+                    eprintln!("zerun exec: report worker pid: {error}");
+                    let _ = crate::syscalls::kill(d, libc::SIGKILL);
+                    let _ = crate::syscalls::wait_pid(d, 0);
+                    return 1;
+                }
+            }
+
+            // The CLI owns the master; C must release both of its copies so
+            // D's exit produces a clean PTY EOF for the host pump.
+            if let Some(pair) = pty_pair.as_mut() {
+                pair.release_slave();
+                let master = pair.take_master();
+                if master >= 0 {
+                    crate::syscalls::close(master);
+                }
+            }
+
             // C waits for D and mirrors its exit code to the CLI.
             let (_, status) = match crate::syscalls::wait_pid(d, 0) {
                 Ok(Some(result)) => result,
@@ -220,13 +307,30 @@ fn namespace_flags(rootless: bool) -> (Option<libc::c_int>, libc::c_int) {
 
 /// The in-container worker: cgroup join, cwd, env, hardening, exec.
 fn worker(
-    state: &ContainerState,
+    request: ExecRequest<'_>,
     cgroup_procs: Option<&File>,
-    env_extra: &[String],
-    user_override: Option<&str>,
-    workdir: Option<&str>,
-    argv: &[String],
+    tty_master: std::os::fd::RawFd,
+    tty_slave: std::os::fd::RawFd,
 ) -> i32 {
+    let ExecRequest {
+        state,
+        env_extra,
+        user_override,
+        workdir,
+        interactive,
+        argv,
+        ..
+    } = request;
+    // D inherited both PTY ends across the fork. The joiner owns the master,
+    // and only the worker should retain the slave as its stdio.
+    if tty_master >= 0 {
+        crate::syscalls::close(tty_master);
+    }
+    if let Err(error) = configure_stdio(tty_slave, interactive) {
+        eprintln!("zerun exec: stdio: {error}");
+        return 1;
+    }
+
     // Join the container's cgroup before exec so the child is accounted
     // against the same memory/cpu/pids limits. If the persisted cgroup has
     // disappeared or cannot be written, fail closed instead of running the
@@ -282,6 +386,12 @@ fn worker(
             }
         }
     }
+    if tty_slave >= 0 && workload::env_value(&pairs, "TERM").is_none() {
+        pairs.push((
+            "TERM".to_string(),
+            std::env::var("TERM").unwrap_or_else(|_| "xterm".to_string()),
+        ));
+    }
 
     // Resolve a bare argv[0] against the container PATH; entries already
     // containing '/' are used as-is. The resolved absolute path is passed to
@@ -334,6 +444,55 @@ fn worker(
     1
 }
 
+/// Read the host PID of D from C. EOF means C failed before the worker fork.
+fn read_exec_pid(fd: std::os::fd::RawFd) -> ZResult<Option<i32>> {
+    let mut bytes = [0u8; std::mem::size_of::<i32>()];
+    let mut read = 0;
+    while read < bytes.len() {
+        let n = crate::syscalls::read_fd(fd, &mut bytes[read..])?;
+        if n == 0 {
+            return Ok(None);
+        }
+        read += n as usize;
+    }
+    let pid = i32::from_ne_bytes(bytes);
+    Ok((pid > 0).then_some(pid))
+}
+
+/// Attach the CLI-side PTY pump. The caller owns the joins and error cleanup.
+fn start_pty_pump(
+    pty_pair: &mut Option<PtyPair>,
+    interactive: bool,
+) -> ZResult<Option<std::thread::JoinHandle<()>>> {
+    let Some(pair) = pty_pair.as_mut() else {
+        return Ok(None);
+    };
+    pair.release_slave();
+    let master = pair.take_master();
+    match pty::attach(master, interactive) {
+        Ok(handle) => Ok(Some(handle)),
+        Err(error) => {
+            crate::syscalls::close(master);
+            Err(error)
+        }
+    }
+}
+
+/// Give the in-container worker the requested stdio. Without `exec -i`, stdin
+/// is /dev/null just like a non-interactive `docker exec`; with `-t`, the PTY
+/// slave becomes both stdio endpoints and the worker's controlling terminal.
+fn configure_stdio(tty_slave: std::os::fd::RawFd, interactive: bool) -> ZResult<()> {
+    if tty_slave >= 0 {
+        crate::syscalls::redirect_stdio(tty_slave)?;
+        crate::syscalls::new_session()?;
+        crate::syscalls::set_controlling_terminal(tty_slave)?;
+        crate::syscalls::close(tty_slave);
+    } else if !interactive {
+        crate::syscalls::redirect_stdin_devnull()?;
+    }
+    Ok(())
+}
+
 fn open_cgroup_procs(path: &Path) -> std::io::Result<File> {
     OpenOptions::new()
         .write(true)
@@ -357,7 +516,7 @@ fn upsert(env: &mut Vec<(String, String)>, key: &str, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{join_cgroup, namespace_flags, open_cgroup_procs};
+    use super::{join_cgroup, namespace_flags, open_cgroup_procs, read_exec_pid};
 
     #[test]
     fn user_namespace_is_joined_separately_before_other_namespaces() {
@@ -399,6 +558,20 @@ mod tests {
             "1234"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn worker_pid_pipe_round_trips_and_detects_an_early_child_failure() {
+        let (read, write) = crate::syscalls::pipe2_cloexec().unwrap();
+        crate::syscalls::write_all_fd(write, &4242i32.to_ne_bytes()).unwrap();
+        crate::syscalls::close(write);
+        assert_eq!(read_exec_pid(read).unwrap(), Some(4242));
+        crate::syscalls::close(read);
+
+        let (read, write) = crate::syscalls::pipe2_cloexec().unwrap();
+        crate::syscalls::close(write);
+        assert_eq!(read_exec_pid(read).unwrap(), None);
+        crate::syscalls::close(read);
     }
 
     #[test]

@@ -21,6 +21,7 @@ use crate::mounts::{
     make_root_readonly, mount_extra_tmpfs, open_rootless_device_sources, setup_rootfs, BindMount,
     OverlayPaths, RootfsConfig, TmpfsMount,
 };
+use crate::pty::PtyPair;
 use crate::seccomp::SeccompMode;
 use crate::security;
 use crate::state::ContainerMetrics;
@@ -254,7 +255,7 @@ where
     let host_euid = crate::syscalls::effective_uid();
     let host_egid = crate::syscalls::effective_gid();
 
-    let slave = pty_pair.as_ref().map_or(-1, |p| p.slave);
+    let slave = pty_pair.as_ref().map_or(-1, PtyPair::slave);
     let child_spec = spec.clone();
     let pid = syscalls::clone_into(flags, move || {
         child_main(
@@ -725,46 +726,6 @@ fn read_all(fd: RawFd, buf: &mut [u8]) -> ZResult<usize> {
         total += n as usize;
         if total == buf.len() {
             return Ok(total);
-        }
-    }
-}
-
-/// Owns the parent-side ends of a PTY during clone/setup.
-struct PtyPair {
-    master: Option<RawFd>,
-    slave: RawFd,
-    child_owns_slave: bool,
-}
-
-impl PtyPair {
-    fn open() -> ZResult<Self> {
-        let (master, slave) = syscalls::open_pty()?;
-        Ok(Self {
-            master: Some(master),
-            slave,
-            child_owns_slave: false,
-        })
-    }
-
-    /// After a successful clone the parent must release the slave so the
-    /// container's exit can close the last slave-side descriptors.
-    fn release_slave(&mut self) {
-        syscalls::close(self.slave);
-        self.child_owns_slave = true;
-    }
-
-    fn take_master(&mut self) -> RawFd {
-        self.master.take().unwrap_or(-1)
-    }
-}
-
-impl Drop for PtyPair {
-    fn drop(&mut self) {
-        if let Some(master) = self.master.take() {
-            syscalls::close(master);
-        }
-        if !self.child_owns_slave {
-            syscalls::close(self.slave);
         }
     }
 }
