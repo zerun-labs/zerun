@@ -168,13 +168,22 @@ cgroup_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
   --pids 32 --init -- /bin/sh -c 'printf "cgroup-ok\\n"')
 grep -Fx cgroup-ok <<<"$cgroup_output" >/dev/null
 
+# POSIX rlimits apply before hardening and are restored for detached exec.
+ulimit_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+  --ulimit nofile=64:96 --init -- /bin/sh -c \
+  'printf "soft=%s hard=%s\\n" "$(ulimit -Sn)" "$(ulimit -Hn)"')
+grep -Fx 'soft=64 hard=96' <<<"$ulimit_output" >/dev/null
+
 # Detached exec must join the same cgroup as the container. This also guards
 # the persisted cgroup-path validation used by the exec joiner.
 exec_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
-  --pids 32 --init -- /bin/sh -c 'sleep 30')
+  --pids 32 --ulimit nofile=64:96 --init -- /bin/sh -c 'sleep 30')
 cleanup_ids+=("$exec_id")
 exec_output=$("${zerun[@]}" exec "$exec_id" /bin/sh -c 'printf "exec-ok\\n"')
 grep -Fx exec-ok <<<"$exec_output" >/dev/null
+exec_limits=$("${zerun[@]}" exec "$exec_id" /bin/sh -c \
+  'printf "soft=%s hard=%s\n" "$(ulimit -Sn)" "$(ulimit -Hn)"')
+grep -Fx 'soft=64 hard=96' <<<"$exec_limits" >/dev/null
 exec_uid=$("${zerun[@]}" exec --user testuser "$exec_id" /bin/busybox id -u)
 exec_gid=$("${zerun[@]}" exec --user testuser "$exec_id" /bin/busybox id -g)
 test "$exec_uid:$exec_gid" = 4242:4344
@@ -204,11 +213,12 @@ grep -Fq read-exec-it-stdin <<<"$exec_it"
 # replacement container. Verify that the workload ran once before and once
 # after the restart while retaining the same id and log history.
 restart_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
-  --init -- /bin/sh -c 'printf "restart-ok\\n"; sleep 30')
+  --ulimit nofile=64:96 --init -- /bin/sh -c \
+  'printf "restart-ok nofile=%s:%s\\n" "$(ulimit -Sn)" "$(ulimit -Hn)"; sleep 30')
 cleanup_ids+=("$restart_id")
 for attempt in $(seq 1 50); do
   restart_logs=$("${zerun[@]}" logs "$restart_id" 2>/dev/null || true)
-  if (( $(grep -c 'restart-ok' <<<"$restart_logs" || true) >= 1 )); then
+  if (( $(grep -c 'restart-ok nofile=64:96' <<<"$restart_logs" || true) >= 1 )); then
     break
   fi
   if (( attempt == 50 )); then
@@ -220,7 +230,7 @@ done
 "${zerun[@]}" restart --time 1 "$restart_id" >/dev/null
 for attempt in $(seq 1 50); do
   restart_logs=$("${zerun[@]}" logs "$restart_id" 2>/dev/null || true)
-  if (( $(grep -c 'restart-ok' <<<"$restart_logs" || true) >= 2 )); then
+  if (( $(grep -c 'restart-ok nofile=64:96' <<<"$restart_logs" || true) >= 2 )); then
     break
   fi
   if (( attempt == 50 )); then

@@ -82,6 +82,10 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
     if a.oom_group {
         run_args.push("--oom-group".into());
     }
+    for value in a.ulimits.canonical() {
+        run_args.push("--ulimit".into());
+        run_args.push(value);
+    }
     for v in &a.device_read_bps {
         if let Some(limit) = v.read_bps {
             run_args.push("--device-read-bps".into());
@@ -525,6 +529,20 @@ mod tests {
         let unit = render(&PathBuf::from("/usr/local/bin/zerun"), &a, true).unwrap();
         assert!(unit.contains("--cpuset-cpus 0-1"));
         assert!(unit.contains("--cpuset-mems 0"));
+    }
+
+    #[test]
+    fn renders_process_ulimits() {
+        let a = args(&[
+            "--ulimit",
+            "nofile=64:96",
+            "--ulimit=as=unlimited",
+            "alpine",
+            "true",
+        ]);
+        let unit = render(Path::new("/usr/local/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains("--ulimit as=-1:-1"));
+        assert!(unit.contains("--ulimit nofile=64:96"));
     }
 
     #[test]

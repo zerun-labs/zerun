@@ -416,6 +416,19 @@ fn worker(
         None => crate::security::CapabilitySet::default(),
     };
     let seccomp = state.seccomp.unwrap_or_default();
+    if let Some(specs) = state.ulimits.as_deref() {
+        let limits = match crate::rlimit::UlimitSet::from_specs(specs) {
+            Ok(limits) => limits,
+            Err(error) => {
+                eprintln!("zerun exec: invalid persisted --ulimit: {error}");
+                return 1;
+            }
+        };
+        if let Err(error) = limits.apply() {
+            eprintln!("zerun exec: {error}");
+            return 1;
+        }
+    }
     if let Err(e) = crate::security::harden(seccomp, &capabilities, state.rootless) {
         eprintln!("zerun exec: {e}");
         return 1;

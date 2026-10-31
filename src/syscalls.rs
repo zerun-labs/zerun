@@ -24,6 +24,25 @@ pub fn effective_gid() -> libc::gid_t {
     unsafe { libc::getegid() }
 }
 
+/// Apply a per-process POSIX resource limit.
+///
+/// Callers reach this through the safe `rlimit` module. The syscall wrapper is
+/// kept here with the other kernel-facing operations.
+pub fn set_resource_limit(resource: c_int, soft: u64, hard: u64) -> ZResult<()> {
+    let soft = libc::rlim_t::try_from(soft)
+        .map_err(|_| crate::zerr!("soft resource limit does not fit rlim_t"))?;
+    let hard = libc::rlim_t::try_from(hard)
+        .map_err(|_| crate::zerr!("hard resource limit does not fit rlim_t"))?;
+    let limit = libc::rlimit {
+        rlim_cur: soft,
+        rlim_max: hard,
+    };
+    if unsafe { libc::setrlimit(resource as _, &limit) } != 0 {
+        return Err(last_err("setrlimit"));
+    }
+    Ok(())
+}
+
 /// Probe whether a PID currently exists. EPERM still means that the process
 /// exists but is not inspectable by this user.
 pub fn pid_exists(pid: libc::pid_t) -> bool {

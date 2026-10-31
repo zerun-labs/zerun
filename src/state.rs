@@ -373,6 +373,10 @@ pub struct ContainerState {
     /// default deny-by-default profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seccomp: Option<SeccompMode>,
+    /// Canonical per-process rlimits (`--ulimit`). None = legacy record with no
+    /// operator overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ulimits: Option<Vec<String>>,
     /// Canonical absolute path to this container's console.log. Runtime code
     /// derives it from the store and id; the field remains serialized for
     /// compatibility and inspection.
@@ -698,6 +702,7 @@ mod tests {
             restart_pending: false,
             capabilities: None,
             seccomp: None,
+            ulimits: None,
             log: String::new(),
             log_max_size: None,
             log_max_file: None,
@@ -720,6 +725,7 @@ mod tests {
         value.as_object_mut().unwrap().remove("restart_pending");
         value.as_object_mut().unwrap().remove("reaper_pid");
         value.as_object_mut().unwrap().remove("reaper_start_time");
+        value.as_object_mut().unwrap().remove("ulimits");
         let state: ContainerState = serde_json::from_value(value).unwrap();
         assert_eq!(state.stop_signal, libc::SIGTERM);
         assert_eq!(state.stop_timeout, DEFAULT_STOP_TIMEOUT_SECS);
@@ -728,6 +734,7 @@ mod tests {
         assert!(!state.restart_pending);
         assert_eq!(state.reaper_pid, None);
         assert_eq!(state.reaper_start_time, None);
+        assert_eq!(state.ulimits, None);
     }
 
     #[test]
@@ -808,6 +815,7 @@ mod tests {
             restart_pending: false,
             capabilities: None,
             seccomp: None,
+            ulimits: None,
             log: String::new(),
             log_max_size: None,
             log_max_file: None,
@@ -903,6 +911,7 @@ mod tests {
             restart_pending: false,
             capabilities: Some(vec!["CAP_NET_RAW".to_string()]),
             seccomp: Some(SeccompMode::Unconfined),
+            ulimits: None,
             log: format!("{}/x/console.log", std::env::temp_dir().display()),
             log_max_size: None,
             log_max_file: None,

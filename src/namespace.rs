@@ -51,6 +51,8 @@ pub struct RunSpec {
     pub net: NetMode,
     pub use_init: bool,
     pub limits: ResourceLimits,
+    /// Per-process POSIX limits applied to the workload.
+    pub ulimits: crate::rlimit::UlimitSet,
     pub seccomp: SeccompMode,
     /// Exact capability set left for the workload after security hardening.
     pub capabilities: security::CapabilitySet,
@@ -568,6 +570,11 @@ fn child_stage(
     if spec.readonly {
         make_root_readonly(identity.rootless)?;
     }
+
+    // 2c. Apply per-process rlimits while the setup process still has the
+    //     privileges needed to raise a hard limit up to the host ceiling.
+    spec.ulimits.apply()?;
+    trace::mark("child:ulimit:done");
 
     // 3. Security hardening: no_new_privs -> supplementary groups -> capability
     //    drop -> seccomp profile.

@@ -27,6 +27,7 @@ mod prompt;
 mod psfilter;
 mod pty;
 mod restart;
+mod rlimit;
 mod seccomp;
 mod security;
 mod service;
@@ -143,6 +144,8 @@ struct RunArgs {
     device_write_bps: Vec<cgroup::IoLimit>,
     device_read_iops: Vec<cgroup::IoLimit>,
     device_write_iops: Vec<cgroup::IoLimit>,
+    /// Process-level POSIX limits (`--ulimit TYPE=SOFT[:HARD]`).
+    ulimits: rlimit::UlimitSet,
     hostname: Option<String>,
     /// Container user (`--user USER[:GROUP]`; image `config.User` wins when no
     /// explicit flag is given).
@@ -259,6 +262,12 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             "--oom-group" => {
                 a.oom_group = true;
                 i += 1;
+            }
+            "--ulimit" => {
+                let value = next_value(args, &mut i, "--ulimit")?;
+                a.ulimits
+                    .insert_spec(&value)
+                    .map_err(|error| format!("--ulimit: {error}"))?;
             }
             "--cpus" => {
                 let v = next_value(args, &mut i, "--cpus")?;
@@ -496,6 +505,13 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             other if other.starts_with("--restart=") => {
                 a.restart = Some(other["--restart=".len()..].parse()?);
+                i += 1;
+            }
+            other if other.starts_with("--ulimit=") => {
+                let value = &other["--ulimit=".len()..];
+                a.ulimits
+                    .insert_spec(value)
+                    .map_err(|error| format!("--ulimit: {error}"))?;
                 i += 1;
             }
             other if other.starts_with("--cap-add=") => {
@@ -1092,6 +1108,21 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
             }
         };
 
+    let ulimits = if let Some(st) = &resume {
+        match st.ulimits.as_deref() {
+            Some(specs) => match rlimit::UlimitSet::from_specs(specs) {
+                Ok(limits) => limits,
+                Err(error) => {
+                    eprintln!("zerun start: invalid persisted --ulimit: {error}");
+                    return 1;
+                }
+            },
+            None => a.ulimits.clone(),
+        }
+    } else {
+        a.ulimits.clone()
+    };
+
     drop(image_store_lease);
     let container_fs = if let Some(st) = &resume {
         if st.overlay.is_some() {
@@ -1181,6 +1212,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         },
         seccomp,
         capabilities,
+        ulimits,
         tty: a.tty,
         interactive: a.interactive,
         overlay,
@@ -1614,6 +1646,7 @@ fn run_detached(
         restart_pending: false,
         capabilities: None,
         seccomp: None,
+        ulimits: None,
         labels: BTreeMap::new(),
         log: String::new(),
         log_max_size: None,
@@ -1668,6 +1701,7 @@ fn run_detached(
     st.restart_count = 0;
     st.capabilities = Some(spec.capabilities.names());
     st.seccomp = Some(spec.seccomp);
+    st.ulimits = (!spec.ulimits.is_empty()).then(|| spec.ulimits.canonical());
     st.labels = info.labels;
     st.log = log_path.display().to_string();
     st.log_max_size = Some(info.log.max_size);
@@ -1826,6 +1860,9 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     }
     if a.oom_group {
         args.push("--oom-group".to_string());
+    }
+    for value in a.ulimits.canonical() {
+        args.extend(["--ulimit".to_string(), value]);
     }
     for v in &a.device_read_bps {
         if let Some(limit) = v.read_bps {
@@ -6566,6 +6603,7 @@ RUN OPTIONS:\n  \
   --device-write-bps DEV:BYTES   cgroup v2 io.max write rate (repeatable)\n  \
   --device-read-iops DEV:COUNT   cgroup v2 io.max read IOPS (repeatable)\n  \
   --device-write-iops DEV:COUNT  cgroup v2 io.max write IOPS (repeatable)\n  \
+  --ulimit TYPE=SOFT[:HARD]      per-process rlimit (repeatable; -1 = unlimited)\n  \
   -h, --hostname H    container hostname (new UTS namespace)\n  \
   -u, --user USER[:GROUP]  run as container user (numeric or /etc/passwd name)\n  \
   --stop-signal SIGNAL     stop/restart signal (image StopSignal; default SIGTERM)\n  \
@@ -7170,6 +7208,42 @@ mod tests {
         assert!(launch_args.contains(&"--memory-reservation".to_string()));
         assert!(launch_args.contains(&"48M".to_string()));
         assert!(launch_args.contains(&"--oom-group".to_string()));
+    }
+
+    #[test]
+    fn parses_and_captures_process_ulimits() {
+        let args: Vec<_> = [
+            "--ulimit",
+            "nofile=64",
+            "--ulimit=nofile=32:96",
+            "--ulimit",
+            "as=1:2",
+            "alpine",
+            "true",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_run_args(&args).expect("valid ulimit arguments");
+        assert_eq!(a.ulimits.canonical(), vec!["as=1:2", "nofile=32:96"]);
+
+        let launch_args = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+        assert_eq!(
+            launch_args
+                .windows(2)
+                .filter(|pair| pair[0] == "--ulimit")
+                .map(|pair| pair[1].as_str())
+                .collect::<Vec<_>>(),
+            vec!["as=1:2", "nofile=32:96"]
+        );
+
+        for value in ["unknown=1", "nofile=2:1", "nofile=bad"] {
+            let args: Vec<_> = ["--ulimit", value, "alpine", "true"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            assert!(parse_run_args(&args).is_err(), "{value} should be rejected");
+        }
     }
 
     #[test]

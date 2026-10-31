@@ -1112,6 +1112,7 @@ mod attach_tests {
             restart_pending: false,
             capabilities: None,
             seccomp: Some(crate::seccomp::SeccompMode::Unconfined),
+            ulimits: None,
             log: String::new(),
             log_max_size: None,
             log_max_file: None,

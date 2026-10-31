@@ -19,7 +19,8 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
 
 - **M1 — isolation executor (done)**: namespace isolation (PID/MNT/UTS/IPC/NET/USER),
   corrected `pivot_root(".", ".")` sequence, container pseudo-filesystems, minimal `/dev`,
-  masked/readonly paths, capability dropping, cgroups v2 (memory/cpu/pids/io), optional
+  masked/readonly paths, capability dropping, cgroups v2 (memory/cpu/pids/io), per-process
+  rlimits, optional
   built-in mini-init, and a reproducible benchmark harness.
 - **M2 — storage & security (done)**: deny-by-default seccomp allowlist; per-run OverlayFS
   with disk upper and automatic cleanup; OCI whiteout materialization; safe host bind-mount
@@ -187,6 +188,7 @@ Run options (current subset):
 --device-write-bps DEV:RATE   cgroup v2 io.max (e.g. 8:0:10mb)
 --device-read-iops DEV:COUNT  cgroup v2 io.max
 --device-write-iops DEV:COUNT cgroup v2 io.max
+--ulimit TYPE=SOFT[:HARD]     per-process rlimit (repeatable; -1/unlimited)
 -h, --hostname H     container hostname (new UTS namespace)
 -u, --user USER[:GROUP]
                      run as a container user (numeric or from the image's /etc/passwd;
@@ -231,6 +233,15 @@ Run options (current subset):
                     optional B suffix; mode=/ro, repeatable; pairs naturally with
                     --read-only for /tmp-like scratch space)
 ```
+
+Cgroup flags bound aggregate container resource use. `--ulimit` additionally
+sets POSIX per-process limits; supported types match Docker (`core`, `cpu`,
+`data`, `fsize`, `locks`, `memlock`, `msgqueue`, `nice`, `nofile`, `nproc`,
+`rss`, `rtprio`, `rttime`, `sigpending`, `stack`, and `as`). A missing hard
+limit defaults to the soft value, `-1`/`unlimited` removes the ceiling, and a
+repeated type uses its last value. Detached restart and `exec` restore the
+persisted limits; raising a hard limit above the host ceiling still requires
+the corresponding host privilege and otherwise fails explicitly.
 
 `ZERUN_REGISTRY_MIRRORS` (comma-separated), a zerun config file
 (`/etc/zerun/config.toml` with `[registry] mirrors = [...]`, overridable via

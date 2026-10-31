@@ -160,6 +160,7 @@ mod tests {
             restart_pending: false,
             capabilities: None,
             seccomp: None,
+            ulimits: None,
             labels: BTreeMap::new(),
             log: String::new(),
             log_max_size: None,
