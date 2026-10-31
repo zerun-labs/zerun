@@ -47,6 +47,14 @@ const MAX_LOG_RECORD_BYTES: usize = 64 * 1024;
 /// stop reading or disconnect while the workload is silent.
 const MAX_ATTACH_CLIENTS: usize = 32;
 
+/// Bounded backoff between automatic restart attempts.
+const RESTART_INITIAL_DELAY: Duration = Duration::from_millis(100);
+const RESTART_MAX_DELAY: Duration = Duration::from_secs(1);
+/// A run at least this long resets the restart backoff.
+const RESTART_STABLE_AFTER: Duration = Duration::from_secs(10);
+/// Maximum time the reaper waits for a concurrent lifecycle command.
+const RESTART_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Persist the running transition before the detached CLI is released.
 ///
 /// This is deliberately a fallible boundary: a detached run without a durable
@@ -60,9 +68,13 @@ fn persist_started_state(
         .ok_or_else(|| crate::zerr!("detached state for {id} disappeared before start"))?;
     st.status = Status::Running;
     st.paused = false;
+    st.restart_pending = false;
     st.pid = Some(info.pid);
     st.pid_start_time = info.pid_start_time;
     st.started = Some(state::now_rfc3339());
+    st.finished = None;
+    st.exit_code = None;
+    st.metrics = None;
     st.ip = info.ip;
     st.table = info.table.clone();
     st.veth = info.veth.clone();
@@ -70,16 +82,17 @@ fn persist_started_state(
     st.save(store)
 }
 
-/// The detached reaper's whole job. Runs the container, persists state, then
-/// returns the exit code (the caller `_exit`s). `overlay_dir` (if any) is
-/// removed after the container exits; `started_w` carries the "0" (started)
-/// or "1:<error>" signal back to the `run -d` CLI.
+/// Console-log destination passed across the detached reaper fork.
 pub struct LogTarget<'a> {
     pub path: &'a Path,
     pub previous_fd: RawFd,
     pub options: LogOptions,
 }
 
+/// Run the detached workload, applying its restart policy between attempts.
+///
+/// The caller `_exit`s with the final workload code. `started_w` carries the
+/// "0" (started) or "1:<error>" signal back to the `run -d` CLI exactly once.
 pub fn run_detached(
     store: Store,
     spec: RunSpec,
@@ -90,7 +103,8 @@ pub fn run_detached(
 ) -> i32 {
     let id = spec.id.clone();
     // Replace inherited stdio with a timestamping collector before clone so
-    // the container's real stdout/stderr are the collector's write ends.
+    // the container's real stdout/stderr are the collector's write ends. The
+    // collector and attach hub remain installed across automatic restarts.
     let mut captured_log = match CapturedLog::install(log.path, log.previous_fd, log.options) {
         Ok(log) => log,
         Err(e) => {
@@ -101,39 +115,170 @@ pub fn run_detached(
             return 1;
         }
     };
+
     let mut signaled = false;
-    let mut code = 1;
-    let result = run_container_with_report(spec, |info| {
-        // Persist "running" before releasing the CLI so `ze ps` never sees a
-        // Created-but-alive container.
-        persist_started_state(&store, &id, info)?;
-        signaled = true;
-        let _ = write_all(started_w, b"0\n");
+    let mut started_once = false;
+    let mut start_error = None;
+    let mut code;
+    let mut backoff = RESTART_INITIAL_DELAY;
+    let mut held_restart_lock: Option<state::ContainerOperationLock> = None;
+    // Keep the operation lock until log/attach cleanup has finished so a
+    // `wait` that observes the final state cannot race a manual `start`.
+    let mut terminal_lock: Option<state::ContainerOperationLock> = None;
+    let reaper_pid = crate::syscalls::process_id();
+    let reaper_start_time = crate::procinfo::process_start_time(reaper_pid);
+    if let Err(error) = persist_reaper_claim(&store, &id, reaper_pid, reaper_start_time) {
+        eprintln!("zerun: claim detached container {id}: {error}");
+        let msg = format!("1: claim detached container: {error}\n");
+        let _ = write_all(started_w, msg.as_bytes());
         crate::syscalls::close(started_w);
-        Ok(())
-    });
-    let mut metrics = None;
-    match result {
-        Ok(exit) => {
-            code = exit.code;
-            metrics = exit.metrics;
-        }
-        Err(e) => {
-            // Setup failed before the child could exec (cgroup create, bridge
-            // allocation...). The error pipe path inside namespace.rs prints its
-            // own details for post-clone failures; this is the pre-clone kind.
-            let msg = format!("1: {e}\n");
-            let _ = write_all(started_w, msg.as_bytes());
-            crate::syscalls::close(started_w);
-            eprintln!("zerun: {e}");
-        }
+        captured_log.finish();
+        return 1;
     }
-    // If the hook never fired, the child failed during setup (the error pipe
-    // path in namespace.rs already printed details to our log) and the CLI is
-    // still blocked on the started pipe: tell it.
+
+    loop {
+        let attempt_started = Instant::now();
+        // A restart carries the lifecycle lock from the previous terminal
+        // state through backoff and this attempt. If setup fails before the
+        // started hook, it remains held for the next terminal-state write.
+        let mut start_lock = held_restart_lock.take();
+        code = 1;
+        let result = run_container_with_report(spec.clone(), |info| {
+            // Persist "running" before releasing the CLI so `ze ps` never sees
+            // a Created-but-alive container. On an automatic retry this also
+            // replaces the previous terminal attempt in one atomic write.
+            persist_started_state(&store, &id, info)?;
+            started_once = true;
+            // The reaper owns this lock only through the next successful
+            // exec. Releasing it here lets `stop`/`kill` address the new run.
+            drop(start_lock.take());
+            if !signaled {
+                signaled = true;
+                let _ = write_all(started_w, b"0\n");
+                crate::syscalls::close(started_w);
+            }
+            Ok(())
+        });
+        let attempt_elapsed = attempt_started.elapsed();
+
+        let mut metrics = None;
+        match result {
+            Ok(exit) => {
+                code = exit.code;
+                metrics = exit.metrics;
+            }
+            Err(error) => {
+                // Setup failed before the child could exec (cgroup create,
+                // bridge allocation...). The error pipe path inside
+                // namespace.rs prints its own details for post-clone failures;
+                // this is the pre-clone kind. The retry loop resets `code` to
+                // one before every attempt.
+                start_error = Some(error.to_string());
+                eprintln!("zerun: {error}");
+            }
+        }
+
+        // Coordinate the terminal write with lifecycle commands. The reaper
+        // identity in state keeps `ps`/`wait` from mistaking the short gap
+        // after a workload exits for a crashed reaper.
+        let operation_lock = match start_lock.or_else(|| {
+            state::ContainerOperationLock::acquire(&store, &id, RESTART_LOCK_TIMEOUT).ok()
+        }) {
+            Some(lock) => lock,
+            None => {
+                eprintln!(
+                    "zerun: warning: could not persist terminal state for container {id}: lifecycle lock busy"
+                );
+                break;
+            }
+        };
+
+        let Some(mut st) = ContainerState::load(&store, &id) else {
+            // `rm` or `--rm` removed the record (the latter cannot be combined
+            // with an enabled restart policy).
+            break;
+        };
+        if !reaper_owns_state(&st, reaper_pid, reaper_start_time) {
+            // A manual start replaced this reaper while it was unwinding.
+            break;
+        }
+        st.metrics = metrics.or(st.metrics);
+        st.status = Status::Exited;
+        st.paused = false;
+        st.exit_code = Some(code);
+        st.finished = Some(state::now_rfc3339());
+        let policy = st.restart_policy;
+        let completed_restarts = st.restart_count;
+        let restart_denied = state::restart_is_suppressed(&store, &id);
+        let will_restart =
+            started_once && !restart_denied && policy.should_restart(code, completed_restarts);
+
+        if will_restart {
+            // Count the attempt now, while its terminal state is written. A
+            // crash during setup therefore cannot make a finite policy spin.
+            st.restart_count = st.restart_count.saturating_add(1);
+            st.restart_pending = true;
+        } else {
+            st.restart_pending = false;
+            clear_reaper_claim(&mut st);
+        }
+        if let Err(error) = st.save(&store) {
+            eprintln!(
+                "zerun: warning: failed to persist final state for container {}: {error}",
+                st.id
+            );
+            break;
+        }
+        if !will_restart {
+            terminal_lock = Some(operation_lock);
+            break;
+        }
+
+        let delay = if attempt_elapsed >= RESTART_STABLE_AFTER {
+            RESTART_INITIAL_DELAY
+        } else {
+            backoff
+        };
+        backoff = next_restart_delay(delay);
+        // Do not hold the lifecycle lock while sleeping. Interactive commands
+        // must be able to mark a fast crash loop as stopped instead of racing
+        // the reaper for a lock it would otherwise never yield.
+        drop(operation_lock);
+        std::thread::sleep(delay);
+
+        let lock = match state::ContainerOperationLock::acquire(&store, &id, RESTART_LOCK_TIMEOUT) {
+            Ok(lock) => lock,
+            Err(error) => {
+                eprintln!("zerun: warning: automatic restart for container {id} stopped: {error}");
+                break;
+            }
+        };
+        if state::restart_is_suppressed(&store, &id) {
+            finish_cancelled_restart(&store, &id, reaper_pid, reaper_start_time);
+            terminal_lock = Some(lock);
+            break;
+        }
+        match ContainerState::load(&store, &id) {
+            Some(current)
+                if current.restart_pending
+                    && reaper_owns_state(&current, reaper_pid, reaper_start_time) => {}
+            _ => {
+                terminal_lock = Some(lock);
+                break;
+            }
+        }
+        held_restart_lock = Some(lock);
+    }
+
+    // If the initial attempt never reached exec, the CLI is still blocked on
+    // the started pipe. Report the most precise error available.
     if !signaled {
-        let msg = b"1: container setup failed (see console.log)\n";
-        let _ = write_all(started_w, msg);
+        let msg = if let Some(error) = start_error {
+            format!("1: {error}\n")
+        } else {
+            "1: container setup failed (see console.log)\n".to_string()
+        };
+        let _ = write_all(started_w, msg.as_bytes());
         crate::syscalls::close(started_w);
     }
 
@@ -141,21 +286,6 @@ pub fn run_detached(
     // state record is marked Exited.
     captured_log.finish();
 
-    // Final state: exited. Namespace capture already snapshotted metrics just
-    // before cgroup cleanup; keep any older snapshot when unavailable.
-    if let Some(mut st) = ContainerState::load(&store, &id) {
-        st.metrics = metrics.or(st.metrics);
-        st.status = Status::Exited;
-        st.paused = false;
-        st.exit_code = Some(code);
-        st.finished = Some(state::now_rfc3339());
-        if let Err(error) = st.save(&store) {
-            eprintln!(
-                "zerun: warning: failed to persist final state for container {}: {error}",
-                st.id
-            );
-        }
-    }
     // Keep the writable layer for an addressable exited container so it can be
     // committed or inspected later. `--rm` retains Docker's remove-on-exit
     // behavior; `rm` cleans up any other stopped container's layer.
@@ -171,7 +301,44 @@ pub fn run_detached(
         let dir = state::ContainerState::dir(&store, &id);
         fsutil::remove_dir_all_quiet(&dir);
     }
+    drop(terminal_lock);
     code
+}
+
+fn persist_reaper_claim(store: &Store, id: &str, pid: i32, start_time: Option<u64>) -> ZResult<()> {
+    let mut st = ContainerState::load(store, id)
+        .ok_or_else(|| crate::zerr!("detached state for {id} disappeared before reaper claim"))?;
+    st.reaper_pid = Some(pid);
+    st.reaper_start_time = start_time;
+    st.restart_pending = false;
+    st.save(store)
+}
+
+fn reaper_owns_state(st: &ContainerState, pid: i32, start_time: Option<u64>) -> bool {
+    st.reaper_pid == Some(pid) && st.reaper_start_time == start_time
+}
+
+fn clear_reaper_claim(st: &mut ContainerState) {
+    st.reaper_pid = None;
+    st.reaper_start_time = None;
+}
+
+fn finish_cancelled_restart(store: &Store, id: &str, pid: i32, start_time: Option<u64>) {
+    let Some(mut st) = ContainerState::load(store, id) else {
+        return;
+    };
+    if !reaper_owns_state(&st, pid, start_time) {
+        return;
+    }
+    st.restart_pending = false;
+    clear_reaper_claim(&mut st);
+    if let Err(error) = st.save(store) {
+        eprintln!("zerun: warning: failed to persist stopped restart for {id}: {error}");
+    }
+}
+
+fn next_restart_delay(delay: Duration) -> Duration {
+    delay.saturating_mul(2).min(RESTART_MAX_DELAY)
 }
 
 /// Background pipe -> timestamped console.log collector.
@@ -524,7 +691,24 @@ fn write_timestamped_line(output: &mut RotatingLog, line: &[u8]) -> std::io::Res
 /// reclaim its host-side resources (nft table, veth, cgroup, IPAM slot).
 /// Returns true when the record changed.
 pub fn reconcile_stale(store: &Store, st: &mut ContainerState) -> bool {
+    // A terminal attempt may still belong to a live reaper waiting to retry.
+    // Only the reaper itself may clear this marker; once it is gone, preserve
+    // the last exit code but make the record terminal.
+    if st.status == Status::Exited && st.restart_pending {
+        if st.reaper_alive() {
+            return false;
+        }
+        st.restart_pending = false;
+        st.reaper_pid = None;
+        st.reaper_start_time = None;
+        return true;
+    }
     if st.status != Status::Running || st.pid_alive() {
+        return false;
+    }
+    // The workload can exit just before its reaper persists the restart
+    // decision. A live reaper still owns this lifecycle record.
+    if st.reaper_alive() {
         return false;
     }
     // The PID is gone but state still says running: the reaper was killed or
@@ -562,6 +746,9 @@ pub fn reconcile_stale(store: &Store, st: &mut ContainerState) -> bool {
     }
     st.status = Status::Exited;
     st.paused = false;
+    st.restart_pending = false;
+    st.reaper_pid = None;
+    st.reaper_start_time = None;
     st.exit_code = st.exit_code.or(Some(137)); // SIGKILL-ish default
     st.finished = Some(state::now_rfc3339());
     st.table = None;
@@ -597,13 +784,13 @@ pub fn settle_exit(store: &Store, id: &str) -> ZResult<()> {
     while Instant::now() < deadline {
         match ContainerState::load(store, id) {
             None => return Ok(()), // --rm already removed the record
-            Some(st) if st.status != Status::Running => return Ok(()),
+            Some(st) if st.status != Status::Running && !st.restart_pending => return Ok(()),
             Some(_) => {}
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     if let Some(mut st) = ContainerState::load(store, id) {
-        if st.status == Status::Running && !st.pid_alive() {
+        if st.restart_pending || (st.status == Status::Running && !st.pid_alive()) {
             reconcile_stale_and_save(store, &mut st)?;
         }
     }
@@ -900,6 +1087,8 @@ mod attach_tests {
             image: "rootfs:/tmp/rootfs".to_string(),
             pid: Some(i32::MAX),
             pid_start_time: None,
+            reaper_pid: None,
+            reaper_start_time: None,
             status: Status::Running,
             paused: false,
             exit_code: None,
@@ -918,6 +1107,9 @@ mod attach_tests {
             user: None,
             stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
             stop_timeout: crate::state::DEFAULT_STOP_TIMEOUT_SECS,
+            restart_policy: crate::restart::RestartPolicy::No,
+            restart_count: 0,
+            restart_pending: false,
             capabilities: None,
             seccomp: Some(crate::seccomp::SeccompMode::Unconfined),
             log: String::new(),

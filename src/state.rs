@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Default grace period between the configured stop signal and SIGKILL.
 pub const DEFAULT_STOP_TIMEOUT_SECS: u64 = 10;
@@ -59,19 +59,52 @@ impl ContainerOperationLock {
     /// command owns the container; silently queueing behind a long-running
     /// `start` can make the caller operate on stale state.
     pub fn try_acquire(store: &Store, id: &str) -> Result<Self, String> {
+        let file = Self::open(store, id)?;
+        file.try_lock()
+            .map_err(|e| format!("container {id} is busy with another lifecycle operation: {e}"))?;
+        Ok(Self { file })
+    }
+
+    /// Acquire a lifecycle lock, waiting briefly for a reaper handoff.
+    ///
+    /// Operators issue `stop`/`kill`/`rm` while an automatic restart may be
+    /// between attempts. The reaper holds this same lock across its short
+    /// backoff so a manual stop cannot race a relaunch. Interactive commands
+    /// retain their fail-fast behavior via `try_acquire`.
+    pub fn acquire(store: &Store, id: &str, timeout: Duration) -> Result<Self, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let file = Self::open(store, id)?;
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { file }),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(format!(
+                            "container {id} is busy with another lifecycle operation"
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(format!(
+                        "lock container {id} for a lifecycle operation: {error}"
+                    ));
+                }
+            }
+        }
+    }
+
+    fn open(store: &Store, id: &str) -> Result<File, String> {
         let dir = store.run_root().join("locks");
         fsutil::mkdir_p(&dir).map_err(|e| e.to_string())?;
         let path = dir.join(format!("{id}.lock"));
-        let file = OpenOptions::new()
+        OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(&path)
-            .map_err(|e| format!("open container lock {}: {e}", path.display()))?;
-        file.try_lock()
-            .map_err(|e| format!("container {id} is busy with another lifecycle operation: {e}"))?;
-        Ok(Self { file })
+            .map_err(|e| format!("open container lock {}: {e}", path.display()))
     }
 }
 
@@ -115,6 +148,39 @@ impl ContainerNameLock {
 impl Drop for ContainerNameLock {
     fn drop(&mut self) {
         let _ = self.file.unlock();
+    }
+}
+
+/// Manual-stop marker read by the restarting reaper.
+///
+/// Keeping this outside `state.json` avoids a last-writer race: `stop` can
+/// create the marker before signalling while the reaper atomically rewrites the
+/// terminal state record. `start` removes the marker after acquiring the
+/// lifecycle lock, which re-enables the persisted restart policy.
+fn restart_suppression_path(store: &Store, id: &str) -> PathBuf {
+    ContainerState::dir(store, id).join("restart.suppressed")
+}
+
+pub fn restart_is_suppressed(store: &Store, id: &str) -> bool {
+    valid_id(id) && restart_suppression_path(store, id).exists()
+}
+
+pub fn suppress_restart(store: &Store, id: &str) -> ZResult<()> {
+    if !valid_id(id) {
+        return Err(crate::zerr!("invalid container id '{id}'"));
+    }
+    let path = restart_suppression_path(store, id);
+    fsutil::atomic_write_mode(&path, b"", 0o600)
+}
+
+pub fn clear_restart_suppression(store: &Store, id: &str) -> ZResult<()> {
+    if !valid_id(id) {
+        return Err(crate::zerr!("invalid container id '{id}'"));
+    }
+    match std::fs::remove_file(restart_suppression_path(store, id)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(crate::zerr!("remove restart suppression for {id}: {error}")),
     }
 }
 
@@ -243,6 +309,13 @@ pub struct ContainerState {
     /// `/proc/<pid>/stat` starttime in clock ticks, used to detect PID reuse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid_start_time: Option<u64>,
+    /// Per-container reaper process. Unlike `pid`, this stays alive between
+    /// attempts while an automatic restart is pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaper_pid: Option<i32>,
+    /// `/proc/<pid>/stat` starttime for `reaper_pid`, guarding against PID reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaper_start_time: Option<u64>,
     pub status: Status,
     /// True while the detached container's cgroup freezer is active.
     #[serde(default)]
@@ -283,6 +356,15 @@ pub struct ContainerState {
     /// Older records use the runtime default.
     #[serde(default = "default_stop_timeout")]
     pub stop_timeout: u64,
+    /// Detached restart policy. Older records never restart automatically.
+    #[serde(default)]
+    pub restart_policy: crate::restart::RestartPolicy,
+    /// Automatic restart attempts completed since the last manual start.
+    #[serde(default)]
+    pub restart_count: u32,
+    /// True while this reaper is waiting to relaunch the workload.
+    #[serde(default)]
+    pub restart_pending: bool,
     /// Exact capability set left for the workload. None = legacy record using
     /// the secure default set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -403,6 +485,9 @@ impl ContainerState {
 
     /// Human-friendly status line for `ze ps`.
     pub fn status_label(&self) -> String {
+        if self.restart_pending {
+            return format!("Restarting ({})", self.exit_code.unwrap_or(-1));
+        }
         match self.status {
             Status::Running if self.paused => "Up (Paused)".to_string(),
             Status::Running => "Up".to_string(),
@@ -416,16 +501,26 @@ impl ContainerState {
     /// files without `pid_start_time` retain the historical kill(2)-only
     /// fallback for backward compatibility.
     pub fn pid_alive(&self) -> bool {
-        let Some(pid) = self.pid.filter(|pid| *pid > 0) else {
-            return false;
-        };
-        let alive = syscalls::pid_exists(pid);
-        if !alive {
-            return false;
-        }
-        self.pid_start_time
-            .is_none_or(|expected| crate::procinfo::process_start_time(pid) == Some(expected))
+        process_is_alive(self.pid, self.pid_start_time)
     }
+
+    /// Whether the detached reaper that owns this record is still alive.
+    ///
+    /// New records persist both the PID and its kernel start time. Legacy
+    /// records have no reaper identity and rely on the workload PID alone.
+    pub fn reaper_alive(&self) -> bool {
+        process_is_alive(self.reaper_pid, self.reaper_start_time)
+    }
+}
+
+fn process_is_alive(pid: Option<i32>, start_time: Option<u64>) -> bool {
+    let Some(pid) = pid.filter(|pid| *pid > 0) else {
+        return false;
+    };
+    if !syscalls::pid_exists(pid) {
+        return false;
+    }
+    start_time.is_none_or(|expected| crate::procinfo::process_start_time(pid) == Some(expected))
 }
 
 /// ISO-8601-ish timestamp for state records.
@@ -578,6 +673,8 @@ mod tests {
             image: "alpine".to_string(),
             pid: None,
             pid_start_time: None,
+            reaper_pid: None,
+            reaper_start_time: None,
             status: Status::Exited,
             paused: false,
             exit_code: Some(0),
@@ -596,6 +693,9 @@ mod tests {
             user: None,
             stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
             stop_timeout: DEFAULT_STOP_TIMEOUT_SECS,
+            restart_policy: crate::restart::RestartPolicy::No,
+            restart_count: 0,
+            restart_pending: false,
             capabilities: None,
             seccomp: None,
             log: String::new(),
@@ -615,9 +715,19 @@ mod tests {
         .unwrap();
         value.as_object_mut().unwrap().remove("stop_signal");
         value.as_object_mut().unwrap().remove("stop_timeout");
+        value.as_object_mut().unwrap().remove("restart_policy");
+        value.as_object_mut().unwrap().remove("restart_count");
+        value.as_object_mut().unwrap().remove("restart_pending");
+        value.as_object_mut().unwrap().remove("reaper_pid");
+        value.as_object_mut().unwrap().remove("reaper_start_time");
         let state: ContainerState = serde_json::from_value(value).unwrap();
         assert_eq!(state.stop_signal, libc::SIGTERM);
         assert_eq!(state.stop_timeout, DEFAULT_STOP_TIMEOUT_SECS);
+        assert_eq!(state.restart_policy, crate::restart::RestartPolicy::No);
+        assert_eq!(state.restart_count, 0);
+        assert!(!state.restart_pending);
+        assert_eq!(state.reaper_pid, None);
+        assert_eq!(state.reaper_start_time, None);
     }
 
     #[test]
@@ -673,6 +783,8 @@ mod tests {
             image: "alpine".to_string(),
             pid: Some(std::process::id() as i32),
             pid_start_time: crate::procinfo::process_start_time(std::process::id() as i32),
+            reaper_pid: None,
+            reaper_start_time: None,
             status: Status::Running,
             paused: false,
             exit_code: None,
@@ -691,6 +803,9 @@ mod tests {
             user: None,
             stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
             stop_timeout: DEFAULT_STOP_TIMEOUT_SECS,
+            restart_policy: crate::restart::RestartPolicy::No,
+            restart_count: 0,
+            restart_pending: false,
             capabilities: None,
             seccomp: None,
             log: String::new(),
@@ -710,6 +825,12 @@ mod tests {
         assert!(state.pid_alive());
         state.pid_start_time = state.pid_start_time.map(|start| start.saturating_add(1));
         assert!(!state.pid_alive());
+
+        state.reaper_pid = Some(std::process::id() as i32);
+        state.reaper_start_time = crate::procinfo::process_start_time(std::process::id() as i32);
+        assert!(state.reaper_alive());
+        state.reaper_start_time = state.reaper_start_time.map(|start| start.saturating_add(1));
+        assert!(!state.reaper_alive());
     }
 
     #[test]
@@ -757,6 +878,8 @@ mod tests {
             image: "alpine:latest".to_string(),
             pid: None,
             pid_start_time: None,
+            reaper_pid: None,
+            reaper_start_time: None,
             status: Status::Exited,
             paused: false,
             exit_code: Some(0),
@@ -775,6 +898,9 @@ mod tests {
             user: None,
             stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
             stop_timeout: DEFAULT_STOP_TIMEOUT_SECS,
+            restart_policy: crate::restart::RestartPolicy::No,
+            restart_count: 0,
+            restart_pending: false,
             capabilities: Some(vec!["CAP_NET_RAW".to_string()]),
             seccomp: Some(SeccompMode::Unconfined),
             log: format!("{}/x/console.log", std::env::temp_dir().display()),
@@ -851,6 +977,36 @@ mod tests {
         assert!(ContainerOperationLock::try_acquire(&store, "abc123").is_err());
         drop(first);
         assert!(ContainerOperationLock::try_acquire(&store, "abc123").is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restart_suppression_marker_is_private_and_removable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "zerun-state-restart-marker-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.join("data"), root.join("run"));
+        store.ensure_dirs().unwrap();
+
+        let id = "abc123";
+        assert!(!restart_is_suppressed(&store, id));
+        suppress_restart(&store, id).unwrap();
+        assert!(restart_is_suppressed(&store, id));
+        let mode = std::fs::metadata(restart_suppression_path(&store, id))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        clear_restart_suppression(&store, id).unwrap();
+        assert!(!restart_is_suppressed(&store, id));
+        assert!(suppress_restart(&store, "../outside").is_err());
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

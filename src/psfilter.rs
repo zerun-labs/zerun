@@ -10,6 +10,7 @@ use crate::state::{ContainerState, Status};
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PsFilter {
     status: Option<Status>,
+    restarting: Option<bool>,
     paused: Option<bool>,
     name: Option<String>,
     id: Option<String>,
@@ -25,15 +26,17 @@ impl PsFilter {
         let invalid = |what: &str| Err(format!("invalid {what}: {value:?}"));
         match key {
             "status" => {
-                let (status, paused) = match value {
-                    "created" => (Status::Created, None),
-                    "running" => (Status::Running, Some(false)),
-                    "paused" => (Status::Running, Some(true)),
-                    "exited" => (Status::Exited, None),
+                let (status, paused, restarting) = match value {
+                    "created" => (Status::Created, None, Some(false)),
+                    "running" => (Status::Running, Some(false), Some(false)),
+                    "paused" => (Status::Running, Some(true), Some(false)),
+                    "restarting" => (Status::Exited, None, Some(true)),
+                    "exited" => (Status::Exited, None, Some(false)),
                     _ => return invalid("status"),
                 };
                 self.status = Some(status);
                 self.paused = paused;
+                self.restarting = restarting;
                 Ok(())
             }
             "name" | "id" | "image" | "net" => {
@@ -73,12 +76,17 @@ impl PsFilter {
 
     /// Whether the filter must see non-running records to be meaningful.
     pub fn widens_status(&self) -> bool {
-        self.status.is_some_and(|status| status != Status::Running) || self.exit_code.is_some()
+        self.status.is_some_and(|status| status != Status::Running)
+            || self.restarting == Some(true)
+            || self.exit_code.is_some()
     }
 
     /// Whether a record satisfies every configured selector.
     pub fn matches(&self, state: &ContainerState) -> bool {
         let status_ok = self.status.is_none_or(|want| state.status == want);
+        let restarting_ok = self
+            .restarting
+            .is_none_or(|want| state.restart_pending == want);
         let paused_ok = self.paused.is_none_or(|want| state.paused == want);
         let id_ok = self
             .id
@@ -101,7 +109,15 @@ impl PsFilter {
                 .get(name)
                 .is_some_and(|found| wanted.as_ref().is_none_or(|value| found == value))
         });
-        status_ok && paused_ok && id_ok && name_ok && image_ok && net_ok && exit_ok && labels_ok
+        status_ok
+            && restarting_ok
+            && paused_ok
+            && id_ok
+            && name_ok
+            && image_ok
+            && net_ok
+            && exit_ok
+            && labels_ok
     }
 }
 
@@ -119,6 +135,8 @@ mod tests {
             image: "alpine:latest".to_string(),
             pid: None,
             pid_start_time: None,
+            reaper_pid: None,
+            reaper_start_time: None,
             status,
             paused: false,
             exit_code,
@@ -137,6 +155,9 @@ mod tests {
             user: None,
             stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
             stop_timeout: crate::state::DEFAULT_STOP_TIMEOUT_SECS,
+            restart_policy: crate::restart::RestartPolicy::No,
+            restart_count: 0,
+            restart_pending: false,
             capabilities: None,
             seccomp: None,
             labels: BTreeMap::new(),
@@ -169,6 +190,15 @@ mod tests {
         assert!(filter("exitCode", "7").matches(&state(Status::Exited, Some(7))));
         assert!(!filter("exitCode", "0").matches(&state(Status::Exited, Some(7))));
         assert!(PsFilter::default().set("exitCode", "x").is_err());
+    }
+
+    #[test]
+    fn restarting_status_is_distinct_from_exited() {
+        let mut restarting = state(Status::Exited, Some(7));
+        restarting.restart_pending = true;
+        assert!(filter("status", "restarting").matches(&restarting));
+        assert!(!filter("status", "exited").matches(&restarting));
+        assert!(filter("status", "exited").matches(&state(Status::Exited, Some(7))));
     }
 
     #[test]
@@ -227,6 +257,7 @@ mod tests {
     fn status_selector_widens_default_ps_view() {
         assert!(filter("status", "exited").widens_status());
         assert!(filter("status", "created").widens_status());
+        assert!(filter("status", "restarting").widens_status());
         assert!(filter("exitCode", "0").widens_status());
         assert!(!filter("status", "running").widens_status());
         assert!(!filter("name", "web").widens_status());

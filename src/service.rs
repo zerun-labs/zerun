@@ -287,7 +287,7 @@ pub fn print_usage() {
          zerun generate-service [RUN OPTIONS] IMAGE [CMD [ARGS...]]\n  \
          zerun generate-service [RUN OPTIONS] --rootfs DIR [--] CMD [ARGS...]\n\n\
          Writes a systemd unit to stdout. Most zerun run options are supported;\n\
-         -d/--detach and --rm are rejected because systemd owns the lifecycle."
+         -d/--detach, --rm, and --restart are rejected because systemd owns the lifecycle."
     );
 }
 
@@ -307,6 +307,11 @@ fn validate(a: &RunArgs, rootful: bool) -> Result<(), String> {
     }
     if a.rm {
         return Err("--rm cannot be used with generate-service; systemd owns the lifecycle".into());
+    }
+    if a.restart.is_some() {
+        return Err(
+            "--restart cannot be used with generate-service; systemd owns restart policy".into(),
+        );
     }
     if a.tty || a.interactive {
         return Err(
@@ -708,6 +713,10 @@ mod tests {
 
         let detached = args(&["-d", "alpine"]);
         assert!(render(Path::new("/bin/zerun"), &detached, true).is_err());
+
+        let restart = args(&["--restart", "always", "alpine"]);
+        let err = render(Path::new("/bin/zerun"), &restart, true).unwrap_err();
+        assert!(err.contains("systemd owns restart policy"));
     }
 
     #[test]

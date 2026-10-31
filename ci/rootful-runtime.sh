@@ -212,6 +212,45 @@ done
 "${zerun[@]}" wait "$restart_id" >/dev/null
 "${zerun[@]}" rm "$restart_id" >/dev/null
 
+# Automatic restart policies are evaluated by the same reaper. Bind a published
+# port so a retry also proves the previous proxy released its listener before
+# the next attempt starts.
+policy_port=$(find_free_tcp_port)
+policy_id=$("${zerun[@]}" run -d --restart=on-failure:1 --rootfs "$rootfs"   --no-overlay --net bridge -p "$policy_port:8080" --init --   /bin/sh -c 'printf "restart-policy\n"; exit 7')
+cleanup_ids+=("$policy_id")
+policy_code=$("${zerun[@]}" wait "$policy_id")
+test "$policy_code" -eq 7
+policy_logs=$("${zerun[@]}" logs "$policy_id")
+test "$(grep -c '^restart-policy$' <<<"$policy_logs" || true)" -eq 2
+policy_inspect=$("${zerun[@]}" inspect "$policy_id")
+grep -q '"restart_policy": "on-failure:1"' <<<"$policy_inspect"
+grep -q '"restart_count": 1' <<<"$policy_inspect"
+grep -q '"restart_pending": false' <<<"$policy_inspect"
+"${zerun[@]}" rm "$policy_id" >/dev/null
+
+# A manual stop suppresses a pending automatic restart. A later manual start
+# clears that marker and re-enables the persisted policy.
+always_id=$("${zerun[@]}" run -d --restart=always --rootfs "$rootfs"   --no-overlay --net none --init -- /bin/sh -c   'printf "always-attempt\n"; while :; do sleep 1; done')
+cleanup_ids+=("$always_id")
+for attempt in $(seq 1 50); do
+  always_logs=$("${zerun[@]}" logs "$always_id" 2>/dev/null || true)
+  if grep -Fxq always-attempt <<<"$always_logs"; then
+    break
+  fi
+  if (( attempt == 50 )); then
+    echo "restart-policy workload did not start" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+"${zerun[@]}" stop --time 1 "$always_id" >/dev/null
+"${zerun[@]}" wait "$always_id" >/dev/null
+always_before=$(grep -c '^always-attempt$' <<<"$("${zerun[@]}" logs "$always_id")" || true)
+sleep 0.5
+always_after=$(grep -c '^always-attempt$' <<<"$("${zerun[@]}" logs "$always_id")" || true)
+test "$always_after" -eq "$always_before"
+"${zerun[@]}" rm "$always_id" >/dev/null
+
 # A configured stop signal must reach the workload through mini-init. The
 # shell child traps SIGUSR1 and exits with a distinctive code, proving Zerun
 # did not silently substitute SIGTERM or leave the signal queued on PID 1.

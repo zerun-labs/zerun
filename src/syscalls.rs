@@ -9,6 +9,11 @@ use std::path::Path;
 
 // ---------- process identity / host queries ----------
 
+/// Return the current process ID without exposing libc's unsafe query to callers.
+pub fn process_id() -> libc::pid_t {
+    unsafe { libc::getpid() }
+}
+
 /// Return the effective UID without exposing libc's unsafe query to callers.
 pub fn effective_uid() -> libc::uid_t {
     unsafe { libc::geteuid() }
@@ -683,8 +688,10 @@ const PAGE_SIZE: usize = 4096;
 /// New PID/NET/etc. namespaces must be created by a new child process; the caller
 /// never enters them itself. The child stack is an anonymous mmap (lazily
 /// populated, unlike a zeroed Box array, so debug builds do not overflow the
-/// parent stack) with a PROT_NONE guard page below it. The mapping is leaked until
-/// process exit — acceptable because CLI processes are short-lived.
+/// parent stack) with a PROT_NONE guard page below it. Without `CLONE_VM` the
+/// child receives a private copy-on-write view, so the parent releases its own
+/// mapping immediately after a successful clone; this matters for the
+/// long-lived detached reaper, which repeats the clone for restart attempts.
 pub fn clone_into<F>(flags: c_int, child_fn: F) -> ZResult<i32>
 where
     F: FnOnce() -> ZResult<()> + Send + 'static,
@@ -725,6 +732,18 @@ where
             libc::munmap(base, total);
         }
         return Err(last_err("clone"));
+    }
+    // clone(2) without CLONE_VM gives the child a copy-on-write memory map.
+    // Keeping a CLONE_VM child on an ordinary Rust stack would be unsound, so
+    // every caller uses the copy-on-write form. Release the parent's stack and
+    // closure after the address spaces have diverged; the child owns its own
+    // copies, and a restarting reaper must not leak one closure per attempt.
+    debug_assert_eq!(flags & libc::CLONE_VM, 0);
+    if flags & libc::CLONE_VM == 0 {
+        unsafe {
+            drop(Box::from_raw(arg as *mut F));
+            libc::munmap(base, total);
+        }
     }
     Ok(pid)
 }

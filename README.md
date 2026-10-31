@@ -42,7 +42,8 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   redirects stdio to `console.log` and persists state to disk;
   `ps [-a] [-q] [--format table|json] [--filter KEY=VALUE]`, `start`, `pause`, `unpause`, `stop`, `restart`,
   `rm`, `prune [-f] [--images]`, `logs [--since/--until/-f]`, `stats`, `exec`, `attach`, and `commit` address containers by id/name with crash reconcile
-  of stale records; file-based IPAM; `--rm` for auto-removal (see AGENTS.md).
+  of stale records; `run -d --restart` applies Docker-style restart policies inside the
+  per-container reaper; file-based IPAM; `--rm` for auto-removal (see AGENTS.md).
 - **M6 — operations and distribution (done)**: `generate-service` emits declarative foreground
   systemd units; `install.sh` verifies checksums, detects architectures, supports rootless
   installation, and creates the `ze` alias; Arch and Homebrew source packaging is included.
@@ -190,6 +191,8 @@ Run options (current subset):
                      translated to this signal)
 --stop-timeout S     seconds to wait for the stop signal before SIGKILL (default 10;
                      generate-service maps this to TimeoutStopSec)
+--restart POLICY     detached restart policy: no, on-failure[:MAX], always, or
+                     unless-stopped (requires -d; incompatible with --rm)
 --net bridge|none|host
                      bridge = rootful bridge networking on zerun0 (veth + eth0 in container;
                      rootful default); none = fresh netns with loopback only (rootless default);
@@ -293,11 +296,13 @@ registry or daemon involved anywhere in the path.
 ```bash
 # Run in the background (prints the container id once the workload has started)
 sudo target/release/zerun run -d --name web -p 18080:80 --net bridge --init \
+  --restart=on-failure:3 \
   alpine /bin/sh -c 'while true; do echo hi | nc -l -p 80; done'
 
 sudo target/release/zerun ps                          # running containers
 sudo target/release/zerun ps -a --filter name=web     # inspect one container's records
 sudo target/release/zerun ps --filter status=exited   # exited detached containers
+sudo target/release/zerun ps --filter status=restarting
 sudo target/release/zerun ps --filter exitCode=0      # successful detached exits
 sudo target/release/zerun ps --filter label=tier=prod # containers with a label key/value
 sudo target/release/zerun ps -q                       # container IDs only
@@ -329,6 +334,18 @@ sudo target/release/zerun system df                   # image and container disk
 Detached containers keep no daemon: the per-container reaper is a tiny process that
 disappears when the container exits. If the host crashes (or the reaper is killed), the
 next `ps`/`rm` reconciles the stale record and reclaims host-side resources.
+
+`--restart=on-failure[:MAX]` retries non-zero exits (an omitted or zero maximum is
+unlimited), `always` retries every exit, and `unless-stopped` retries every exit until a
+manual stop. Retries use a bounded 100 ms-to-1 s backoff, and `ps` reports the transient
+state as `Restarting`. `wait` and `logs -f` follow the policy across attempts, so they
+return only after a terminal exit or a manual stop. `stop`, `kill` when it terminates the
+workload, and `rm -f` suppress pending automatic restarts; a later manual `start`
+reactivates the persisted policy. Because Zerun has no daemon or boot-time state loader,
+`always` and `unless-stopped` have the same effect for the lifetime of the per-container
+reaper; neither recreates a container after a host reboot. `--restart` requires `-d`,
+cannot be combined with `--rm`, and is rejected by `generate-service` because systemd owns
+service restart semantics.
 `-p` can bind a specific host address (`127.0.0.1:18080:80` or `[::1]:18080:80`);
 `zerun port` and `ps` display the selected bind address. Repeatable
 `--add-host NAME:IP` entries are written to the container `/etc/hosts`; the special

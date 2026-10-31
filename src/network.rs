@@ -25,9 +25,9 @@
 //! `bind_port_proxies` opens one listener per published port on 0.0.0.0 and
 //! forwards accepted TCP connections to the container IP. Active TCP proxy
 //! connections are bounded per container across all published ports so a
-//! connection flood cannot create unbounded pump threads. The listeners live
-//! exactly as long as the parent (foreground CLI or detached reaper) waits on
-//! the container, so they disappear with the run.
+//! connection flood cannot create unbounded pump threads. Each proxy's
+//! receive loop is stopped and joined before the next automatic restart
+//! attempt, so a long-lived detached reaper can bind the same host ports again.
 //!
 //! IPv4 address allocation is deterministic from the container id (no daemon,
 //! no shared state) and serialized in a file-based IPAM under
@@ -216,10 +216,24 @@ impl HostNet {
 const TCP_PROXY_CONNECTION_LIMIT: usize = 64;
 
 /// One listening host port forwarded to the container (userland `-p` proxy).
-/// Dropping the proxy closes the listener; pump threads are detached and die
-/// with the owning process, which never outlives the container run.
+///
+/// Dropping the proxy stops its receive loop and joins it. A detached reaper
+/// reuses the same process for automatic restart attempts, so listeners must
+/// release their host ports between attempts instead of living until that
+/// process exits.
 pub struct PortProxy {
     _listener: ProxyListener,
+    stop: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for PortProxy {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 enum ProxyListener {
@@ -248,16 +262,26 @@ impl PortProxy {
                 let thread_listener = listener
                     .try_clone()
                     .map_err(|e| crate::zerr!("clone listener for {host_label}:{host}: {e}"))?;
-                thread::Builder::new()
+                let stop = Arc::new(AtomicBool::new(false));
+                let worker_stop = Arc::clone(&stop);
+                let worker = thread::Builder::new()
                     .name("zerun-port-tcp".to_string())
                     .spawn(move || {
-                        accept_loop(thread_listener, container_ip, container, tcp_connections)
+                        accept_loop(
+                            thread_listener,
+                            container_ip,
+                            container,
+                            tcp_connections,
+                            worker_stop,
+                        )
                     })
                     .map_err(|e| {
                         crate::zerr!("spawn TCP port proxy for {host_label}:{host}: {e}")
                     })?;
                 Ok(PortProxy {
                     _listener: ProxyListener::Tcp(listener),
+                    stop,
+                    worker: Some(worker),
                 })
             }
             PortProtocol::Udp => {
@@ -269,14 +293,18 @@ impl PortProxy {
                 let thread_listener = listener
                     .try_clone()
                     .map_err(|e| crate::zerr!("clone UDP socket for {host_label}:{host}: {e}"))?;
-                thread::Builder::new()
+                let stop = Arc::new(AtomicBool::new(false));
+                let worker_stop = Arc::clone(&stop);
+                let worker = thread::Builder::new()
                     .name("zerun-port-udp".to_string())
-                    .spawn(move || udp_loop(thread_listener, container_ip, container))
+                    .spawn(move || udp_loop(thread_listener, container_ip, container, worker_stop))
                     .map_err(|e| {
                         crate::zerr!("spawn UDP port proxy for {host_label}:{host}: {e}")
                     })?;
                 Ok(PortProxy {
                     _listener: ProxyListener::Udp(listener),
+                    stop,
+                    worker: Some(worker),
                 })
             }
         }
@@ -331,34 +359,49 @@ fn try_acquire_tcp_proxy_slot(connections: &Arc<AtomicUsize>) -> Option<TcpProxy
         .map(|_| TcpProxySlot(Arc::clone(connections)))
 }
 
-/// Accept connections until the listener is dropped, then forward each one.
+/// Accept connections until the proxy is dropped, then forward each one.
 fn accept_loop(
     listener: TcpListener,
     container_ip: Ipv4Addr,
     container: u16,
     connections: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
 ) {
+    if let Err(error) = listener.set_nonblocking(true) {
+        eprintln!("zerun: warn: configure TCP port proxy: {error}");
+        return;
+    }
     let mut warned_full = false;
-    for conn in listener.incoming() {
-        let Ok(client) = conn else { break }; // listener closed -> shutdown
-        let Some(slot) = try_acquire_tcp_proxy_slot(&connections) else {
-            if !warned_full {
-                eprintln!(
-                    "zerun: warn: TCP port proxy connection limit ({TCP_PROXY_CONNECTION_LIMIT}) reached; dropping new connections"
-                );
-                warned_full = true;
+    while !stop.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((client, _)) => {
+                let Some(slot) = try_acquire_tcp_proxy_slot(&connections) else {
+                    if !warned_full {
+                        eprintln!(
+                            "zerun: warn: TCP port proxy connection limit ({TCP_PROXY_CONNECTION_LIMIT}) reached; dropping new connections"
+                        );
+                        warned_full = true;
+                    }
+                    continue;
+                };
+                warned_full = false;
+                if let Err(error) = thread::Builder::new()
+                    .name("zerun-port-client".to_string())
+                    .spawn(move || {
+                        let _slot = slot;
+                        let _ = forward(client, container_ip, container);
+                    })
+                {
+                    eprintln!("zerun: warn: failed to spawn TCP port client proxy: {error}");
+                }
             }
-            continue;
-        };
-        warned_full = false;
-        if let Err(error) = thread::Builder::new()
-            .name("zerun-port-client".to_string())
-            .spawn(move || {
-                let _slot = slot;
-                let _ = forward(client, container_ip, container);
-            })
-        {
-            eprintln!("zerun: warn: failed to spawn TCP port client proxy: {error}");
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                // A short poll keeps Drop latency below the restart backoff
+                // while avoiding a permanently blocked accept thread.
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
         }
     }
 }
@@ -366,18 +409,20 @@ fn accept_loop(
 const UDP_CLIENT_LIMIT: usize = 256;
 const UDP_CLIENT_IDLE: Duration = Duration::from_secs(60);
 const UDP_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const UDP_STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 struct UdpClient {
     upstream: UdpSocket,
     last_seen: Instant,
     stop: Arc<AtomicBool>,
+    worker: thread::JoinHandle<()>,
 }
 
 fn stop_udp_client(client: UdpClient) {
     client.stop.store(true, Ordering::Release);
-    // Dropping the map-owned clone does not close the worker's socket, but the
-    // worker uses a short receive timeout and observes the stop flag.
-    drop(client);
+    // The worker polls the stop flag via a short socket read timeout. UDP
+    // sockets have no shutdown(2), so joining waits at most one poll interval.
+    let _ = client.worker.join();
 }
 
 fn prune_udp_clients(clients: &mut HashMap<SocketAddr, UdpClient>, now: Instant) {
@@ -399,13 +444,14 @@ fn prune_udp_clients(clients: &mut HashMap<SocketAddr, UdpClient>, now: Instant)
 /// observe the published host port as the source. Idle client mappings are
 /// reclaimed, and a hard limit prevents a source-port flood from creating an
 /// unbounded number of worker threads and sockets.
-fn udp_loop(listener: UdpSocket, container_ip: Ipv4Addr, container: u16) {
-    let _ = listener.set_read_timeout(Some(UDP_POLL_INTERVAL));
+fn udp_loop(listener: UdpSocket, container_ip: Ipv4Addr, container: u16, stop: Arc<AtomicBool>) {
+    let _ = listener.set_read_timeout(Some(UDP_STOP_POLL_INTERVAL));
     let mut clients: HashMap<SocketAddr, UdpClient> = HashMap::new();
     let mut warned_full = false;
+    let mut next_prune = Instant::now() + UDP_POLL_INTERVAL;
     let mut buf = [0u8; 65535];
 
-    loop {
+    while !stop.load(Ordering::Acquire) {
         let (len, client) = match listener.recv_from(&mut buf) {
             Ok(packet) => packet,
             Err(error)
@@ -414,7 +460,11 @@ fn udp_loop(listener: UdpSocket, container_ip: Ipv4Addr, container: u16) {
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                 ) =>
             {
-                prune_udp_clients(&mut clients, Instant::now());
+                let now = Instant::now();
+                if now >= next_prune {
+                    prune_udp_clients(&mut clients, now);
+                    next_prune = now + UDP_POLL_INTERVAL;
+                }
                 continue;
             }
             Err(_) => break,
@@ -450,16 +500,18 @@ fn udp_loop(listener: UdpSocket, container_ip: Ipv4Addr, container: u16) {
             continue;
         };
         if upstream.connect((container_ip, container)).is_err()
-            || upstream.set_read_timeout(Some(UDP_POLL_INTERVAL)).is_err()
+            || upstream
+                .set_read_timeout(Some(UDP_STOP_POLL_INTERVAL))
+                .is_err()
         {
             continue;
         }
         let Ok(registered) = upstream.try_clone() else {
             continue;
         };
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = Arc::clone(&stop);
-        if let Err(error) = thread::Builder::new()
+        let client_stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&client_stop);
+        let worker = match thread::Builder::new()
             .name("zerun-port-udp-client".to_string())
             .spawn(move || {
                 let mut buf = [0u8; 65535];
@@ -478,18 +530,21 @@ fn udp_loop(listener: UdpSocket, container_ip: Ipv4Addr, container: u16) {
                         Err(_) => break,
                     }
                 }
-            })
-        {
-            eprintln!("zerun: warn: failed to spawn UDP port client proxy: {error}");
-            continue;
-        }
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                eprintln!("zerun: warn: failed to spawn UDP port client proxy: {error}");
+                continue;
+            }
+        };
         let _ = registered.send(&buf[..len]);
         clients.insert(
             client,
             UdpClient {
                 upstream: registered,
                 last_seen: now,
-                stop,
+                stop: client_stop,
+                worker,
             },
         );
     }
@@ -942,6 +997,56 @@ mod tests {
     }
 
     #[test]
+    fn dropping_proxies_releases_published_ports() {
+        for protocol in [PortProtocol::Tcp, PortProtocol::Udp] {
+            let port = match protocol {
+                PortProtocol::Tcp => {
+                    let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+                    let port = probe.local_addr().unwrap().port();
+                    drop(probe);
+                    port
+                }
+                PortProtocol::Udp => {
+                    let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+                    let port = probe.local_addr().unwrap().port();
+                    drop(probe);
+                    port
+                }
+            };
+
+            let proxy = PortProxy::bind(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port,
+                Ipv4Addr::LOCALHOST,
+                4242,
+                protocol,
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .unwrap();
+            let conflict = match protocol {
+                PortProtocol::Tcp => TcpListener::bind((Ipv4Addr::LOCALHOST, port)).map(drop),
+                PortProtocol::Udp => UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).map(drop),
+            };
+            assert!(
+                conflict.is_err(),
+                "{protocol:?} listener did not own the port"
+            );
+            drop(proxy);
+
+            match protocol {
+                PortProtocol::Tcp => {
+                    TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+                        .expect("TCP proxy did not release its port");
+                }
+                PortProtocol::Udp => {
+                    UdpSocket::bind((Ipv4Addr::LOCALHOST, port))
+                        .expect("UDP proxy did not release its port");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn tcp_proxy_connection_slots_enforce_limit_and_release() {
         let active = Arc::new(AtomicUsize::new(0));
         let mut slots: Vec<_> = (0..TCP_PROXY_CONNECTION_LIMIT)
@@ -1007,6 +1112,7 @@ mod tests {
                 upstream: socket,
                 last_seen: Instant::now() - UDP_CLIENT_IDLE,
                 stop: Arc::clone(&stop),
+                worker: std::thread::spawn(|| {}),
             },
         );
 

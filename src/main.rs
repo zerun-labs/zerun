@@ -26,6 +26,7 @@ mod procinfo;
 mod prompt;
 mod psfilter;
 mod pty;
+mod restart;
 mod seccomp;
 mod security;
 mod service;
@@ -151,6 +152,8 @@ struct RunArgs {
     stop_signal: Option<i32>,
     /// Grace period used by `stop`/`restart` before SIGKILL.
     stop_timeout: Option<u64>,
+    /// Detached automatic restart policy (`--restart`).
+    restart: Option<restart::RestartPolicy>,
     net: NetMode,
     /// True after the operator explicitly selected `--net`.
     net_specified: bool,
@@ -287,6 +290,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             "--stop-timeout" => {
                 let v = next_value(args, &mut i, "--stop-timeout")?;
                 a.stop_timeout = Some(parse_seconds(&v, "--stop-timeout")?);
+            }
+            "--restart" => {
+                let v = next_value(args, &mut i, "--restart")?;
+                a.restart = Some(v.parse()?);
             }
             "--net" => {
                 let v = next_value(args, &mut i, "--net")?;
@@ -468,6 +475,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                     &other["--stop-timeout=".len()..],
                     "--stop-timeout",
                 )?);
+                i += 1;
+            }
+            other if other.starts_with("--restart=") => {
+                a.restart = Some(other["--restart=".len()..].parse()?);
                 i += 1;
             }
             other if other.starts_with("--cap-add=") => {
@@ -751,6 +762,18 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         eprintln!(
             "zerun: warning: log rotation options only apply to detached containers; ignoring"
         );
+    }
+    let restart_policy = a
+        .restart
+        .or_else(|| resume.as_ref().map(|st| st.restart_policy))
+        .unwrap_or_default();
+    if a.restart.is_some() && !a.detach {
+        eprintln!("zerun run: --restart requires -d/--detach");
+        return 2;
+    }
+    if a.restart.is_some() && a.rm {
+        eprintln!("zerun run: --restart cannot be combined with --rm");
+        return 2;
     }
     let host_aliases = if !a.add_hosts.is_empty() && a.net == NetMode::Host {
         eprintln!("zerun run: --add-host cannot be used with --net host");
@@ -1143,6 +1166,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
                 launch_args,
                 stop_signal,
                 stop_timeout,
+                restart_policy,
                 name: if resume.is_some() {
                     resume.as_ref().and_then(|st| st.name.clone())
                 } else {
@@ -1322,7 +1346,7 @@ fn cmd_start(args: &[String]) -> i32 {
 /// writable layer, or console history.
 fn start_one(store: &Store, target: &str) -> Result<String, String> {
     let initial = state::resolve(store, target)?;
-    let _lock = state::ContainerOperationLock::try_acquire(store, &initial.id)?;
+    let _lock = state::ContainerOperationLock::acquire(store, &initial.id, Duration::from_secs(5))?;
     let mut st = state::ContainerState::load(store, &initial.id).ok_or_else(|| {
         format!(
             "container {} disappeared before start",
@@ -1335,9 +1359,27 @@ fn start_one(store: &Store, target: &str) -> Result<String, String> {
             return Err(format!("container {name} is already running"));
         }
         state::Status::Running => {
+            if st.reaper_alive() {
+                return Err(format!(
+                    "container {name} is restarting; stop it before starting manually"
+                ));
+            }
             reconcile_stale_state(store, &mut st)?;
         }
-        state::Status::Created | state::Status::Exited => {}
+        state::Status::Created => {
+            if st.reaper_alive() {
+                return Err(format!("container {name} is still starting"));
+            }
+        }
+        state::Status::Exited if st.restart_pending => {
+            if st.reaper_alive() {
+                return Err(format!(
+                    "container {name} is restarting; stop it before starting manually"
+                ));
+            }
+            reconcile_stale_state(store, &mut st)?;
+        }
+        state::Status::Exited => {}
     }
     // A paused marker is only meaningful while the PID/cgroup are alive. Clear
     // it before launching the resumed workload so stale/corrupt records cannot
@@ -1351,6 +1393,7 @@ fn start_one(store: &Store, target: &str) -> Result<String, String> {
             "container {name} has invalid launch metadata and cannot be started"
         ));
     }
+    state::clear_restart_suppression(store, &st.id).map_err(|error| error.to_string())?;
     lifecycle::reclaim_resources(store, &st);
     let code = cmd_run_inner(&launch_args, Some(st), false);
     if code != 0 {
@@ -1387,6 +1430,8 @@ struct DetachedInfo {
     stop_signal: i32,
     /// Grace period between `stop_signal` and the SIGKILL fallback.
     stop_timeout: u64,
+    /// Automatic restart behavior used by the detached reaper.
+    restart_policy: restart::RestartPolicy,
     name: Option<String>,
     rm: bool,
     labels: BTreeMap<String, String>,
@@ -1494,6 +1539,8 @@ fn run_detached(
         image: image_desc.to_string(),
         pid: None,
         pid_start_time: None,
+        reaper_pid: None,
+        reaper_start_time: None,
         status: state::Status::Created,
         paused: false,
         exit_code: None,
@@ -1512,6 +1559,9 @@ fn run_detached(
         user: None,
         stop_signal: signal::DEFAULT_STOP_SIGNAL,
         stop_timeout: state::DEFAULT_STOP_TIMEOUT_SECS,
+        restart_policy: restart::RestartPolicy::No,
+        restart_count: 0,
+        restart_pending: false,
         capabilities: None,
         seccomp: None,
         labels: BTreeMap::new(),
@@ -1531,6 +1581,9 @@ fn run_detached(
     st.status = state::Status::Created;
     st.pid = None;
     st.pid_start_time = None;
+    st.reaper_pid = None;
+    st.reaper_start_time = None;
+    st.restart_pending = false;
     st.paused = false;
     st.exit_code = None;
     st.started = None;
@@ -1561,6 +1614,8 @@ fn run_detached(
     st.user = spec.user.clone();
     st.stop_signal = info.stop_signal;
     st.stop_timeout = info.stop_timeout;
+    st.restart_policy = info.restart_policy;
+    st.restart_count = 0;
     st.capabilities = Some(spec.capabilities.names());
     st.seccomp = Some(spec.seccomp);
     st.labels = info.labels;
@@ -1765,6 +1820,9 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     }
     if let Some(v) = a.stop_timeout {
         args.extend(["--stop-timeout".to_string(), v.to_string()]);
+    }
+    if let Some(policy) = a.restart.filter(|policy| policy.is_enabled()) {
+        args.extend(["--restart".to_string(), policy.to_string()]);
     }
     args.extend(["--net".to_string(), net_label(a.net)]);
     if a.use_init {
@@ -3321,7 +3379,11 @@ fn cmd_ps(args: &[String]) -> i32 {
             eprintln!("zerun ps: {e}");
             return 1;
         }
-        if !all && !filter.widens_status() && st.status != state::Status::Running {
+        if !all
+            && !filter.widens_status()
+            && st.status != state::Status::Running
+            && !st.restart_pending
+        {
             continue;
         }
         if !filter.matches(&st) {
@@ -3378,6 +3440,13 @@ fn ps_row(st: &ContainerState) -> Vec<String> {
 }
 
 fn ps_status(st: &ContainerState) -> String {
+    if st.restart_pending {
+        let code = st.exit_code.unwrap_or(-1);
+        return match &st.finished {
+            Some(t) => format!("Restarting ({code}) {} ago", elapsed_str(t)),
+            None => format!("Restarting ({code})"),
+        };
+    }
     match st.status {
         state::Status::Running => {
             let status = match &st.started {
@@ -3487,11 +3556,20 @@ fn wait_one(store: &Store, target: &str) -> Result<i32, String> {
             ));
         };
         if st.status == state::Status::Exited {
-            return Ok(st.exit_code.unwrap_or(-1));
+            if !st.restart_pending {
+                return Ok(st.exit_code.unwrap_or(-1));
+            }
+            // An automatic retry is in progress while the reaper is alive.
+            // If that reaper disappeared, reconcile the stored attempt and
+            // preserve its exit code instead of waiting forever.
+            reconcile_stale_state(store, &mut st)?;
+            if st.status == state::Status::Exited && !st.restart_pending {
+                return Ok(st.exit_code.unwrap_or(-1));
+            }
         }
         if st.status == state::Status::Running && !st.pid_alive() {
             reconcile_stale_state(store, &mut st)?;
-            if st.status == state::Status::Exited {
+            if st.status == state::Status::Exited && !st.restart_pending {
                 return Ok(st.exit_code.unwrap_or(-1));
             }
         }
@@ -3642,7 +3720,7 @@ fn cmd_kill(args: &[String]) -> i32 {
 /// briefly for the reaper to persist its final state.
 fn kill_one(store: &Store, target: &str, signal: libc::c_int) -> Result<String, String> {
     let initial = state::resolve(store, target)?;
-    let _lock = state::ContainerOperationLock::try_acquire(store, &initial.id)?;
+    let lock = state::ContainerOperationLock::acquire(store, &initial.id, Duration::from_secs(5))?;
     let mut st = state::ContainerState::load(store, &initial.id).ok_or_else(|| {
         format!(
             "container {} disappeared before kill",
@@ -3650,22 +3728,56 @@ fn kill_one(store: &Store, target: &str, signal: libc::c_int) -> Result<String, 
         )
     })?;
     let name = display_name(&st);
+    let policy_enabled = st.restart_policy.is_enabled();
+    let suppress = policy_enabled && !state::restart_is_suppressed(store, &st.id);
+    if suppress {
+        state::suppress_restart(store, &st.id).map_err(|error| error.to_string())?;
+    }
     match st.status {
-        state::Status::Exited | state::Status::Created => return Ok(name),
+        state::Status::Exited | state::Status::Created => {
+            if st.restart_pending && !st.reaper_alive() {
+                reconcile_stale_state(store, &mut st)?;
+            }
+            let pending = st.restart_pending;
+            drop(lock);
+            if pending {
+                lifecycle::settle_exit(store, &st.id).map_err(|e| e.to_string())?;
+            }
+            return Ok(name);
+        }
         state::Status::Running => {}
     }
     if !st.pid_alive() {
-        reconcile_stale_state(store, &mut st)?;
+        if !st.reaper_alive() {
+            reconcile_stale_state(store, &mut st)?;
+        }
+        drop(lock);
+        lifecycle::settle_exit(store, &st.id).map_err(|e| e.to_string())?;
         return Ok(name);
     }
     if st.paused && signal_requires_thaw(signal) {
-        thaw_paused_container(store, &mut st)?;
+        if let Err(error) = thaw_paused_container(store, &mut st) {
+            if suppress {
+                let _ = state::clear_restart_suppression(store, &st.id);
+            }
+            return Err(error);
+        }
     }
-    signal_container(&st, signal).map_err(|e| format!("signal container {name}: {e}"))?;
-    // Give a terminating signal a brief chance to take effect, without making
-    // control signals such as STOP/CONT feel like `stop`.
-    if wait_pid_gone(&st, Duration::from_millis(500)) {
+    if let Err(error) = signal_container(&st, signal) {
+        if suppress {
+            let _ = state::clear_restart_suppression(store, &st.id);
+        }
+        return Err(format!("signal container {name}: {error}"));
+    }
+    // Give a terminating signal a brief chance to take effect. A control
+    // signal that leaves the workload alive must not permanently disable its
+    // restart policy.
+    let exited = wait_pid_gone(&st, Duration::from_millis(500));
+    drop(lock);
+    if exited {
         lifecycle::settle_exit(store, &st.id).map_err(|e| e.to_string())?;
+    } else if suppress {
+        state::clear_restart_suppression(store, &st.id).map_err(|error| error.to_string())?;
     }
     Ok(name)
 }
@@ -3743,7 +3855,7 @@ fn stop_one(
     override_signal: Option<i32>,
 ) -> Result<String, String> {
     let initial = state::resolve(store, target)?;
-    let _lock = state::ContainerOperationLock::try_acquire(store, &initial.id)?;
+    let lock = state::ContainerOperationLock::acquire(store, &initial.id, Duration::from_secs(5))?;
     let mut st = state::ContainerState::load(store, &initial.id).ok_or_else(|| {
         format!(
             "container {} disappeared before stop",
@@ -3751,26 +3863,68 @@ fn stop_one(
         )
     })?;
     let name = display_name(&st);
+    let policy_enabled = st.restart_policy.is_enabled();
     match st.status {
-        state::Status::Exited | state::Status::Created => return Ok(name), // nothing to signal
+        state::Status::Exited | state::Status::Created => {
+            if policy_enabled {
+                state::suppress_restart(store, &st.id).map_err(|error| error.to_string())?;
+            }
+            if st.restart_pending && !st.reaper_alive() {
+                reconcile_stale_state(store, &mut st)?;
+            }
+            let pending = st.restart_pending;
+            drop(lock);
+            if pending {
+                lifecycle::settle_exit(store, &st.id).map_err(|e| e.to_string())?;
+            }
+            return Ok(name); // nothing to signal
+        }
         state::Status::Running => {}
     }
     if !st.pid_alive() {
-        let mut s = st.clone();
-        reconcile_stale_state(store, &mut s)?;
+        if policy_enabled {
+            state::suppress_restart(store, &st.id).map_err(|error| error.to_string())?;
+        }
+        if !st.reaper_alive() {
+            reconcile_stale_state(store, &mut st)?;
+        }
+        drop(lock);
+        lifecycle::settle_exit(store, &st.id).map_err(|e| e.to_string())?;
         return Ok(name);
     }
     let stop_signal =
         signal::validate(override_signal.unwrap_or(st.stop_signal)).map_err(|e| e.to_string())?;
     let timeout_secs = timeout_override.unwrap_or(st.stop_timeout);
+    if policy_enabled {
+        state::suppress_restart(store, &st.id).map_err(|error| error.to_string())?;
+    }
     // A frozen task cannot service the stop signal; thaw first so the grace
     // period is meaningful instead of always ending in SIGKILL.
-    thaw_paused_container(store, &mut st)?;
-    signal_container(&st, stop_signal)?;
+    if let Err(error) = thaw_paused_container(store, &mut st) {
+        if policy_enabled {
+            let _ = state::clear_restart_suppression(store, &st.id);
+        }
+        return Err(error);
+    }
+    if let Err(error) = signal_container(&st, stop_signal) {
+        if policy_enabled {
+            let _ = state::clear_restart_suppression(store, &st.id);
+        }
+        return Err(error);
+    }
     if !wait_pid_gone(&st, Duration::from_secs(timeout_secs)) {
-        signal_container(&st, libc::SIGKILL)?;
+        if let Err(error) = signal_container(&st, libc::SIGKILL) {
+            if policy_enabled {
+                let _ = state::clear_restart_suppression(store, &st.id);
+            }
+            return Err(error);
+        }
         wait_pid_gone(&st, Duration::from_secs(5));
     }
+    // The reaper needs this lock to persist the terminal attempt. Release it
+    // before waiting for that write; otherwise stop and its own reaper can
+    // deadlock until the settlement timeout.
+    drop(lock);
     lifecycle::settle_exit(store, &st.id).map_err(|e| e.to_string())?;
     Ok(name)
 }
@@ -3857,7 +4011,7 @@ fn cmd_system_df(args: &[String]) -> i32 {
         let bytes = fsutil::dir_size(&state_dir) + overlay_bytes;
         containers += 1;
         container_bytes += bytes;
-        if st.status != state::Status::Running {
+        if st.status != state::Status::Running && !st.restart_pending {
             reclaimable_bytes += bytes;
         }
     }
@@ -3937,7 +4091,7 @@ fn cmd_prune(args: &[String]) -> i32 {
             eprintln!("zerun prune: {e}");
             return 1;
         }
-        if st.status == state::Status::Exited {
+        if st.status == state::Status::Exited && !st.restart_pending {
             targets.push((st.id.clone(), display_name(&st)));
         }
     }
@@ -4069,7 +4223,7 @@ fn cmd_rm(args: &[String]) -> i32 {
 
 fn rm_one(store: &Store, target: &str, force: bool) -> Result<String, String> {
     let initial = state::resolve(store, target)?;
-    let _lock = state::ContainerOperationLock::try_acquire(store, &initial.id)?;
+    let lock = state::ContainerOperationLock::acquire(store, &initial.id, Duration::from_secs(5))?;
     let mut st = state::ContainerState::load(store, &initial.id).ok_or_else(|| {
         format!(
             "container {} disappeared before removal",
@@ -4077,28 +4231,56 @@ fn rm_one(store: &Store, target: &str, force: bool) -> Result<String, String> {
         )
     })?;
     let name = display_name(&st);
-    if st.status == state::Status::Running {
+    reconcile_stale_state(store, &mut st)?;
+    let active = st.status == state::Status::Running || st.restart_pending;
+    if active {
         if !force {
-            return Err(format!(
-                "cannot remove a running container {name} - stop it first or use -f"
-            ));
+            return Err(if st.restart_pending {
+                format!("cannot remove a restarting container {name} - stop it first or use -f")
+            } else {
+                format!("cannot remove a running container {name} - stop it first or use -f")
+            });
         }
-        thaw_paused_container(store, &mut st)?;
+        let policy_enabled = st.restart_policy.is_enabled();
+        if policy_enabled {
+            state::suppress_restart(store, &st.id).map_err(|error| error.to_string())?;
+        }
+        if let Err(error) = thaw_paused_container(store, &mut st) {
+            if policy_enabled {
+                let _ = state::clear_restart_suppression(store, &st.id);
+            }
+            return Err(error);
+        }
         if st.pid.is_some() && st.pid_alive() {
-            signal_container(&st, libc::SIGKILL)?;
+            if let Err(error) = signal_container(&st, libc::SIGKILL) {
+                if policy_enabled {
+                    let _ = state::clear_restart_suppression(store, &st.id);
+                }
+                return Err(error);
+            }
             wait_pid_gone(&st, Duration::from_secs(5));
         }
-        // Let the reaper record the exit (or reconcile when it is gone), so the
-        // state directory is not deleted underneath a reaper that is about to
-        // write its final record.
+        // The reaper needs the operation lock to persist its terminal state.
+        // Wait for that handoff, then reacquire before deleting its directory.
+        drop(lock);
         lifecycle::settle_exit(store, &st.id).map_err(|e| e.to_string())?;
+        let _lock = state::ContainerOperationLock::acquire(store, &st.id, Duration::from_secs(5))?;
         if let Some(fresh) = state::ContainerState::load(store, &st.id) {
             st = fresh;
         }
+        return remove_container_files(store, &st, name);
     }
+    remove_container_files(store, &st, name)
+}
+
+fn remove_container_files(
+    store: &Store,
+    st: &state::ContainerState,
+    name: String,
+) -> Result<String, String> {
     // Reclaim any host-side leftovers still recorded (best effort; the normal
     // reaper path already cleaned them up).
-    lifecycle::reclaim_resources(store, &st);
+    lifecycle::reclaim_resources(store, st);
     if st.overlay.is_some() {
         fsutil::remove_dir_all_quiet(&store.container_overlay_dir(&st.id));
     }
@@ -4337,7 +4519,12 @@ fn drain_rotated_logs(
 
 fn container_observable(store: &Store, st: &ContainerState) -> bool {
     match state::ContainerState::load(store, &st.id) {
-        Some(s) => s.status == state::Status::Running && s.pid_alive(),
+        Some(s) => {
+            (s.status == state::Status::Running && s.pid_alive())
+                // A live reaper can be between a workload exit and its
+                // terminal-state write, or sleeping before the next attempt.
+                || (s.reaper_alive() && (s.restart_pending || s.restart_policy.is_enabled()))
+        }
         None => false, // --rm removed the record; stop following
     }
 }
@@ -6245,6 +6432,7 @@ RUN OPTIONS:\n  \
   -u, --user USER[:GROUP]  run as container user (numeric or /etc/passwd name)\n  \
   --stop-signal SIGNAL     stop/restart signal (image StopSignal; default SIGTERM)\n  \
   --stop-timeout S         seconds before stop/restart sends SIGKILL (default 10)\n  \
+  --restart POLICY        detached restart policy (no|on-failure[:max]|always|unless-stopped)\n  \
   --net none|host|bridge\n  \
                       none = fresh netns + loopback; host = share host net;\n  \
                       bridge = zerun0 bridge + NAT (needs CAP_NET_ADMIN;\n  \
@@ -7133,6 +7321,45 @@ mod tests {
     fn stop_timeout_rejects_negative_and_overflowing_values() {
         for value in ["-1", "18446744073709551616", "1.5", "ten"] {
             let args = vec!["--stop-timeout".to_string(), value.to_string()];
+            assert!(parse_run_args(&args).is_err(), "{value:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn restart_policy_is_parsed_and_captured_in_launch_metadata() {
+        let args: Vec<String> = ["-d", "--restart=on-failure:2", "alpine", "echo", "ok"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let parsed = parse_run_args(&args).unwrap();
+        assert_eq!(
+            parsed.restart,
+            Some(restart::RestartPolicy::OnFailure {
+                max_retries: Some(2)
+            })
+        );
+        let launch = detached_launch_args(&parsed, Path::new("/tmp/rootfs"));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--restart", "on-failure:2"]));
+    }
+
+    #[test]
+    fn run_rejects_malformed_restart_policies() {
+        for value in [
+            "",
+            "on",
+            "on-failure:",
+            "on-failure:-1",
+            "on-failure:nope",
+            "always:2",
+        ] {
+            let args = vec![
+                "-d".to_string(),
+                "--restart".to_string(),
+                value.to_string(),
+                "alpine".to_string(),
+            ];
             assert!(parse_run_args(&args).is_err(), "{value:?} was accepted");
         }
     }
