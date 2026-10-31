@@ -160,8 +160,13 @@ target/release/zerun rm builder
 ```
 
 `run IMAGE` pulls the image automatically when it is not present locally; `-e NAME=V`
-sets environment variables, `--init` adds the built-in mini-init, and
+sets environment variables, `--env-file FILE` loads them from disk, `--init` adds
+the built-in mini-init, and
 `--platform os/arch[/variant]` selects a specific architecture (default: host).
+Environment files contain one `NAME=VALUE` per line; blank lines and lines whose
+first non-whitespace character is `#` are ignored, and values are literal (no shell
+expansion). Later files override earlier files, then `-e` overrides both. Files are
+limited to 1 MiB each and are only accepted in image mode.
 
 Run options (current subset):
 
@@ -212,6 +217,7 @@ Run options (current subset):
 -w, --workdir DIR              override the image WorkingDir
 --pull missing|always|never    image refresh policy (default: missing)
 -e, --env NAME[=VALUE]         set a container environment variable (image mode)
+--env-file FILE                load NAME=VALUE lines (repeatable; image mode)
 --log-max-size SIZE            rotate detached console.log at SIZE (default 10m; 0 disables)
 --log-max-file N               retain N detached log files including active (default 3; max 1024)
 --label KEY=VALUE             add container metadata (repeatable; overrides image labels)

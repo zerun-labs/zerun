@@ -174,6 +174,12 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--pull".into());
         run_args.push(a.pull.label().into());
     }
+    let env_files = crate::workload::resolve_env_file_paths(&a.env_files)?;
+    crate::workload::load_env_files(&env_files)?;
+    for path in env_files {
+        run_args.push("--env-file".into());
+        run_args.push(path.display().to_string());
+    }
     for v in &a.env {
         run_args.push("--env".into());
         run_args.push(v.clone());
@@ -346,8 +352,8 @@ fn validate(a: &RunArgs, rootful: bool) -> Result<(), String> {
         &a.add_hosts,
         (effective_net == NetMode::Bridge).then_some(crate::network::GATEWAY_IP),
     )?;
-    if a.rootfs.is_some() && !a.env.is_empty() {
-        return Err("-e/--env requires image mode (drop --rootfs)".into());
+    if a.rootfs.is_some() && (!a.env.is_empty() || !a.env_files.is_empty()) {
+        return Err("-e/--env and --env-file require image mode (drop --rootfs)".into());
     }
     if a.rootfs.is_some() && a.entrypoint.is_some() {
         return Err("--entrypoint requires image mode (drop --rootfs)".into());
@@ -602,6 +608,36 @@ mod tests {
         assert!(unit.contains(" --entrypoint /bin/sh "));
         assert!(unit.contains(" --workdir /srv/app "));
         assert!(unit.contains(" --pull never "));
+    }
+
+    #[test]
+    fn renders_and_validates_canonical_env_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-service-env-file-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_file = dir.join("app.env");
+        std::fs::write(&env_file, "MODE=production\n").unwrap();
+        let a = args(&[
+            "--env-file",
+            env_file.to_str().unwrap(),
+            "--env",
+            "MODE=test",
+            "alpine",
+            "true",
+        ]);
+        let unit = render(Path::new("/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains(&format!(
+            " --env-file {} --env MODE=test ",
+            env_file.display()
+        )));
+
+        std::fs::remove_file(&env_file).unwrap();
+        assert!(render(Path::new("/bin/zerun"), &a, true).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

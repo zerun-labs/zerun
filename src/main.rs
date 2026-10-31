@@ -181,6 +181,8 @@ struct RunArgs {
     /// True when either log rotation flag was explicitly supplied.
     log_options_set: bool,
     env: Vec<String>,
+    /// `--env-file FILE`: ordered image-mode environment files.
+    env_files: Vec<String>,
     ports: Vec<network::PublishedPort>,
     volumes: Vec<mounts::BindMount>,
     dns: Vec<String>,
@@ -386,6 +388,13 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 workload::validate_env_spec(&value).map_err(|e| e.to_string())?;
                 a.env.push(value);
             }
+            "--env-file" => {
+                let value = next_value(args, &mut i, s)?;
+                if value.is_empty() {
+                    return Err("--env-file path cannot be empty".to_string());
+                }
+                a.env_files.push(value);
+            }
             "--volume" | "-v" => {
                 let v = next_value(args, &mut i, s)?;
                 a.volumes
@@ -475,6 +484,14 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                     &other["--stop-timeout=".len()..],
                     "--stop-timeout",
                 )?);
+                i += 1;
+            }
+            other if other.starts_with("--env-file=") => {
+                let value = &other["--env-file=".len()..];
+                if value.is_empty() {
+                    return Err("--env-file path cannot be empty".to_string());
+                }
+                a.env_files.push(value.to_string());
                 i += 1;
             }
             other if other.starts_with("--restart=") => {
@@ -754,6 +771,14 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         eprintln!("zerun run: --pull requires image mode (drop --rootfs)");
         return 2;
     }
+    if a.rootfs.is_some() && !a.env.is_empty() {
+        eprintln!("zerun run: -e/--env requires image mode (drop --rootfs)");
+        return 2;
+    }
+    if a.rootfs.is_some() && !a.env_files.is_empty() {
+        eprintln!("zerun run: --env-file requires image mode (drop --rootfs)");
+        return 2;
+    }
     if a.workdir.as_deref() == Some("") {
         eprintln!("zerun run: --workdir cannot be empty");
         return 2;
@@ -796,6 +821,34 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
             eprintln!("zerun run: {e}");
             return 2;
         }
+    };
+
+    // Environment files are host inputs to a new container. Resolve them before
+    // allocating storage, and never re-read them while resuming from persisted
+    // state: restart must preserve the environment the container was created
+    // with even if the source file was edited or removed.
+    let env_file_overrides = if resume.is_none() && !a.env_files.is_empty() {
+        let paths = match workload::resolve_env_file_paths(&a.env_files) {
+            Ok(paths) => paths,
+            Err(error) => {
+                eprintln!("zerun run: {error}");
+                return 2;
+            }
+        };
+        let entries = match workload::load_env_files(&paths) {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!("zerun run: {error}");
+                return 2;
+            }
+        };
+        a.env_files = paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        entries
+    } else {
+        Vec::new()
     };
 
     let store = match Store::detect() {
@@ -918,10 +971,6 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
                 seccomp,
             )
         } else if let Some(rootfs_str) = &a.rootfs {
-            if !a.env.is_empty() {
-                eprintln!("zerun run: -e/--env requires image mode (drop --rootfs)");
-                return 2;
-            }
             let rootfs = PathBuf::from(rootfs_str);
             if !rootfs.is_dir() {
                 eprintln!(
@@ -986,6 +1035,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
                     };
                     let env = match build_image_env(
                         &cfg.config.env,
+                        &env_file_overrides,
                         &a.env,
                         a.hostname.as_deref(),
                         &id,
@@ -1865,6 +1915,9 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
         args.extend(["--log-max-size".to_string(), a.log.max_size.to_string()]);
         args.extend(["--log-max-file".to_string(), a.log.max_files.to_string()]);
     }
+    for path in &a.env_files {
+        args.extend(["--env-file".to_string(), path.clone()]);
+    }
     for v in &a.env {
         args.extend(["--env".to_string(), v.clone()]);
     }
@@ -2451,6 +2504,7 @@ fn user_is_mappable_rootless(spec: &str) -> bool {
 
 fn build_image_env(
     cfg_env: &[String],
+    env_file: &[(String, String)],
     overrides: &[String],
     hostname: Option<&str>,
     id: &str,
@@ -2472,6 +2526,9 @@ fn build_image_env(
     }
     if workload::env_value(&env, "HOME").is_none() {
         env.push(("HOME".to_string(), "/root".to_string()));
+    }
+    for (key, value) in env_file {
+        upsert_env(&mut env, key.clone(), value.clone());
     }
     for o in overrides {
         workload::validate_env_spec(o).map_err(|e| format!("invalid --env '{o}': {e}"))?;
@@ -6454,6 +6511,8 @@ RUN OPTIONS:\n  \
   -w, --workdir DIR   override the image WorkingDir\n  \
   --pull POLICY       missing|always|never (default: missing)\n  \
   -e, --env NAME[=VALUE]  set a container environment variable (image mode)\n  \
+  --env-file FILE     load NAME=VALUE lines from a file (repeatable; image mode;\n  \
+                      later files win, then -e overrides)\n  \
   --log-max-size SIZE  detached console.log rotation size (default: 10m; 0 disables)\n  \
   --log-max-file N     retained detached log files including active (default: 3; max: 1024)\n  \
   --no-overlay        pivot directly into the rootfs (no writable upper layer)\n  \
@@ -6633,6 +6692,8 @@ mod tests {
             protocol: network::PortProtocol::Tcp,
         });
         a.labels.insert("tier".to_string(), "prod".to_string());
+        a.env_files.push("/tmp/app.env".to_string());
+        a.env.push("MODE=prod".to_string());
         let args = detached_launch_args(&a, Path::new("/tmp/rootfs"));
         assert_eq!(
             args,
@@ -6644,6 +6705,10 @@ mod tests {
                 "64M",
                 "--net",
                 "bridge",
+                "--env-file",
+                "/tmp/app.env",
+                "--env",
+                "MODE=prod",
                 "--publish",
                 "0.0.0.0:8080:80",
                 "--label",
@@ -7208,16 +7273,48 @@ mod tests {
     }
 
     #[test]
+    fn parses_repeated_env_files() {
+        let args: Vec<_> = ["--env-file", "first.env", "--env-file=second.env", "alpine"]
+            .iter()
+            .map(|value| value.to_string())
+            .collect();
+        let a = parse_run_args(&args).unwrap();
+        assert_eq!(a.env_files, ["first.env", "second.env"]);
+        assert!(parse_run_args(&["--env-file=".to_string(), "alpine".to_string()]).is_err());
+        assert!(parse_run_args(&["--env-file".to_string(), String::new()]).is_err());
+    }
+
+    #[test]
     fn malformed_image_environment_is_rejected() {
-        assert!(build_image_env(&["=bad".to_string()], &[], None, "id", false).is_err());
-        assert!(build_image_env(&["NO_EQUALS".to_string()], &[], None, "id", false).is_err());
-        assert!(build_image_env(&["OK=bad\0value".to_string()], &[], None, "id", false).is_err());
+        assert!(build_image_env(&["=bad".to_string()], &[], &[], None, "id", false).is_err());
+        assert!(build_image_env(&["NO_EQUALS".to_string()], &[], &[], None, "id", false).is_err());
+        assert!(
+            build_image_env(&["OK=bad\0value".to_string()], &[], &[], None, "id", false).is_err()
+        );
     }
 
     #[test]
     fn image_tty_gets_default_term() {
-        let env = build_image_env(&[], &[], None, "abc123", true).unwrap();
+        let env = build_image_env(&[], &[], &[], None, "abc123", true).unwrap();
         assert_eq!(workload::env_value(&env, "TERM"), Some("xterm"));
+    }
+
+    #[test]
+    fn env_files_precede_explicit_image_overrides() {
+        let image = ["IMAGE_ONLY=image".to_string(), "ORDER=image".to_string()];
+        let files = [
+            ("FILE_ONLY".to_string(), "file".to_string()),
+            ("ORDER".to_string(), "file".to_string()),
+        ];
+        let overrides = [
+            "ORDER=explicit".to_string(),
+            "EXPLICIT_ONLY=explicit".to_string(),
+        ];
+        let env = build_image_env(&image, &files, &overrides, None, "id", false).unwrap();
+        assert_eq!(workload::env_value(&env, "IMAGE_ONLY"), Some("image"));
+        assert_eq!(workload::env_value(&env, "FILE_ONLY"), Some("file"));
+        assert_eq!(workload::env_value(&env, "ORDER"), Some("explicit"));
+        assert_eq!(workload::env_value(&env, "EXPLICIT_ONLY"), Some("explicit"));
     }
 
     #[test]
