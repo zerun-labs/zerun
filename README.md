@@ -409,9 +409,10 @@ service restart semantics.
 `logs` hides capture-time timestamps by default; `-t/--timestamps` shows them.
 `--since`/`--until` accept RFC3339 times, UNIX seconds, or Go-style durations such as
 `10m` (relative to now) and select inclusive capture-time bounds. `--tail N` narrows the
-raw lines before applying the time window. Untimestamped legacy logs are displayed
-normally but cannot be selected by time. `--until` ends follow mode at that boundary;
-`--since` remains fixed while following. An unterminated line is split into 64 KiB
+raw lines before applying the time window. Log files are streamed in chronological
+order, so only the requested `--tail` lines are retained in memory. Untimestamped legacy
+logs are displayed normally but cannot be selected by time. `--until` ends follow mode at
+that boundary; `--since` remains fixed while following. An unterminated line is split into 64 KiB
 timestamped records in `console.log`, so a workload cannot make the reaper buffer an
 unbounded line; `attach` still receives the original bytes unchanged.
 `prune` removes every retained exited container and its writable layer. It reconciles stale

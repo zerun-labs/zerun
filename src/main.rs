@@ -4591,9 +4591,21 @@ fn cmd_logs(args: &[String]) -> i32 {
             return 1;
         }
     };
+    let filter = match LogTimeFilter::parse(since.as_deref(), until.as_deref()) {
+        Ok(filter) => filter,
+        Err(e) => {
+            eprintln!("zerun logs: {e}");
+            return 2;
+        }
+    };
     let path = st.log_path_for(&store);
     let max_files = st.log_max_file.unwrap_or(1).clamp(1, logs::MAX_FILES);
-    let (bytes, cursor, read_any) = match read_log_snapshot(&path, max_files) {
+    // Stream the retained logs instead of materializing the whole rotation
+    // budget. `--tail` retains only its requested raw lines before applying
+    // the time filter; `--tail 0` can skip file contents entirely.
+    let (cursor, read_any) = match stream_log_snapshot(&path, max_files, tail, &filter, |line| {
+        write_log_output(line, timestamps)
+    }) {
         Ok(snapshot) => snapshot,
         Err(e) => {
             eprintln!(
@@ -4610,20 +4622,6 @@ fn cmd_logs(args: &[String]) -> i32 {
         );
         return 1;
     }
-    let filter = match LogTimeFilter::parse(since.as_deref(), until.as_deref()) {
-        Ok(filter) => filter,
-        Err(e) => {
-            eprintln!("zerun logs: {e}");
-            return 2;
-        }
-    };
-    // Tail selects raw log lines first, then time bounds narrow that window.
-    // This keeps `--tail 0` cheap and makes both options independently useful.
-    let shown = tail_bytes(&bytes, tail.unwrap_or(usize::MAX));
-    // Follow resumes at the raw byte consumed by this snapshot. Filtered
-    // output can be shorter than that tail when old lines are omitted.
-    let shown = logs::filter_log_lines(shown, Some(&filter));
-    write_log_output(&shown, timestamps);
     // A fixed --until is an end boundary: future times still follow until the
     // wall clock reaches them; a past time only shows the historical window.
     if follow {
@@ -4665,17 +4663,30 @@ fn follow_log(
 
 type LogCursor = std::collections::HashMap<(u64, u64), u64>;
 
-/// Read the retained logs in chronological order while recording the exact
-/// inode position consumed from each one. Rotation may rename any path between
-/// opens; using the open file descriptor plus its inode identity keeps the
-/// snapshot and follow cursor consistent across that race.
-fn read_log_snapshot(path: &Path, max_files: usize) -> std::io::Result<(Vec<u8>, LogCursor, bool)> {
-    use std::io::Read;
+/// Stream the retained logs in chronological order while recording the exact
+/// inode position consumed from each one.
+///
+/// Rotation may rename any path between opens; using the open file descriptor
+/// plus its inode identity keeps the snapshot and follow cursor consistent
+/// across that race. Only `--tail` keeps lines in memory, and only the number
+/// requested by the operator.
+fn stream_log_snapshot<F>(
+    path: &Path,
+    max_files: usize,
+    tail: Option<usize>,
+    filter: &LogTimeFilter,
+    mut emit: F,
+) -> std::io::Result<(LogCursor, bool)>
+where
+    F: FnMut(&[u8]),
+{
+    use std::collections::VecDeque;
+    use std::io::{BufRead, BufReader, Read, Seek, Take};
     use std::os::unix::fs::MetadataExt;
 
-    let mut bytes = Vec::new();
     let mut cursor = LogCursor::new();
     let mut read_any = false;
+    let mut tail_lines = tail.map(|_| VecDeque::<Vec<u8>>::new());
     for log_path in logs::log_paths(path, max_files) {
         let mut file = match std::fs::File::open(&log_path) {
             Ok(file) => file,
@@ -4689,13 +4700,41 @@ fn read_log_snapshot(path: &Path, max_files: usize) -> std::io::Result<(Vec<u8>,
         };
         let meta = file.metadata()?;
         let id = (meta.dev(), meta.ino());
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)?;
-        bytes.extend_from_slice(&data);
-        cursor.insert(id, data.len() as u64);
+        let snapshot_len = meta.len();
         read_any = true;
+        if tail == Some(0) {
+            cursor.insert(id, snapshot_len);
+            continue;
+        }
+
+        file.seek(std::io::SeekFrom::Start(0))?;
+        let mut reader: Take<BufReader<std::fs::File>> = BufReader::new(file).take(snapshot_len);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            if let Some(lines) = &mut tail_lines {
+                lines.push_back(std::mem::take(&mut line));
+                if lines.len() > tail.unwrap_or(0) {
+                    lines.pop_front();
+                }
+            } else if logs::log_line_matches(&line, filter) {
+                emit(&line);
+            }
+        }
+        cursor.insert(id, snapshot_len);
     }
-    Ok((bytes, cursor, read_any))
+
+    if let Some(lines) = tail_lines {
+        for line in lines {
+            if logs::log_line_matches(&line, filter) {
+                emit(&line);
+            }
+        }
+    }
+    Ok((cursor, read_any))
 }
 
 fn drain_rotated_logs(
@@ -4705,9 +4744,10 @@ fn drain_rotated_logs(
     timestamps: bool,
     filter: Option<&LogTimeFilter>,
 ) {
-    use std::io::{Read, Seek};
+    use std::io::{BufRead, BufReader, Read, Seek, Take};
     use std::os::unix::fs::MetadataExt;
 
+    let filter = filter.copied();
     let paths = logs::log_paths(path, max_files);
     let mut present = std::collections::HashSet::with_capacity(paths.len());
     for log_path in &paths {
@@ -4727,11 +4767,30 @@ fn drain_rotated_logs(
         if file.seek(std::io::SeekFrom::Start(pos)).is_err() {
             continue;
         }
-        let mut buf = Vec::new();
-        if file.read_to_end(&mut buf).is_ok() {
-            let shown = logs::filter_log_lines(&buf, filter);
-            write_log_output(&shown, timestamps);
-            seen.insert(id, pos.saturating_add(buf.len() as u64));
+        let mut reader: Take<BufReader<std::fs::File>> =
+            BufReader::new(file).take(len.saturating_sub(pos));
+        let mut line = Vec::new();
+        let mut consumed = pos;
+        let mut failed = false;
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) => break,
+                Ok(n) => {
+                    consumed = consumed.saturating_add(n as u64);
+                    if filter.is_none_or(|filter| logs::log_line_matches(&line, &filter)) {
+                        write_log_output(&line, timestamps);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("zerun logs: follow {}: {error}", log_path.display());
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            seen.insert(id, consumed);
         }
     }
     seen.retain(|id, _| present.contains(id));
@@ -6550,25 +6609,6 @@ fn write_log_output(data: &[u8], timestamps: bool) {
     }
 }
 
-/// Keep only the last `n` lines of `data` (newline-terminated lines; a
-/// trailing newline does not produce an extra empty line).
-fn tail_bytes(data: &[u8], n: usize) -> &[u8] {
-    if n == 0 || data.is_empty() {
-        return &[];
-    }
-    let mut line_starts = vec![0usize];
-    for (i, b) in data.iter().enumerate() {
-        if *b == b'\n' && i + 1 < data.len() {
-            line_starts.push(i + 1);
-        }
-    }
-    if line_starts.len() > n {
-        &data[line_starts[line_starts.len() - n]..]
-    } else {
-        data
-    }
-}
-
 fn write_stdout(data: &[u8]) {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
@@ -7309,20 +7349,42 @@ mod tests {
     }
 
     #[test]
-    fn log_snapshot_reads_archives_in_order_and_tracks_positions() {
+    fn log_snapshot_streams_archives_in_order_and_tracks_positions() {
         let dir = std::env::temp_dir().join(format!("zerun-log-snapshot-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let active = dir.join("console.log");
-        std::fs::write(&active, b"newest").unwrap();
-        std::fs::write(dir.join("console.log.1"), b"middle").unwrap();
-        std::fs::write(dir.join("console.log.2"), b"oldest").unwrap();
+        std::fs::write(&active, b"newest\n").unwrap();
+        std::fs::write(dir.join("console.log.1"), b"middle\n").unwrap();
+        std::fs::write(dir.join("console.log.2"), b"oldest\n").unwrap();
+        let filter = LogTimeFilter::parse(None, None).unwrap();
 
-        let (bytes, cursor, read_any) = read_log_snapshot(&active, 3).unwrap();
+        let mut bytes = Vec::new();
+        let (cursor, read_any) = stream_log_snapshot(&active, 3, None, &filter, |line| {
+            bytes.extend_from_slice(line)
+        })
+        .unwrap();
         assert!(read_any);
-        assert_eq!(bytes, b"oldestmiddlenewest");
+        assert_eq!(bytes, b"oldest\nmiddle\nnewest\n");
         assert_eq!(cursor.len(), 3);
         assert!(cursor.values().all(|position| *position > 0));
+
+        let mut bytes = Vec::new();
+        let (_, read_any) = stream_log_snapshot(&active, 3, Some(2), &filter, |line| {
+            bytes.extend_from_slice(line)
+        })
+        .unwrap();
+        assert!(read_any);
+        assert_eq!(bytes, b"middle\nnewest\n");
+
+        let mut bytes = Vec::new();
+        let (cursor, read_any) = stream_log_snapshot(&active, 3, Some(0), &filter, |line| {
+            bytes.extend_from_slice(line)
+        })
+        .unwrap();
+        assert!(read_any);
+        assert!(bytes.is_empty());
+        assert_eq!(cursor.len(), 3);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

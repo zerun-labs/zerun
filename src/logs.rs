@@ -131,6 +131,7 @@ impl LogTimeFilter {
 /// Only lines carrying the known capture-time prefix can be selected. This is
 /// deliberate: guessing their time would make time-filtered output depend on
 /// surrounding timestamped records.
+#[cfg(test)]
 pub fn filter_log_lines(data: &[u8], filter: Option<&LogTimeFilter>) -> Vec<u8> {
     let Some(filter) = filter.filter(|filter| filter.is_active()) else {
         return data.to_vec();
@@ -144,12 +145,22 @@ pub fn filter_log_lines(data: &[u8], filter: Option<&LogTimeFilter>) -> Vec<u8> 
             .map(|position| start + position + 1)
             .unwrap_or(data.len());
         let line = &data[start..end];
-        if log_timestamp_nanos(line).is_some_and(|timestamp| filter.contains(timestamp)) {
+        if log_line_matches(line, filter) {
             out.extend_from_slice(line);
         }
         start = end;
     }
     out
+}
+
+/// Whether one complete log record belongs in a time-filtered view.
+///
+/// Streaming callers use this instead of materializing the complete retained
+/// log set in memory. Legacy lines without the fixed timestamp prefix cannot be
+/// selected by a time range.
+pub fn log_line_matches(line: &[u8], filter: &LogTimeFilter) -> bool {
+    !filter.is_active()
+        || log_timestamp_nanos(line).is_some_and(|timestamp| filter.contains(timestamp))
 }
 
 /// Return the line content after an RFC3339 nanosecond timestamp + TAB.
