@@ -207,8 +207,8 @@ Run options (current subset):
                      (Docker-compatible 2-262144 shares; 0 restores the default)
 --cpuset-cpus 0-3    pin CPUs (cgroups v2 cpuset.cpus)
 --cpuset-mems 0      pin memory nodes (cgroups v2 cpuset.mems)
---pids 256           cgroup v2 pids.max; -1 disables the cap (Docker-compatible
-                     --pids-limit alias)
+--pids 256           cgroup v2 pids.max; rootful default is 256, -1 disables the
+                     cap (Docker-compatible --pids-limit alias)
 --oom-group          kill the whole cgroup on OOM
 --device-read-bps DEV:RATE    cgroup v2 io.max (e.g. /dev/sda:10mb)
 --device-write-bps DEV:RATE   cgroup v2 io.max (e.g. 8:0:10mb)

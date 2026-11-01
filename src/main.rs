@@ -876,6 +876,16 @@ fn parse_net_mode(option: &str, value: &str) -> Result<NetMode, String> {
     }
 }
 
+/// Rootful workloads get a conservative process cap unless the operator
+/// explicitly chooses another limit. Rootless runs cannot rely on a writable
+/// cgroup hierarchy, so an implicit cap would turn a security default into a
+/// hard startup dependency.
+const DEFAULT_PIDS_LIMIT: i64 = 256;
+
+fn default_pids_limit(euid: u32) -> Option<i64> {
+    (euid == 0).then_some(DEFAULT_PIDS_LIMIT)
+}
+
 /// Docker-style networking defaults: rootful runs use the managed bridge;
 /// rootless stays on an isolated loopback namespace until user-mode NAT lands.
 fn default_net(euid: u32) -> NetMode {
@@ -977,12 +987,14 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
             return 2;
         }
     };
+    let euid = syscalls::effective_uid();
     if !a.net_specified {
-        a.net = default_net(syscalls::effective_uid());
+        a.net = default_net(euid);
     }
-    if let Err(error) =
-        mounts::validate_device_permissions(syscalls::effective_uid() != 0, &a.devices)
-    {
+    if a.pids.is_none() {
+        a.pids = default_pids_limit(euid);
+    }
+    if let Err(error) = mounts::validate_device_permissions(euid != 0, &a.devices) {
         eprintln!("zerun run: {error}");
         return 2;
     }
@@ -3586,8 +3598,12 @@ fn cmd_generate_service(args: &[String]) -> i32 {
     };
     // Keep the generated command explicit so behavior does not depend on the
     // effective UID of the systemd service versus the generating user.
+    let euid = syscalls::effective_uid();
     if !a.net_specified {
-        a.net = default_net(syscalls::effective_uid());
+        a.net = default_net(euid);
+    }
+    if a.pids.is_none() {
+        a.pids = default_pids_limit(euid);
     }
     match service::generate(&a, &mut std::io::stdout().lock()) {
         Ok(()) => 0,
@@ -7072,7 +7088,7 @@ RUN OPTIONS:\n  \
   --cpu-shares 512    relative CPU weight (Docker-compatible shares)\n  \
   --cpuset-cpus 0-3   pin CPUs (cgroups v2 cpuset.cpus)\n  \
   --cpuset-mems 0     pin memory nodes (cgroups v2 cpuset.mems)\n  \
-  --pids, --pids-limit N  cgroup v2 pids.max (-1 = unlimited)\n  \
+  --pids, --pids-limit N  cgroup v2 pids.max (rootful default: 256; -1 = unlimited)\n  \
   --oom-group         kill the whole cgroup on OOM (memory.oom.group)\n  \
   --device-read-bps DEV:BYTES    cgroup v2 io.max read rate (repeatable)\n  \
   --device-write-bps DEV:BYTES   cgroup v2 io.max write rate (repeatable)\n  \
@@ -8427,6 +8443,8 @@ mod tests {
     fn rootful_defaults_to_bridge_and_rootless_to_none() {
         assert_eq!(default_net(0), NetMode::Bridge);
         assert_eq!(default_net(1000), NetMode::None);
+        assert_eq!(default_pids_limit(0), Some(DEFAULT_PIDS_LIMIT));
+        assert_eq!(default_pids_limit(1000), None);
     }
 
     #[test]
