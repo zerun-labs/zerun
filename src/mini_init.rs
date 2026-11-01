@@ -8,6 +8,7 @@
 //!
 //! The `zerun __init -- cmd` re-exec entry is retained for manual/legacy use.
 use crate::error::ZResult;
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
@@ -29,6 +30,33 @@ pub fn run(
     env: Option<&[(String, String)]>,
     hostname: Option<&str>,
     id: &str,
+) -> ZResult<i32> {
+    run_impl(business, env, hostname, id, None)
+}
+
+/// Run mini-init with the namespace setup error pipe still open.
+///
+/// The workload child inherits `error_w`; a successful exec closes it through
+/// O_CLOEXEC, while an exec failure writes the diagnostic there. Mini-init's
+/// parent closes its copy after the fork so the runtime parent can distinguish
+/// those outcomes. Errors before the fork leave the endpoint for the caller to
+/// report through the same pipe.
+pub fn run_with_error_pipe(
+    business: &[String],
+    env: Option<&[(String, String)]>,
+    hostname: Option<&str>,
+    id: &str,
+    error_w: RawFd,
+) -> ZResult<i32> {
+    run_impl(business, env, hostname, id, Some(error_w))
+}
+
+fn run_impl(
+    business: &[String],
+    env: Option<&[(String, String)]>,
+    hostname: Option<&str>,
+    id: &str,
+    error_w: Option<RawFd>,
 ) -> ZResult<i32> {
     if business.is_empty() {
         return Err(crate::zerr!("__init: missing business command"));
@@ -53,10 +81,22 @@ pub fn run(
         for signal in forwardable_signals() {
             crate::syscalls::reset_signal_handler(signal)?;
         }
-        exec_business(business, env, hostname, id)?;
-        unreachable!("exec failure is returned as Err");
+        if let Err(error) = exec_business(business, env, hostname, id) {
+            if let Some(fd) = error_w {
+                let message = format!("{error}");
+                let _ = crate::syscalls::write_all_fd(fd, message.as_bytes());
+                crate::syscalls::close(fd);
+            }
+            crate::syscalls::exit_process(1);
+        }
+        unreachable!("exec failure is reported and exits");
     }
     CHILD_PID.store(pid, Ordering::Relaxed);
+    // The workload child now owns the only error-pipe writer. Its successful
+    // exec closes it via O_CLOEXEC; an exec failure writes before closing.
+    if let Some(fd) = error_w {
+        crate::syscalls::close(fd);
+    }
 
     // Reap loop: after the workload exits, keep sweeping orphans with WNOHANG
     // until ECHILD.

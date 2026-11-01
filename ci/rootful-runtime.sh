@@ -101,6 +101,17 @@ set -e
 test "$exec_failure_status" -eq 1
 grep -F "container setup failed: execve failed:" <<<"$exec_failure_output" >/dev/null
 
+# Mini-init forks the workload instead of exec'ing it, but a workload exec
+# failure must still reach the runtime parent rather than looking like a
+# successful init start.
+set +e
+init_exec_failure_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay --init -- \
+  /definitely-missing-zerun-command 2>&1)
+init_exec_failure_status=$?
+set -e
+test "$init_exec_failure_status" -eq 1
+grep -F "container setup failed: mini-init exec" <<<"$init_exec_failure_output" >/dev/null
+
 # PID/IPC/UTS sharing must be opt-in, and host-shared /dev/shm must be the
 # host's mount rather than a private tmpfs. The default private run is checked
 # against the host namespace identities, not just the visible hostname.

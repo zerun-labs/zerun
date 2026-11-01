@@ -1016,12 +1016,13 @@ fn child_stage(
     let env = exec_environment(spec);
     let argv = crate::workload::resolve_argv(env.as_deref(), &spec.argv);
     if spec.use_init {
-        // Setup has succeeded at this point, so close the error-pipe write end
-        // explicitly so the parent's blocking read gets EOF. This path never
-        // execs, unlike the direct-exec path where O_CLOEXEC closes the pipe.
-        syscalls::close(err_w);
-        let code =
-            crate::mini_init::run(&argv, env.as_deref(), spec.hostname.as_deref(), &spec.id)?;
+        let code = crate::mini_init::run_with_error_pipe(
+            &argv,
+            env.as_deref(),
+            spec.hostname.as_deref(),
+            &spec.id,
+            err_w,
+        )?;
         crate::syscalls::exit_process(code);
     }
 
