@@ -672,6 +672,9 @@ pub struct RootfsConfig<'a> {
     /// Mount a private `/dev/shm` tmpfs. False for `--ipc none`, which keeps a
     /// private IPC namespace but deliberately leaves `/dev/shm` unmounted.
     pub mount_shm: bool,
+    /// Requested private `/dev/shm` size in bytes; None keeps Docker's 64 MiB
+    /// default. Ignored for `--ipc host` and `--ipc none`.
+    pub shm_size: Option<u64>,
 }
 
 /// Full root migration + pseudo-filesystem assembly, run by the child inside the
@@ -711,7 +714,7 @@ pub fn setup_rootfs(cfg: &RootfsConfig) -> ZResult<()> {
     syscalls::chdir("/")?;
     trace::mark("child:pivot_root:done");
 
-    mount_pseudo_fs(cfg.rootless, cfg.host_shm, cfg.mount_shm)?;
+    mount_pseudo_fs(cfg.rootless, cfg.host_shm, cfg.mount_shm, cfg.shm_size)?;
     populate_dev(
         cfg.rootless,
         cfg.device_sources,
@@ -858,7 +861,12 @@ fn setup_overlay(rootless: bool, ovl: &OverlayPaths) -> ZResult<()> {
 /// rootful: any critical mount failure is an error. rootless: locked-down hosts
 /// (or nested-container LSM policy) may refuse userns mounts of proc/sys; in that
 /// case warn and continue, with `doctor` explaining the environment limit.
-fn mount_pseudo_fs(rootless: bool, host_shm: Option<RawFd>, mount_shm: bool) -> ZResult<()> {
+fn mount_pseudo_fs(
+    rootless: bool,
+    host_shm: Option<RawFd>,
+    mount_shm: bool,
+    shm_size: Option<u64>,
+) -> ZResult<()> {
     let common = MS_NOSUID | MS_NOEXEC | MS_NODEV;
 
     // /proc is remounted in the container's mount namespace. Under the default
@@ -915,6 +923,7 @@ fn mount_pseudo_fs(rootless: bool, host_shm: Option<RawFd>, mount_shm: bool) -> 
             "host /dev/shm for --ipc host",
         )?;
     } else {
+        let data = shm_mount_data(shm_size);
         require_or_warn(
             rootless,
             syscalls::mount(
@@ -922,7 +931,7 @@ fn mount_pseudo_fs(rootless: bool, host_shm: Option<RawFd>, mount_shm: bool) -> 
                 "/dev/shm",
                 Some("tmpfs"),
                 MS_NOSUID | MS_NODEV | MS_NOEXEC,
-                Some("mode=1777,size=65536k"),
+                Some(data.as_str()),
             ),
             "/dev/shm",
         )?;
@@ -993,6 +1002,13 @@ fn mount_pseudo_fs(rootless: bool, host_shm: Option<RawFd>, mount_shm: bool) -> 
         "/tmp tmpfs",
     )?;
     Ok(())
+}
+
+/// Kernel mount data for the private `/dev/shm` tmpfs. Docker's default is
+/// 64 MiB; an explicit `--shm-size` overrides only this private mount and has
+/// no effect when `/dev/shm` is absent (`--ipc none`) or host-shared.
+fn shm_mount_data(size: Option<u64>) -> String {
+    format!("mode=1777,size={}", size.unwrap_or(64 * 1024 * 1024))
 }
 
 /// rootful: mount failure is an error. rootless: warn and continue (degraded host).
@@ -1271,6 +1287,15 @@ mod bind_tests {
         let dir = std::env::temp_dir().join(format!("zerun-bind-{}-{name}", std::process::id()));
         fsutil::remove_dir_all_quiet(&dir);
         dir
+    }
+
+    #[test]
+    fn private_shm_uses_docker_default_or_explicit_size() {
+        assert_eq!(shm_mount_data(None), "mode=1777,size=67108864");
+        assert_eq!(
+            shm_mount_data(Some(96 * 1024 * 1024)),
+            "mode=1777,size=100663296"
+        );
     }
 
     #[test]

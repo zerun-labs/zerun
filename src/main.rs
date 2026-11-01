@@ -182,6 +182,8 @@ struct RunArgs {
     readonly: bool,
     /// `--tmpfs PATH[:opts]`: extra in-container tmpfs mounts.
     tmpfs: Vec<mounts::TmpfsMount>,
+    /// `--shm-size SIZE`: size of the private `/dev/shm` tmpfs.
+    shm_size: Option<u64>,
     platform: Option<String>,
     /// Override the image `ENTRYPOINT`; an empty string resets it.
     entrypoint: Option<String>,
@@ -430,6 +432,12 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 let v = next_value(args, &mut i, "--tmpfs")?;
                 a.tmpfs.push(mounts::parse_tmpfs(&v)?);
             }
+            "--shm-size" => {
+                let v = next_value(args, &mut i, "--shm-size")?;
+                a.shm_size = Some(
+                    units::parse_size(&v).map_err(|e| format!("invalid --shm-size '{v}': {e}"))?,
+                );
+            }
             "--platform" => {
                 a.platform = Some(next_value(args, &mut i, "--platform")?);
             }
@@ -583,6 +591,14 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             other if other.starts_with("--mount=") => {
                 append_run_mount(&mut a, &other["--mount=".len()..])?;
+                i += 1;
+            }
+            other if other.starts_with("--shm-size=") => {
+                let value = &other["--shm-size=".len()..];
+                a.shm_size = Some(
+                    units::parse_size(value)
+                        .map_err(|e| format!("invalid --shm-size '{value}': {e}"))?,
+                );
                 i += 1;
             }
             other if other.starts_with("--device=") => {
@@ -1435,6 +1451,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         hosts: host_aliases,
         readonly: a.readonly,
         tmpfs: a.tmpfs,
+        shm_size: a.shm_size,
         // Allocated from the file IPAM inside run_container (bridge mode).
         bridge_ip: None,
         run_root: store.run_root().to_path_buf(),
@@ -2162,6 +2179,9 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     }
     for t in &a.tmpfs {
         args.extend(["--tmpfs".to_string(), t.raw.clone()]);
+    }
+    if let Some(size) = a.shm_size {
+        args.extend(["--shm-size".to_string(), size.to_string()]);
     }
     if let Some(v) = &a.platform {
         args.extend(["--platform".to_string(), v.clone()]);
@@ -7041,6 +7061,7 @@ RUN OPTIONS:\n  \
                       later files win, then -e overrides)\n  \
   --log-max-size SIZE  detached console.log rotation size (default: 10m; 0 disables)\n  \
   --log-max-file N     retained detached log files including active (default: 3; max: 1024)\n  \
+  --shm-size SIZE     private /dev/shm size (default: 64m)\n  \
   --no-overlay        pivot directly into the rootfs (no writable upper layer)\n  \
   --tmpfs-upper       keep the overlay writable layer in tmpfs (not committable)\n  \
   --read-only         remount the container root read-only before exec\n  \
@@ -7721,6 +7742,9 @@ mod tests {
             "/scratch:size=16m",
             "--tmpfs",
             "/run/shm:ro",
+            "--shm-size",
+            "96M",
+            "--shm-size=32m",
             "alpine",
             "sh",
         ]
@@ -7732,10 +7756,22 @@ mod tests {
         assert_eq!(a.tmpfs.len(), 2);
         assert_eq!(a.tmpfs[0].data, "size=16777216");
         assert!(a.tmpfs[1].readonly);
+        assert_eq!(a.shm_size, Some(32 * 1024 * 1024));
         let launch = detached_launch_args(&a, Path::new("/tmp/rootfs"));
         assert!(launch.contains(&"--read-only".to_string()));
         assert!(launch.contains(&"/scratch:size=16m".to_string()));
         assert!(launch.contains(&"/run/shm:ro".to_string()));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--shm-size", "33554432"]));
+
+        for value in ["", "NaN", "-1", "1..5M"] {
+            let args = vec![format!("--shm-size={value}"), "alpine".to_string()];
+            assert!(
+                parse_run_args(&args).is_err(),
+                "{value:?} should be rejected"
+            );
+        }
     }
 
     #[test]

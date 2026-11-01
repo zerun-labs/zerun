@@ -92,6 +92,8 @@ pub struct RunSpec {
     pub readonly: bool,
     /// Extra in-container tmpfs mounts (`--tmpfs PATH[:opts]`).
     pub tmpfs: Vec<TmpfsMount>,
+    /// Requested size of the private `/dev/shm` tmpfs (`--shm-size`).
+    pub shm_size: Option<u64>,
     /// TCP ports published on the host (`-p HOST:CONTAINER`); only valid with
     /// `NetMode::Bridge`. Served by the built-in userland proxy in network.rs.
     pub ports: Vec<crate::network::PublishedPort>,
@@ -1073,6 +1075,7 @@ fn child_stage(
         requested_device_sources: &requested_device_sources,
         host_shm: host_shm.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
         mount_shm: !matches!(spec.namespaces.ipc, IpcMode::None),
+        shm_size: spec.shm_size,
     };
     setup_rootfs(&cfg)?;
     // Device nodes must exist before the parent installs the deny-by-default

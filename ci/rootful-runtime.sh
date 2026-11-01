@@ -148,6 +148,12 @@ private_shm=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
   --ipc private -- /bin/sh -c \
   "if test -e '$host_shm_marker'; then exit 1; fi; printf private-shm-ok")
 grep -Fx private-shm-ok <<<"$private_shm" >/dev/null
+sized_shm=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+  --shm-size 96m -- /bin/sh -c \
+  'size_kib=$(/bin/busybox df -k /dev/shm | /bin/busybox tail -n 1 | /bin/busybox awk "{print \$2}");
+   test "$size_kib" -eq 98304 || { printf "unexpected /dev/shm KiB: %s\n" "$size_kib" >&2; exit 1; }
+   printf sized-shm-ok')
+grep -Fx sized-shm-ok <<<"$sized_shm" >/dev/null
 "${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay --ipc host -- \
   /bin/sh -c "printf host-shm-ok > '$host_shm_marker'"
 grep -Fx host-shm-ok "$host_shm_marker" >/dev/null
@@ -424,14 +430,14 @@ fi
 # Restart must stop and resume the same detached record rather than creating a
 # replacement container. Verify that the workload ran once before and once
 # after the restart while retaining the same id, log history, PTY semantics,
-# and resource limits.
+# resource limits, and private /dev/shm size.
 restart_id=$("${zerun[@]}" run -dt --rootfs "$rootfs" --no-overlay --net none \
-  --ulimit nofile=64:96 --init -- /bin/sh -c \
-  'if [ -t 0 ] && [ -t 1 ] && [ -t 2 ]; then tty=yes; else tty=no; fi; geometry=$(/bin/busybox stty -a 2>/dev/null | /bin/busybox grep -o "rows [0-9]*; columns [0-9]*"); printf "restart-ok nofile=%s:%s tty=%s geometry=%s\\n" "$(ulimit -Sn)" "$(ulimit -Hn)" "$tty" "$geometry"; sleep 30')
+  --ulimit nofile=64:96 --shm-size 96m --init -- /bin/sh -c \
+  'if [ -t 0 ] && [ -t 1 ] && [ -t 2 ]; then tty=yes; else tty=no; fi; geometry=$(/bin/busybox stty -a 2>/dev/null | /bin/busybox grep -o "rows [0-9]*; columns [0-9]*"); shm_kib=$(/bin/busybox df -k /dev/shm | /bin/busybox tail -n 1 | /bin/busybox awk "{print \$2}"); printf "restart-ok nofile=%s:%s tty=%s geometry=%s shm=%s\\n" "$(ulimit -Sn)" "$(ulimit -Hn)" "$tty" "$geometry" "$shm_kib"; sleep 30')
 cleanup_ids+=("$restart_id")
 for attempt in $(seq 1 50); do
   restart_logs=$("${zerun[@]}" logs "$restart_id" 2>/dev/null || true)
-  if (( $(grep -c 'restart-ok nofile=64:96 tty=yes geometry=rows 24; columns 80' <<<"$restart_logs" || true) >= 1 )); then
+  if (( $(grep -c 'restart-ok nofile=64:96 tty=yes geometry=rows 24; columns 80 shm=98304' <<<"$restart_logs" || true) >= 1 )); then
     break
   fi
   if (( attempt == 50 )); then
@@ -443,7 +449,7 @@ done
 "${zerun[@]}" restart --time 1 "$restart_id" >/dev/null
 for attempt in $(seq 1 50); do
   restart_logs=$("${zerun[@]}" logs "$restart_id" 2>/dev/null || true)
-  if (( $(grep -c 'restart-ok nofile=64:96 tty=yes geometry=rows 24; columns 80' <<<"$restart_logs" || true) >= 2 )); then
+  if (( $(grep -c 'restart-ok nofile=64:96 tty=yes geometry=rows 24; columns 80 shm=98304' <<<"$restart_logs" || true) >= 2 )); then
     break
   fi
   if (( attempt == 50 )); then

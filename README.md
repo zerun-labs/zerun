@@ -26,7 +26,8 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   with disk upper and automatic cleanup; OCI whiteout materialization; safe host bind-mount
   volumes with `-v HOST:CONTAINER[:ro|rw]`, auto-created named volumes with
   `-v NAME:CONTAINER[:ro|rw]`, Docker-style `--mount type=bind|volume|tmpfs,...` requests,
-  optional ephemeral `--tmpfs-upper` writable layers.
+  configurable private `/dev/shm` sizing with `--shm-size`, optional ephemeral
+  `--tmpfs-upper` writable layers.
 - **M3 — OCI image engine (done)**: `zerun login / logout / pull / push / tag / save / load / images / rmi`; Docker v2
   pull with Bearer token auth, private-registry credentials, multi-arch platform selection (`--platform`), compressed-blob and
   diff_id double verification, zstd layer decode + magic sniffing, transient request retries,
@@ -277,6 +278,8 @@ Run options (current subset):
 --tmpfs PATH[:opts] mount an in-container tmpfs (size=bytes or K/M/G/T units,
                     optional B suffix; mode=/ro, repeatable; pairs naturally with
                     --read-only for /tmp-like scratch space)
+--shm-size SIZE    private /dev/shm size (default: 64m; ignored with
+                    --ipc host or --ipc none)
 ```
 
 Cgroup flags bound aggregate container resource use. `--ulimit` additionally

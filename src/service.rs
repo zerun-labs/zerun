@@ -176,6 +176,10 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--tmpfs".into());
         run_args.push(t.raw.clone());
     }
+    if let Some(size) = a.shm_size {
+        run_args.push("--shm-size".into());
+        run_args.push(size.to_string());
+    }
     for v in &a.volumes {
         run_args.push("--volume".into());
         run_args.push(v.raw.clone());
@@ -588,6 +592,13 @@ mod tests {
         let a = args(&["--device", "/dev/null:r", "alpine", "true"]);
         let error = render(Path::new("/usr/local/bin/zerun"), &a, false).unwrap_err();
         assert!(error.contains("permission subsets require rootful"));
+    }
+
+    #[test]
+    fn renders_private_shm_size() {
+        let a = args(&["--shm-size", "96m", "alpine", "true"]);
+        let unit = render(Path::new("/usr/local/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains("--shm-size 100663296"));
     }
 
     #[test]
