@@ -18,6 +18,7 @@ const BPF_LD: u16 = 0x00;
 const BPF_W: u16 = 0x00;
 const BPF_ABS: u16 = 0x20;
 const BPF_JMP: u16 = 0x05;
+const BPF_JA: u16 = 0x00;
 const BPF_JEQ: u16 = 0x10;
 const BPF_K: u16 = 0x00;
 const BPF_RET: u16 = 0x06;
@@ -74,33 +75,51 @@ pub fn apply(mode: SeccompMode) -> ZResult<()> {
 ///   1          JEQ K <native>, jt=1   (skip the kill on native arch)
 ///   2          RET KILL_PROCESS       (non-native arch -> kill)
 ///   3          LD  W ABS 0            (load syscall nr)
-///   4..4+n-1   JEQ K <nr_i>, jt=n-i   (match -> jump to ALLOW)
-///   4+n        RET ERRNO|EPERM        (default deny)
-///   4+n+1      RET ALLOW
+///   4...       allowlist comparison blocks (see below)
+///   last       RET ERRNO|EPERM        (default deny)
+///
+/// Classic-BPF conditional jumps carry an 8-bit offset, so one flat compare
+/// chain cannot represent more than 255 syscalls. Each block holds at most
+/// `MAX_SYSCALL_COMPARES_PER_BLOCK` compares, jumps matches to a local ALLOW,
+/// and uses an unconditional jump to skip that ALLOW when the whole block
+/// misses. This keeps every branch in range while preserving a single syscall
+/// data load.
 pub fn build_default_program() -> ZResult<Vec<libc::sock_filter>> {
     let allowed = default_allowlist();
-    let n = allowed.len();
-    if n > u8::MAX as usize {
-        return Err(crate::zerr!(
-            "seccomp allowlist too large ({n} entries; max {})",
-            u8::MAX
-        ));
-    }
+    build_allowlist_program(&allowed)
+}
 
-    let mut insns = Vec::with_capacity(n + 5);
+const MAX_SYSCALL_COMPARES_PER_BLOCK: usize = 200;
+const BPF_MAX_INSNS: usize = 4096;
+
+fn build_allowlist_program(allowed: &[u32]) -> ZResult<Vec<libc::sock_filter>> {
+    let blocks = allowed.len().div_ceil(MAX_SYSCALL_COMPARES_PER_BLOCK);
+    let mut insns = Vec::with_capacity(allowed.len() + blocks * 2 + 5);
     // Architecture gate.
     insns.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET));
     insns.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, 1, 0, AUDIT_ARCH_NATIVE));
     insns.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
     // Syscall allowlist.
     insns.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
-    for (i, nr) in allowed.iter().enumerate() {
-        // Equal -> jump over the remaining compares + the default ERRNO, landing
-        // exactly on the final ALLOW (see layout comment).
-        insns.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, (n - i) as u8, 0, *nr));
+    for block in allowed.chunks(MAX_SYSCALL_COMPARES_PER_BLOCK) {
+        let block_start = insns.len();
+        let allow_index = block_start + block.len() + 1;
+        for (offset, syscall) in block.iter().enumerate() {
+            let jump: u8 = (allow_index - (block_start + offset + 1))
+                .try_into()
+                .map_err(|_| crate::zerr!("seccomp allowlist block jump is too large"))?;
+            insns.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, jump, 0, *syscall));
+        }
+        insns.push(bpf_stmt(BPF_JMP | BPF_JA, 1));
+        insns.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
     }
     insns.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM));
-    insns.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    if insns.len() > BPF_MAX_INSNS {
+        return Err(crate::zerr!(
+            "seccomp program too large ({} instructions; max {BPF_MAX_INSNS})",
+            insns.len()
+        ));
+    }
     Ok(insns)
 }
 
@@ -174,6 +193,7 @@ fn common_allowlist() -> Vec<libc::c_long> {
         libc::SYS_fsync,
         libc::SYS_ftruncate,
         libc::SYS_futex,
+        libc::SYS_futex_waitv,
         libc::SYS_getcpu,
         libc::SYS_getcwd,
         libc::SYS_getdents64,
@@ -182,12 +202,14 @@ fn common_allowlist() -> Vec<libc::c_long> {
         libc::SYS_getgid,
         libc::SYS_getgroups,
         libc::SYS_getitimer,
+        libc::SYS_get_mempolicy,
         libc::SYS_getpeername,
         libc::SYS_getpgid,
         libc::SYS_getpid,
         libc::SYS_getppid,
         libc::SYS_getpriority,
         libc::SYS_getrandom,
+        libc::SYS_get_robust_list,
         libc::SYS_getresgid,
         libc::SYS_getresuid,
         libc::SYS_getrusage,
@@ -202,6 +224,8 @@ fn common_allowlist() -> Vec<libc::c_long> {
         libc::SYS_inotify_init1,
         libc::SYS_inotify_rm_watch,
         libc::SYS_ioctl,
+        libc::SYS_ioprio_get,
+        libc::SYS_ioprio_set,
         libc::SYS_kill,
         libc::SYS_lgetxattr,
         libc::SYS_linkat,
@@ -212,6 +236,8 @@ fn common_allowlist() -> Vec<libc::c_long> {
         libc::SYS_lseek,
         libc::SYS_lsetxattr,
         libc::SYS_madvise,
+        libc::SYS_mbind,
+        libc::SYS_membarrier,
         libc::SYS_memfd_create,
         libc::SYS_mincore,
         libc::SYS_mkdirat,
@@ -241,6 +267,9 @@ fn common_allowlist() -> Vec<libc::c_long> {
         libc::SYS_openat2,
         libc::SYS_personality,
         libc::SYS_pipe2,
+        libc::SYS_pkey_alloc,
+        libc::SYS_pkey_free,
+        libc::SYS_pkey_mprotect,
         libc::SYS_ppoll,
         libc::SYS_prctl,
         libc::SYS_pread64,
@@ -250,6 +279,7 @@ fn common_allowlist() -> Vec<libc::c_long> {
         libc::SYS_pwrite64,
         libc::SYS_pwritev,
         libc::SYS_read,
+        libc::SYS_readahead,
         libc::SYS_readlinkat,
         libc::SYS_readv,
         libc::SYS_recvfrom,
@@ -269,6 +299,8 @@ fn common_allowlist() -> Vec<libc::c_long> {
         libc::SYS_sched_getaffinity,
         libc::SYS_sched_getattr,
         libc::SYS_sched_getparam,
+        libc::SYS_sched_get_priority_max,
+        libc::SYS_sched_get_priority_min,
         libc::SYS_sched_getscheduler,
         libc::SYS_sched_rr_get_interval,
         libc::SYS_sched_setaffinity,
@@ -300,6 +332,8 @@ fn common_allowlist() -> Vec<libc::c_long> {
         libc::SYS_setsockopt,
         libc::SYS_setuid,
         libc::SYS_setxattr,
+        libc::SYS_set_tid_address,
+        libc::SYS_set_mempolicy,
         libc::SYS_shmat,
         libc::SYS_shmctl,
         libc::SYS_shmdt,
@@ -356,6 +390,7 @@ fn target_allowlist(common: &mut Vec<libc::c_long>) {
         libc::SYS_epoll_create,
         libc::SYS_epoll_wait,
         libc::SYS_eventfd,
+        libc::SYS_fadvise64,
         libc::SYS_fork,
         libc::SYS_getdents,
         libc::SYS_getpgrp,
@@ -394,6 +429,7 @@ fn target_allowlist(common: &mut Vec<libc::c_long>) {
 #[cfg(target_arch = "aarch64")]
 fn target_allowlist(common: &mut Vec<libc::c_long>) {
     let raw: &[libc::c_long] = &[
+        libc::SYS_fadvise64,
         libc::SYS_getrlimit,
         libc::SYS_mmap,
         libc::SYS_newfstatat,
@@ -406,8 +442,11 @@ fn target_allowlist(common: &mut Vec<libc::c_long>) {
 
 #[cfg(target_arch = "arm")]
 fn target_allowlist(common: &mut Vec<libc::c_long>) {
+    // The libc crate omits this stable ARM EABI constant from its musl table.
+    const ARM_FADVISE64_64: libc::c_long = 270;
     let raw: &[libc::c_long] = &[
         libc::SYS_access,
+        ARM_FADVISE64_64,
         libc::SYS_chmod,
         libc::SYS_chown,
         libc::SYS_creat,
@@ -445,6 +484,7 @@ fn target_allowlist(common: &mut Vec<libc::c_long>) {
 #[cfg(target_arch = "riscv64")]
 fn target_allowlist(common: &mut Vec<libc::c_long>) {
     let raw: &[libc::c_long] = &[
+        libc::SYS_fadvise64,
         libc::SYS_getrlimit,
         libc::SYS_mmap,
         libc::SYS_newfstatat,
@@ -497,32 +537,87 @@ mod tests {
         assert_eq!(code_of(&p[3]), BPF_LD | BPF_W | BPF_ABS);
         assert_eq!(k_of(&p[3]), SECCOMP_DATA_NR_OFFSET);
 
-        // Epilogue: default ERRNO then ALLOW.
+        // Epilogue: the global default deny follows the final ALLOW block.
         let last = p.len() - 1;
         assert_eq!(code_of(&p[last]), BPF_RET | BPF_K);
-        assert_eq!(k_of(&p[last]), SECCOMP_RET_ALLOW);
-        assert_eq!(code_of(&p[last - 1]), BPF_RET | BPF_K);
-        assert_eq!(k_of(&p[last - 1]), SECCOMP_RET_ERRNO | EPERM);
+        assert_eq!(k_of(&p[last]), SECCOMP_RET_ERRNO | EPERM);
     }
 
     #[test]
     fn every_allowed_syscall_is_present_and_jump_lands_on_allow() {
         let p = build_default_program().unwrap();
         let allowed = default_allowlist();
-        let allow_idx = (p.len() - 1) as usize;
-        // Compare block: p[4 .. 4+n); each must JEQ an allowlisted nr and its
-        // jt must land exactly on the ALLOW instruction.
-        for (i, insn) in p.iter().enumerate().skip(4).take(allowed.len()) {
-            assert_eq!(
-                code_of(insn),
-                BPF_JMP | BPF_JEQ | BPF_K,
-                "insn {i} not a JEQ"
-            );
-            assert!(allowed.binary_search(&k_of(insn)).is_ok());
-            let target = i + 1 + insn.jt as usize;
-            assert_eq!(target, allow_idx, "jump from insn {i} misses ALLOW");
+        let mut index = 4;
+        for block in allowed.chunks(MAX_SYSCALL_COMPARES_PER_BLOCK) {
+            let allow_index = index + block.len() + 1;
+            for (offset, syscall) in block.iter().enumerate() {
+                let instruction = index + offset;
+                assert_eq!(
+                    code_of(&p[instruction]),
+                    BPF_JMP | BPF_JEQ | BPF_K,
+                    "insn {instruction} not a JEQ"
+                );
+                assert_eq!(k_of(&p[instruction]), *syscall);
+                assert_eq!(instruction + 1 + p[instruction].jt as usize, allow_index);
+            }
+            let jump = index + block.len();
+            assert_eq!(code_of(&p[jump]), BPF_JMP | BPF_JA);
+            assert_eq!(k_of(&p[jump]), 1);
+            assert_eq!(code_of(&p[allow_index]), BPF_RET | BPF_K);
+            assert_eq!(k_of(&p[allow_index]), SECCOMP_RET_ALLOW);
+            index += block.len() + 2;
         }
-        // And the default-ERRNO instruction sits between the compares and ALLOW.
-        assert_eq!(p.len(), 4 + allowed.len() + 2);
+        assert_eq!(index, p.len() - 1);
+        assert_eq!(code_of(&p[index]), BPF_RET | BPF_K);
+        assert_eq!(k_of(&p[index]), SECCOMP_RET_ERRNO | EPERM);
+    }
+
+    #[test]
+    fn allowlist_program_supports_more_than_255_syscalls() {
+        let syscalls = (0..300).collect::<Vec<_>>();
+        let program = build_allowlist_program(&syscalls).unwrap();
+        assert_eq!(
+            program
+                .iter()
+                .skip(4)
+                .filter(|instruction| code_of(instruction) == BPF_JMP | BPF_JEQ | BPF_K)
+                .count(),
+            300
+        );
+    }
+
+    #[test]
+    fn common_runtime_io_thread_and_numa_syscalls_are_allowed() {
+        let allowed = default_allowlist();
+        let common = [
+            libc::SYS_futex_waitv,
+            libc::SYS_get_mempolicy,
+            libc::SYS_get_robust_list,
+            libc::SYS_ioprio_get,
+            libc::SYS_ioprio_set,
+            libc::SYS_mbind,
+            libc::SYS_membarrier,
+            libc::SYS_pkey_alloc,
+            libc::SYS_pkey_free,
+            libc::SYS_pkey_mprotect,
+            libc::SYS_readahead,
+            libc::SYS_sched_get_priority_max,
+            libc::SYS_sched_get_priority_min,
+            libc::SYS_set_mempolicy,
+            libc::SYS_set_tid_address,
+        ];
+        for syscall in common {
+            assert!(
+                allowed.binary_search(&(syscall as u32)).is_ok(),
+                "syscall {} is missing from the default allowlist",
+                syscall
+            );
+        }
+
+        #[cfg(target_arch = "arm")]
+        let fadvise64 = 270;
+        #[cfg(not(target_arch = "arm"))]
+        let fadvise64 = libc::SYS_fadvise64;
+        assert!(allowed.binary_search(&(fadvise64 as u32)).is_ok());
     }
 }

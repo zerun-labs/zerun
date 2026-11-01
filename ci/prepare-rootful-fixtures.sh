@@ -77,7 +77,27 @@ int main(int argc, char **argv) {
 }
 C_EOF
 
+"$cc" -static -O2 -Wall -Wextra -x c -o "$rootfs/bin/seccomp-io-probe" - <<'C_EOF'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void) {
+    int fd = open("/etc/passwd", O_RDONLY);
+    if (fd < 0) { perror("open"); return 1; }
+    int rc = posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+    if (rc != 0) { errno = rc; perror("posix_fadvise"); return 2; }
+    if (readahead(fd, 0, 4096) != 0) { perror("readahead"); return 3; }
+    if (close(fd) != 0) { perror("close"); return 4; }
+    puts("seccomp-io-ok");
+    return 0;
+}
+C_EOF
+
 test -x "$rootfs/bin/udp-echo"
+test -x "$rootfs/bin/seccomp-io-probe"
 # The integration suite drops all capabilities for one check; every fixture
 # path must remain traversable without DAC override.
 chmod -R a+rX "$rootfs"

@@ -320,6 +320,17 @@ default_device_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-ove
    printf "default-device-policy-ok\n"')
 grep -Fx default-device-policy-ok <<<"$default_device_output" >/dev/null
 
+# Common runtimes use advisory I/O hints and readahead; they are safe and part
+# of Docker's default seccomp allowlist. Newer local fixtures provide this
+# optional static probe, while hosted CI always builds it.
+if [[ -x "$rootfs/bin/seccomp-io-probe" ]]; then
+  seccomp_io_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+    --init -- /bin/seccomp-io-probe)
+  grep -Fx seccomp-io-ok <<<"$seccomp_io_output" >/dev/null
+else
+  echo "skipping optional seccomp I/O compatibility check: $rootfs/bin/seccomp-io-probe is missing" >&2
+fi
+
 # Resource limits require an actual cgroup v2 hierarchy and exercise the
 # parent-side cgroup creation/attach path.
 cgroup_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
