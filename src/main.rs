@@ -3594,26 +3594,28 @@ fn cmd_doctor(args: &[String]) -> i32 {
         println!("device policy  : not required for rootless runs");
     }
 
-    let user_namespaces_available =
-        match std::fs::read_to_string("/proc/sys/user/max_user_namespaces") {
-            Ok(value) => match value.trim().parse::<u64>() {
-                Ok(limit) => {
-                    println!("user namespaces: max = {limit}");
-                    limit > 0
+    let user_namespace_limit = std::fs::read_to_string("/proc/sys/user/max_user_namespaces")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if uid == 0 {
+        match user_namespace_limit {
+            Some(limit) => println!("user namespaces: max = {limit}"),
+            None => println!("user namespaces: max unavailable"),
+        }
+    } else {
+        match namespace::probe_rootless_user_namespace() {
+            Ok(()) => match user_namespace_limit {
+                Some(limit) => {
+                    println!("user namespaces: OK (unprivileged mapping works; max = {limit})")
                 }
-                Err(_) => {
-                    println!("user namespaces: INVALID ({})", value.trim());
-                    false
-                }
+                None => println!("user namespaces: OK (unprivileged mapping works)"),
             },
             Err(error) => {
-                println!("user namespaces: UNAVAILABLE ({error})");
-                false
+                println!("user namespaces: UNAVAILABLE ({error}); rootless runs will be refused");
+                required_failure = true;
             }
-        };
-    if uid != 0 && !user_namespaces_available {
-        println!("                 rootless runs require user namespaces");
-        required_failure = true;
+        }
     }
 
     match std::fs::read_to_string("/proc/filesystems") {

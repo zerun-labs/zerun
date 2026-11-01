@@ -1257,6 +1257,47 @@ fn render_etc_hosts(
     content
 }
 
+/// Verify that this user can create and populate the user namespace used by
+/// rootless runs without changing the caller's namespaces.
+///
+/// The probe runs in a short-lived child because `unshare(2)` is irreversible.
+/// It follows the production rootless mapping sequence: create a new user
+/// namespace, deny setgroups, then map the captured host uid/gid. A failure is
+/// returned with the child's diagnostic so `zerun doctor` can distinguish a
+/// disabled namespace from a broken `/proc/self/*_map` setup.
+pub fn probe_rootless_user_namespace() -> ZResult<()> {
+    let host_euid = crate::syscalls::effective_uid();
+    let host_egid = crate::syscalls::effective_gid();
+    let mut error_pipe = crate::syscalls::Pipe::new()?;
+    let pid = crate::syscalls::fork_process()?;
+    if pid == 0 {
+        error_pipe.close_read();
+        let result = crate::syscalls::unshare_namespaces(libc::CLONE_NEWUSER)
+            .and_then(|()| write_self_id_mapping(host_euid, host_egid));
+        if let Err(error) = result {
+            let _ =
+                crate::syscalls::write_all_fd(error_pipe.write_fd(), error.to_string().as_bytes());
+            crate::syscalls::exit_process(1);
+        }
+        crate::syscalls::exit_process(0);
+    }
+    error_pipe.close_write();
+
+    let (_, status) = crate::syscalls::wait_pid(pid, 0)?
+        .ok_or_else(|| crate::zerr!("user namespace probe returned no child"))?;
+    let mut message = [0u8; 1024];
+    let len = read_all(error_pipe.read_fd(), &mut message)?;
+    if crate::syscalls::wait_status_code(status) == Some(0) {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&message[..len]);
+    if detail.trim().is_empty() {
+        Err(crate::zerr!("user namespace probe failed"))
+    } else {
+        Err(crate::zerr!("{}", detail.trim()))
+    }
+}
+
 /// Unprivileged rootless: map uid/gid 0 inside the new user namespace to the host
 /// euid/egid (single mapping; values captured before unshare).
 /// setgroups must be denied before gid_map can be written.
