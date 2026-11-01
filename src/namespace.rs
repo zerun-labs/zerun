@@ -210,22 +210,22 @@ where
         None
     };
 
-    let (err_r, err_w) = syscalls::pipe2_cloexec()?;
     let mut pty_pair = if spec.tty {
         Some(PtyPair::open()?)
     } else {
         None
     };
+    let mut err_pipe = syscalls::Pipe::new()?;
 
     // The worker must not begin mount or security setup until the parent has
     // attached it to the configured cgroup. This closes the race where a very
     // fast workload could run before its resource limits were effective.
-    let (start_gate_r, start_gate_w) = syscalls::pipe2_cloexec()?;
+    let mut start_gate = syscalls::Pipe::new()?;
 
     // Bridge mode needs a second pipe (parent -> child) so the child does not
     // exec before the veth peer has been moved into its netns. See module docs.
-    let net_sync = if matches!(spec.net, NetMode::Bridge) {
-        Some(syscalls::pipe2_cloexec()?)
+    let mut net_sync = if matches!(spec.net, NetMode::Bridge) {
+        Some(syscalls::Pipe::new()?)
     } else {
         None
     };
@@ -278,16 +278,19 @@ where
     let host_egid = crate::syscalls::effective_gid();
 
     let slave = pty_pair.as_ref().map_or(-1, PtyPair::slave);
+    let net_sync_fds = net_sync
+        .as_ref()
+        .map(|pipe| (pipe.read_fd(), pipe.write_fd()));
     let child_spec = spec.clone();
     let spawned = match spawn_namespaced_child(
         flags,
         child_spec,
         ChildIpc {
-            err_w,
-            err_r,
-            start_gate_r,
-            start_gate_w,
-            net_sync,
+            err_w: err_pipe.write_fd(),
+            err_r: err_pipe.read_fd(),
+            start_gate_r: start_gate.read_fd(),
+            start_gate_w: start_gate.write_fd(),
+            net_sync: net_sync_fds,
             tty_slave: slave,
         },
         ChildIdentity {
@@ -298,21 +301,9 @@ where
     ) {
         Ok(spawned) => spawned,
         Err(error) => {
-            // The supervisor failed before creating a worker. Release every
-            // parent-side descriptor and bridge reservation on this path so a
-            // long-lived detached reaper can retry without leaking resources.
-            syscalls::close(err_r);
-            syscalls::close(err_w);
-            syscalls::close(start_gate_r);
-            syscalls::close(start_gate_w);
-            if let Some((net_r, net_w)) = net_sync {
-                syscalls::close(net_r);
-                syscalls::close(net_w);
-            }
-            drop(pty_pair);
-            if let Some(cg) = cg {
-                cg.cleanup();
-            }
+            // The supervisor failed before creating a worker. The owned pipes,
+            // PTY, cgroup, and port proxies now release their parent-side
+            // resources as this stack frame unwinds.
             release_bridge_ip(&spec);
             return Err(error);
         }
@@ -324,23 +315,19 @@ where
     }
     trace::mark("parent:spawn:done");
 
-    // The parent keeps neither the write end nor the child end of the error pipe.
-    syscalls::close(err_w);
-    syscalls::close(start_gate_r);
+    // The parent keeps neither the write end nor the child end of the error
+    // pipe, nor the read end of the start gate.
+    err_pipe.close_write();
+    start_gate.close_read();
     TARGET_STOP_SIGNAL.store(spec.stop_signal, Ordering::Relaxed);
     TARGET_CHILD.store(pid, Ordering::Relaxed);
 
     // Attach the parked worker before it performs any workload setup. The
     // supervisor reports the worker PID immediately but the worker blocks on
-    // start_gate_w until this succeeds.
+    // the start gate until this succeeds.
     if let Some(cgroup) = &cg {
         if let Err(error) = cgroup.attach(pid) {
-            syscalls::close(start_gate_w);
-            syscalls::close(err_r);
-            if let Some((net_r, net_w)) = net_sync {
-                syscalls::close(net_r);
-                syscalls::close(net_w);
-            }
+            start_gate.close_write();
             let _ = syscalls::kill(pid, libc::SIGKILL);
             let _ = wait_child(supervisor_pid);
             if let Err(cleanup_error) = cgroup.kill_all() {
@@ -359,8 +346,8 @@ where
     // failure the parent sends `1` + error text, which the child forwards over
     // the error pipe; on success it sends `0`.
     let mut host_net: Option<crate::network::HostNet> = None;
-    if let Some((net_r, net_w)) = net_sync {
-        syscalls::close(net_r); // the parent never reads the net-ready pipe
+    if let Some(pipe) = net_sync.as_mut() {
+        pipe.close_read(); // the parent never reads the net-ready pipe
         let msg = match crate::network::setup_host_side(&spec.id, pid) {
             Ok(net) => {
                 host_net = Some(net);
@@ -372,8 +359,8 @@ where
                 v
             }
         };
-        let _ = syscalls::write_all_fd(net_w, &msg); // EPIPE: child already failed
-        syscalls::close(net_w);
+        let _ = syscalls::write_all_fd(pipe.write_fd(), &msg); // EPIPE: child failed
+        pipe.close_write();
     }
 
     // Forward terminal signals to the container PID 1.
@@ -385,14 +372,9 @@ where
 
     // The worker is attached and any bridge setup result is queued. Let it
     // proceed into child setup and then wait for the error-pipe handshake.
-    let start_result = syscalls::write_all_fd(start_gate_w, &[1]);
-    syscalls::close(start_gate_w);
+    let start_result = syscalls::write_all_fd(start_gate.write_fd(), &[1]);
+    start_gate.close_write();
     if let Err(error) = start_result {
-        syscalls::close(err_r);
-        if let Some((net_r, net_w)) = net_sync {
-            syscalls::close(net_r);
-            syscalls::close(net_w);
-        }
         let _ = syscalls::kill(pid, libc::SIGKILL);
         let _ = wait_child(supervisor_pid);
         reap_host_pid_descendants(spec.namespaces);
@@ -416,8 +398,8 @@ where
     // Block on the error pipe: EOF means the child successfully exec'd
     // (CLOEXEC closes the write end).
     let mut buf = [0u8; 2048];
-    let n = read_all(err_r, &mut buf)?;
-    syscalls::close(err_r);
+    let n = read_all(err_pipe.read_fd(), &mut buf)?;
+    err_pipe.close_read();
     if n > 0 {
         // The child failed before exec (this also reports bridge setup failures,
         // which the child relays over this pipe).

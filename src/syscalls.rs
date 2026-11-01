@@ -618,6 +618,45 @@ pub fn pipe2_cloexec() -> ZResult<(RawFd, RawFd)> {
     Ok((fds[0], fds[1]))
 }
 
+/// Owned pair of CLOEXEC pipe descriptors.
+///
+/// Callers that fork pass the raw descriptor numbers to the child but retain
+/// this owner in the parent. Each fork gets an independent descriptor table, so
+/// dropping the parent owner does not close the child's copies. Explicit
+/// `close_*` methods consume an endpoint safely and avoid the double-close risk
+/// of calling `close(2)` while the owner still holds the same number.
+#[must_use]
+pub struct Pipe {
+    read: Option<OwnedFd>,
+    write: Option<OwnedFd>,
+}
+
+impl Pipe {
+    pub fn new() -> ZResult<Self> {
+        let (read, write) = pipe2_cloexec()?;
+        Ok(Self {
+            read: Some(unsafe { OwnedFd::from_raw_fd(read) }),
+            write: Some(unsafe { OwnedFd::from_raw_fd(write) }),
+        })
+    }
+
+    pub fn read_fd(&self) -> RawFd {
+        self.read.as_ref().map_or(-1, AsRawFd::as_raw_fd)
+    }
+
+    pub fn write_fd(&self) -> RawFd {
+        self.write.as_ref().map_or(-1, AsRawFd::as_raw_fd)
+    }
+
+    pub fn close_read(&mut self) {
+        drop(self.read.take());
+    }
+
+    pub fn close_write(&mut self) {
+        drop(self.write.take());
+    }
+}
+
 pub fn close(fd: RawFd) {
     unsafe {
         libc::close(fd);
@@ -943,6 +982,24 @@ mod tests {
         let pid = std::process::id() as libc::pid_t;
         let pidfd = pidfd_open(pid).expect("pidfd_open should be available on supported Linux");
         pidfd_send_signal(pidfd.as_raw_fd(), 0).expect("pidfd signal 0 should probe the process");
+    }
+
+    #[test]
+    fn owned_pipe_closes_endpoints_without_double_close() {
+        let mut pipe = Pipe::new().expect("pipe2 should succeed");
+        let read_fd = pipe.read_fd();
+        let write_fd = pipe.write_fd();
+        assert!(std::path::Path::new(&format!("/proc/self/fd/{read_fd}")).exists());
+        assert!(std::path::Path::new(&format!("/proc/self/fd/{write_fd}")).exists());
+
+        pipe.close_read();
+        assert_eq!(pipe.read_fd(), -1);
+        assert!(!std::path::Path::new(&format!("/proc/self/fd/{read_fd}")).exists());
+        assert!(std::path::Path::new(&format!("/proc/self/fd/{write_fd}")).exists());
+
+        pipe.close_write();
+        assert_eq!(pipe.write_fd(), -1);
+        assert!(!std::path::Path::new(&format!("/proc/self/fd/{write_fd}")).exists());
     }
 
     #[test]
