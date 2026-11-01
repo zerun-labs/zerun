@@ -327,9 +327,11 @@ persisted limits; raising a hard limit above the host ceiling still requires
 the corresponding host privilege and otherwise fails explicitly.
 
 `zerun update` can change memory, CPU quota and shares, cpuset, PID, OOM-group,
-and per-device I/O limits on a running detached container. I/O updates merge into the current `io.max` view,
-so changing one device or direction leaves the other kernel limits intact; `restart`
-returns to the limits captured at launch.
+per-device I/O limits, and the restart policy of a running detached container. I/O updates
+merge into the current `io.max` view, so changing one device or direction leaves the other
+kernel limits intact; the updated restart policy is used by the reaper on the next exit and
+is retained by manual `start`/`restart`. `--restart` may also be changed on an exited
+container. Resource limits return to their launch-time values after `restart`.
 
 `--group-add` replaces the inherited supplementary group list, whether the workload
 runs as root or another user. Names are resolved against the container's `/etc/group`

@@ -1446,9 +1446,12 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
             "zerun: warning: log rotation options only apply to detached containers; ignoring"
         );
     }
-    let restart_policy = a
-        .restart
-        .or_else(|| resume.as_ref().map(|st| st.restart_policy))
+    // A resumed container's persisted policy is authoritative: `update --restart`
+    // may have changed it after the canonical launch arguments were captured.
+    let restart_policy = resume
+        .as_ref()
+        .map(|st| st.restart_policy)
+        .or(a.restart)
         .unwrap_or_default();
     if a.restart.is_some() && !a.detach {
         eprintln!("zerun run: --restart requires -d/--detach");
@@ -5839,16 +5842,17 @@ fn human_duration(usec: u64) -> String {
 }
 
 /// `zerun update [opts] CONTAINER` — change cgroup v2 limits of a running
-/// container in place (memory, CPU, cpuset, pids, I/O, oom-group).
+/// container in place (memory, CPU, cpuset, pids, I/O, oom-group), or update
+/// its detached restart policy.
 ///
-/// The container must have been started with at least one resource flag so
-/// its cgroup exists; otherwise there is nothing to update and `restart`
-/// with the desired flags is the safe path. I/O updates merge with the
-/// kernel's current `io.max`, so only the named devices and directions
-/// change. `restart` still reverts to the launch-time limits captured in
-/// `launch_args`.
+/// Resource changes require a live cgroup; a restart-only update may also
+/// target an exited record. I/O updates merge with the kernel's current
+/// `io.max`, so only the named devices and directions change. `restart` still
+/// reverts resource limits to the launch-time values captured in
+/// `launch_args`; the persisted restart policy is authoritative on resume.
 fn cmd_update(args: &[String]) -> i32 {
     let mut limits = cgroup::ResourceLimits::default();
+    let mut restart_policy: Option<restart::RestartPolicy> = None;
     let mut targets: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -5862,7 +5866,7 @@ fn cmd_update(args: &[String]) -> i32 {
                      [--cpuset-mems LIST] [--pids|--pids-limit N|-1] \
                      [--device-read-bps DEV:BYTES] [--device-write-bps DEV:BYTES] \
                      [--device-read-iops DEV:COUNT] [--device-write-iops DEV:COUNT] \
-                     [--oom-group] CONTAINER"
+                     [--oom-group] [--restart POLICY] CONTAINER"
                 );
                 return 0;
             }
@@ -6050,6 +6054,30 @@ fn cmd_update(args: &[String]) -> i32 {
                 limits.oom_group = true;
                 i += 1;
             }
+            "--restart" => match next_value(args, &mut i, a) {
+                Ok(v) => match v.parse::<restart::RestartPolicy>() {
+                    Ok(policy) => restart_policy = Some(policy),
+                    Err(e) => {
+                        eprintln!("zerun update: {e}");
+                        return 2;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("zerun update: {e}");
+                    return 2;
+                }
+            },
+            other if other.starts_with("--restart=") => {
+                let value = &other["--restart=".len()..];
+                match value.parse::<restart::RestartPolicy>() {
+                    Ok(policy) => restart_policy = Some(policy),
+                    Err(e) => {
+                        eprintln!("zerun update: {e}");
+                        return 2;
+                    }
+                }
+                i += 1;
+            }
             other if other.starts_with('-') && other.len() > 1 => {
                 eprintln!("zerun update: unknown option {other}");
                 return 2;
@@ -6064,18 +6092,18 @@ fn cmd_update(args: &[String]) -> i32 {
         eprintln!("usage: zerun update [opts] CONTAINER");
         return 2;
     }
-    if limits.memory.is_none()
-        && limits.memory_reservation.is_none()
-        && limits.memory_swap.is_none()
-        && limits.cpus.is_none()
-        && limits.cpu_shares.is_none()
-        && limits.cpuset_cpus.is_none()
-        && limits.cpuset_mems.is_none()
-        && limits.pids.is_none()
-        && limits.io.is_empty()
-        && !limits.oom_group
-    {
-        eprintln!("zerun update: provide at least one limit to change");
+    let limits_requested = limits.memory.is_some()
+        || limits.memory_reservation.is_some()
+        || limits.memory_swap.is_some()
+        || limits.cpus.is_some()
+        || limits.cpu_shares.is_some()
+        || limits.cpuset_cpus.is_some()
+        || limits.cpuset_mems.is_some()
+        || limits.pids.is_some()
+        || !limits.io.is_empty()
+        || limits.oom_group;
+    if !limits_requested && restart_policy.is_none() {
+        eprintln!("zerun update: provide at least one limit or --restart policy to change");
         return 2;
     }
     let store = match Store::detect() {
@@ -6085,10 +6113,27 @@ fn cmd_update(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let mut st = match state::resolve(&store, targets[0]) {
+    let initial = match state::resolve(&store, targets[0]) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("zerun update: {e}");
+            return 1;
+        }
+    };
+    let _lock = match state::ContainerOperationLock::try_acquire(&store, &initial.id) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("zerun update: {e}");
+            return 1;
+        }
+    };
+    let mut st = match state::ContainerState::load(&store, &initial.id) {
+        Some(st) => st,
+        None => {
+            eprintln!(
+                "zerun update: container {} disappeared",
+                display_name(&initial)
+            );
             return 1;
         }
     };
@@ -6096,40 +6141,52 @@ fn cmd_update(args: &[String]) -> i32 {
         eprintln!("zerun update: {e}");
         return 1;
     }
-    if st.status != state::Status::Running || !st.pid_alive() {
+    let restart_only = restart_policy.is_some() && !limits_requested;
+    let restart_on_exited =
+        restart_only && st.status == state::Status::Exited && !st.restart_pending;
+    if !restart_on_exited && (st.status != state::Status::Running || !st.pid_alive()) {
         eprintln!(
-            "zerun update: container {} is not running",
+            "zerun update: container {} is not running (only --restart may be changed on an exited container)",
             display_name(&st)
         );
         return 1;
     }
-    let Some(cgroup_path) = st.cgroup.clone() else {
-        eprintln!(
-            "zerun update: container {} has no cgroup (started without resource limits); \
-             restart it with the desired flags instead",
-            display_name(&st)
-        );
-        return 1;
-    };
-    let cg = match cgroup::CgroupV2::open_for_container(&st.id, Path::new(&cgroup_path)) {
-        Ok(c) => c,
-        Err(e) => {
+    if limits_requested {
+        let Some(cgroup_path) = st.cgroup.clone() else {
+            eprintln!(
+                "zerun update: container {} has no cgroup (started without resource limits); \
+                 restart it with the desired flags instead",
+                display_name(&st)
+            );
+            return 1;
+        };
+        let cg = match cgroup::CgroupV2::open_for_container(&st.id, Path::new(&cgroup_path)) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("zerun update: {e}");
+                return 1;
+            }
+        };
+        // The parent zerun cgroup is required by the io controller check inside
+        // apply; recompute it from the cgroup v2 root.
+        let parent = match cgroup::detect_cgroup2_root() {
+            Ok(root) => root.join("zerun"),
+            Err(e) => {
+                eprintln!("zerun update: {e}");
+                return 1;
+            }
+        };
+        if let Err(e) = cg.apply_limits(&parent, &limits) {
             eprintln!("zerun update: {e}");
             return 1;
         }
-    };
-    // The parent zerun cgroup is required by the io controller check inside
-    // apply; recompute it from the cgroup v2 root.
-    let parent = match cgroup::detect_cgroup2_root() {
-        Ok(root) => root.join("zerun"),
-        Err(e) => {
-            eprintln!("zerun update: {e}");
+    }
+    if let Some(policy) = restart_policy {
+        st.restart_policy = policy;
+        if let Err(e) = st.save(&store) {
+            eprintln!("zerun update: persist restart policy: {e}");
             return 1;
         }
-    };
-    if let Err(e) = cg.apply_limits(&parent, &limits) {
-        eprintln!("zerun update: {e}");
-        return 1;
     }
     0
 }

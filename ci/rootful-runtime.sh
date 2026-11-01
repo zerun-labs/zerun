@@ -585,6 +585,45 @@ always_after=$(grep -c '^always-attempt$' <<<"$("${zerun[@]}" logs "$always_id")
 test "$always_after" -eq "$always_before"
 "${zerun[@]}" rm "$always_id" >/dev/null
 
+# `update --restart` changes the policy used by the live reaper on the next
+# exit. It remains authoritative for a later manual start even though the
+# canonical launch arguments still describe the policy used at creation.
+updated_policy_id=$(
+  "${zerun[@]}" run -d --restart=no --rootfs "$rootfs" \
+    --no-overlay --net none --init -- /bin/sh -c \
+    'printf "updated-policy\n"; sleep 2; exit 7'
+)
+cleanup_ids+=("$updated_policy_id")
+for attempt in $(seq 1 50); do
+  updated_policy_logs=$("${zerun[@]}" logs "$updated_policy_id" 2>/dev/null || true)
+  if grep -Fxq updated-policy <<<"$updated_policy_logs"; then
+    break
+  fi
+  if (( attempt == 50 )); then
+    echo "update-restart workload did not start" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+"${zerun[@]}" update --restart=on-failure:1 "$updated_policy_id" >/dev/null
+updated_policy_code=$("${zerun[@]}" wait "$updated_policy_id")
+test "$updated_policy_code" -eq 7
+updated_policy_logs=$("${zerun[@]}" logs "$updated_policy_id")
+test "$(grep -c '^updated-policy$' <<<"$updated_policy_logs" || true)" -eq 2
+grep -q '"restart_policy": "on-failure:1"' \
+  <<<"$("${zerun[@]}" inspect "$updated_policy_id")"
+"${zerun[@]}" update --restart no "$updated_policy_id" >/dev/null
+grep -q '"restart_policy": "no"' \
+  <<<"$("${zerun[@]}" inspect "$updated_policy_id")"
+"${zerun[@]}" start "$updated_policy_id" >/dev/null
+updated_policy_code=$("${zerun[@]}" wait "$updated_policy_id")
+test "$updated_policy_code" -eq 7
+updated_policy_logs=$("${zerun[@]}" logs "$updated_policy_id")
+test "$(grep -c '^updated-policy$' <<<"$updated_policy_logs" || true)" -eq 3
+grep -q '"restart_policy": "no"' \
+  <<<"$("${zerun[@]}" inspect "$updated_policy_id")"
+"${zerun[@]}" rm "$updated_policy_id" >/dev/null
+
 # A configured stop signal must reach the workload through mini-init. The
 # shell child traps SIGUSR1 and exits with a distinctive code, proving Zerun
 # did not silently substitute SIGTERM or leave the signal queued on PID 1.
