@@ -107,7 +107,7 @@ fn main() {
             println!("{}", version_string());
             0
         }
-        Some("doctor") => cmd_doctor(),
+        Some("doctor") => cmd_doctor(&args[2..]),
         Some("__init") => {
             // Internal re-exec entry: __init [--] <cmd...>
             let pos = args.iter().position(|a| a == "--");
@@ -3534,11 +3534,30 @@ fn cmd_generate_service(args: &[String]) -> i32 {
     }
 }
 
-fn cmd_doctor() -> i32 {
+fn print_doctor_usage() {
+    println!("usage: zerun doctor");
+    println!();
+    println!("Reports host capabilities used by Zerun. The command exits 1 when the");
+    println!("capabilities required for the current user's run mode are unavailable.");
+}
+
+fn cmd_doctor(args: &[String]) -> i32 {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_doctor_usage();
+        return 0;
+    }
+    if !args.is_empty() {
+        eprintln!("zerun doctor: no options or arguments are accepted");
+        print_doctor_usage();
+        return 2;
+    }
+
     println!("== Zerun environment doctor ==");
     if let Some(rel) = syscalls::kernel_release() {
         println!("kernel release : {rel}  (baseline recommendation >= 5.10 LTS)");
     }
+
+    let mut required_failure = false;
     let cgroup_available = match cgroup::detect_cgroup2_root() {
         Ok(root) => {
             let ctrl = std::fs::read_to_string(root.join("cgroup.controllers")).unwrap_or_default();
@@ -3554,6 +3573,7 @@ fn cmd_doctor() -> i32 {
             false
         }
     };
+
     let uid = syscalls::effective_uid();
     if uid == 0 {
         if cgroup_available {
@@ -3562,23 +3582,44 @@ fn cmd_doctor() -> i32 {
                     "device policy  : OK (mandatory cgroup v2 eBPF allowlist for rootful runs)"
                 ),
                 Err(e) => {
-                    println!("device policy  : UNAVAILABLE ({e}); rootful runs will be refused")
+                    println!("device policy  : UNAVAILABLE ({e}); rootful runs will be refused");
+                    required_failure = true;
                 }
             }
         } else {
             println!("device policy  : UNAVAILABLE (cgroup v2 is required); rootful runs will be refused");
+            required_failure = true;
         }
     } else {
         println!("device policy  : not required for rootless runs");
     }
-    match std::fs::read_to_string("/proc/sys/user/max_user_namespaces") {
-        Ok(v) => println!("user namespaces: max = {}", v.trim()),
-        Err(_) => println!("user namespaces: unknown"),
+
+    let user_namespaces_available =
+        match std::fs::read_to_string("/proc/sys/user/max_user_namespaces") {
+            Ok(value) => match value.trim().parse::<u64>() {
+                Ok(limit) => {
+                    println!("user namespaces: max = {limit}");
+                    limit > 0
+                }
+                Err(_) => {
+                    println!("user namespaces: INVALID ({})", value.trim());
+                    false
+                }
+            },
+            Err(error) => {
+                println!("user namespaces: UNAVAILABLE ({error})");
+                false
+            }
+        };
+    if uid != 0 && !user_namespaces_available {
+        println!("                 rootless runs require user namespaces");
+        required_failure = true;
     }
+
     match std::fs::read_to_string("/proc/filesystems") {
         Ok(fs) => println!(
             "overlayfs      : {}",
-            if fs.lines().any(|l| l.contains("overlay")) {
+            if fs.lines().any(|line| line.contains("overlay")) {
                 "available (used from M2)"
             } else {
                 "NOT available"
@@ -3587,6 +3628,7 @@ fn cmd_doctor() -> i32 {
         Err(_) => println!("overlayfs      : unknown"),
     }
     println!("cap_last_cap   : {}", syscalls::cap_last_cap());
+
     match Store::detect() {
         Ok(store) => {
             println!("data root      : {}", store.data_root().display());
@@ -3601,13 +3643,20 @@ fn cmd_doctor() -> i32 {
             println!("data root      : <error: {error}>");
             println!("runtime root   : <error>");
             println!("bridge IPAM    : unknown");
+            required_failure = true;
         }
     }
     println!(
         "uid            : {} (rootful isolation needs uid=0; non-root goes rootless via NEWUSER)",
         uid
     );
-    0
+    if required_failure {
+        println!("readiness      : FAIL (required host capabilities are unavailable)");
+        1
+    } else {
+        println!("readiness      : OK (this user can launch containers)");
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7004,6 +7053,12 @@ ENV:\n  \
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_rejects_arguments_with_a_usage_error() {
+        assert_eq!(cmd_doctor(&["--unknown".to_string()]), 2);
+        assert_eq!(cmd_doctor(&["--help".to_string()]), 0);
+    }
 
     #[test]
     fn version_string_uses_the_package_version() {

@@ -284,6 +284,13 @@ jobs:
           sudo chown -R "$ci_user:" "$rootfs" "$data" "$runtime" "$home"
           sudo chown "$ci_user:" "$binary"
 
+          doctor_output=$(sudo -u "$ci_user" env \
+            HOME="$home" \
+            ZERUN_DATA_ROOT="$data" \
+            ZERUN_RUNTIME_ROOT="$runtime" \
+            "$binary" doctor)
+          grep -F 'readiness      : OK' <<<"$doctor_output" >/dev/null
+
           # Direct exec keeps this smoke focused on rootless namespace and
           # pivot behavior; PID-1/mini-init semantics are covered by the
           # rootful lifecycle smoke tests.

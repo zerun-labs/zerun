@@ -64,6 +64,7 @@ trap cleanup EXIT
 # the same temporary-cgroup load/attach path that normal container startup uses.
 doctor_output=$("${zerun[@]}" doctor)
 grep -F 'device policy  : OK' <<<"$doctor_output" >/dev/null
+grep -F 'readiness      : OK' <<<"$doctor_output" >/dev/null
 
 # Pick a high, currently unused TCP port instead of assuming a shared runner
 # has 18080 available. The check is intentionally only a race-avoidance hint:

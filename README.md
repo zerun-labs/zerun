@@ -129,7 +129,10 @@ cargo build --release
 
 `doctor` also creates a short-lived empty cgroup and attaches the same device
 BPF policy used by rootful workloads, so it reports whether the mandatory
-device boundary is actually available on the host.
+device boundary is actually available on the host. It exits `1` when a
+capability required by the current run mode is unavailable (cgroup v2 plus the
+device policy for rootful runs, or user namespaces for rootless runs), and `2`
+for invalid command-line arguments.
 
 Static musl build (for minimal edge root filesystems):
 
