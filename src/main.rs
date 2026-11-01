@@ -101,6 +101,10 @@ fn main() {
         Some("load") => cmd_load(&args[2..]),
         Some("commit") => cmd_commit(&args[2..]),
         Some("generate-service") => cmd_generate_service(&args[2..]),
+        Some("version") | Some("-V") | Some("--version") => {
+            println!("{}", version_string());
+            0
+        }
         Some("doctor") => cmd_doctor(),
         Some("__init") => {
             // Internal re-exec entry: __init [--] <cmd...>
@@ -6724,6 +6728,10 @@ fn print_run_usage() {
     );
 }
 
+fn version_string() -> String {
+    format!("zerun {}", env!("CARGO_PKG_VERSION"))
+}
+
 fn print_help() {
     println!(
         "zerun — daemonless single-binary container runtime\n\
@@ -6774,7 +6782,8 @@ USAGE:\n  \
   zerun load -i FILE.tar                import images from an OCI archive\n  \
   zerun commit [-m MSG] CONTAINER IMAGE[:TAG]  save a container as an image\n  \
   zerun generate-service [opts] IMAGE    write a systemd unit to stdout\n  \
-  zerun doctor                           environment diagnostics\n\
+  zerun doctor                           environment diagnostics\n  \
+  zerun version                          print the runtime version\n\
 \n\
 RUN OPTIONS:\n  \
   --rootfs DIR    run from an unpacked rootfs dir instead of an image (legacy)\n  \
@@ -6842,6 +6851,15 @@ ENV:\n  \
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_string_uses_the_package_version() {
+        assert_eq!(
+            version_string(),
+            format!("zerun {}", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(!version_string().trim().is_empty());
+    }
 
     #[test]
     fn parses_images_options_and_rejects_unknown_flags() {
