@@ -207,7 +207,8 @@ Run options (current subset):
                      (Docker-compatible 2-262144 shares; 0 restores the default)
 --cpuset-cpus 0-3    pin CPUs (cgroups v2 cpuset.cpus)
 --cpuset-mems 0      pin memory nodes (cgroups v2 cpuset.mems)
---pids 256           cgroup v2 pids.max
+--pids 256           cgroup v2 pids.max; -1 disables the cap (Docker-compatible
+                     --pids-limit alias)
 --oom-group          kill the whole cgroup on OOM
 --device-read-bps DEV:RATE    cgroup v2 io.max (e.g. /dev/sda:10mb)
 --device-write-bps DEV:RATE   cgroup v2 io.max (e.g. 8:0:10mb)
@@ -234,7 +235,7 @@ Run options (current subset):
                      generate-service maps this to TimeoutStopSec)
 --restart POLICY     detached restart policy: no, on-failure[:MAX], always, or
                      unless-stopped (requires -d; incompatible with --rm)
---net bridge|none|host
+--net, --network bridge|none|host
                      bridge = rootful bridge networking on zerun0 (veth + eth0 in container;
                      rootful default); none = fresh netns with loopback only (rootless default);
                      host = share host net

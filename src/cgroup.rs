@@ -450,10 +450,13 @@ fn plan_limit_writes(
         writes.push(("cpuset.mems", parse_cpuset(mems)?));
     }
     if let Some(pids) = limits.pids {
-        if pids <= 0 {
-            return Err(crate::zerr!("pids limit must be positive"));
+        if pids == -1 {
+            writes.push(("pids.max", "max".to_string()));
+        } else if pids > 0 {
+            writes.push(("pids.max", pids.to_string()));
+        } else {
+            return Err(crate::zerr!("pids limit must be positive or -1"));
         }
-        writes.push(("pids.max", pids.to_string()));
     }
     if !limits.io.is_empty() {
         let current_io = current_io.ok_or_else(|| crate::zerr!("current io.max is unavailable"))?;
@@ -1074,6 +1077,35 @@ mod tests {
             plan_limit_writes(&limits, None, None).unwrap(),
             vec![("cpu.weight", "79".to_string())]
         );
+    }
+
+    #[test]
+    fn pids_limit_plan_supports_positive_and_unlimited_values() {
+        let limited = ResourceLimits {
+            pids: Some(128),
+            ..ResourceLimits::default()
+        };
+        assert_eq!(
+            plan_limit_writes(&limited, None, None).unwrap(),
+            vec![("pids.max", "128".to_string())]
+        );
+
+        let unlimited = ResourceLimits {
+            pids: Some(-1),
+            ..ResourceLimits::default()
+        };
+        assert_eq!(
+            plan_limit_writes(&unlimited, None, None).unwrap(),
+            vec![("pids.max", "max".to_string())]
+        );
+
+        for invalid in [0, -2] {
+            let limits = ResourceLimits {
+                pids: Some(invalid),
+                ..ResourceLimits::default()
+            };
+            assert!(plan_limit_writes(&limits, None, None).is_err());
+        }
     }
 
     #[test]

@@ -340,12 +340,9 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 let v = next_value(args, &mut i, "--cpuset-mems")?;
                 a.cpuset_mems = Some(cgroup::parse_cpuset(&v).map_err(|e| e.to_string())?);
             }
-            "--pids" => {
-                let v = next_value(args, &mut i, "--pids")?;
-                a.pids = Some(
-                    v.parse()
-                        .map_err(|_| format!("invalid --pids value '{v}'"))?,
-                );
+            "--pids" | "--pids-limit" => {
+                let v = next_value(args, &mut i, s)?;
+                a.pids = Some(parse_pids_limit(s, &v)?);
             }
             "--hostname" | "-h" => {
                 a.hostname = Some(next_value(args, &mut i, s)?);
@@ -377,17 +374,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 let v = next_value(args, &mut i, "--restart")?;
                 a.restart = Some(v.parse()?);
             }
-            "--net" => {
-                let v = next_value(args, &mut i, "--net")?;
+            "--net" | "--network" => {
+                let v = next_value(args, &mut i, s)?;
                 a.net_specified = true;
-                a.net = match v.as_str() {
-                    "bridge" => NetMode::Bridge,
-                    "host" => NetMode::Host,
-                    "none" => NetMode::None,
-                    other => {
-                        return Err(format!("invalid --net value '{other}' (bridge|host|none)"))
-                    }
-                };
+                a.net = parse_net_mode(s, &v)?;
             }
             "-i" | "--interactive" => {
                 a.interactive = true;
@@ -605,6 +595,28 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                     units::parse_size(value)
                         .map_err(|e| format!("invalid --shm-size '{value}': {e}"))?,
                 );
+                i += 1;
+            }
+            other if other.starts_with("--pids=") => {
+                let value = &other["--pids=".len()..];
+                a.pids = Some(parse_pids_limit("--pids", value)?);
+                i += 1;
+            }
+            other if other.starts_with("--pids-limit=") => {
+                let value = &other["--pids-limit=".len()..];
+                a.pids = Some(parse_pids_limit("--pids-limit", value)?);
+                i += 1;
+            }
+            other if other.starts_with("--net=") => {
+                let value = &other["--net=".len()..];
+                a.net_specified = true;
+                a.net = parse_net_mode("--net", value)?;
+                i += 1;
+            }
+            other if other.starts_with("--network=") => {
+                let value = &other["--network=".len()..];
+                a.net_specified = true;
+                a.net = parse_net_mode("--network", value)?;
                 i += 1;
             }
             other if other.starts_with("--cpu-shares=") => {
@@ -845,6 +857,23 @@ fn parse_seconds(value: &str, option: &str) -> Result<u64, String> {
     value
         .parse::<u64>()
         .map_err(|_| format!("{option}: invalid seconds value '{value}'"))
+}
+
+fn parse_pids_limit(option: &str, value: &str) -> Result<i64, String> {
+    value
+        .parse()
+        .map_err(|_| format!("invalid {option} value '{value}'"))
+}
+
+fn parse_net_mode(option: &str, value: &str) -> Result<NetMode, String> {
+    match value {
+        "bridge" => Ok(NetMode::Bridge),
+        "host" => Ok(NetMode::Host),
+        "none" => Ok(NetMode::None),
+        other => Err(format!(
+            "invalid {option} value '{other}' (bridge|host|none)"
+        )),
+    }
 }
 
 /// Docker-style networking defaults: rootful runs use the managed bridge;
@@ -5145,7 +5174,7 @@ fn cmd_update(args: &[String]) -> i32 {
                     "usage: zerun update [--memory SIZE] [--memory-reservation SIZE] \
                      [--memory-swap SIZE] [--cpus VALUE] [--cpu-shares SHARES] \
                      [--cpuset-cpus LIST] \
-                     [--cpuset-mems LIST] [--pids N] \
+                     [--cpuset-mems LIST] [--pids|--pids-limit N|-1] \
                      [--device-read-bps DEV:BYTES] [--device-write-bps DEV:BYTES] \
                      [--device-read-iops DEV:COUNT] [--device-write-iops DEV:COUNT] \
                      [--oom-group] CONTAINER"
@@ -5252,14 +5281,14 @@ fn cmd_update(args: &[String]) -> i32 {
                     return 2;
                 }
             },
-            "--pids" => match next_value(args, &mut i, a) {
+            "--pids" | "--pids-limit" => match next_value(args, &mut i, a) {
                 Ok(v) => match v.parse::<i64>() {
-                    Ok(p) if p > 0 => {
+                    Ok(p) if p == -1 || p > 0 => {
                         limits.pids = Some(p);
                         continue;
                     }
                     _ => {
-                        eprintln!("zerun update: --pids expects a positive integer, got '{v}'");
+                        eprintln!("zerun update: {a} expects a positive integer or -1, got '{v}'");
                         return 2;
                     }
                 },
@@ -7043,7 +7072,7 @@ RUN OPTIONS:\n  \
   --cpu-shares 512    relative CPU weight (Docker-compatible shares)\n  \
   --cpuset-cpus 0-3   pin CPUs (cgroups v2 cpuset.cpus)\n  \
   --cpuset-mems 0     pin memory nodes (cgroups v2 cpuset.mems)\n  \
-  --pids 256          cgroup v2 pids.max\n  \
+  --pids, --pids-limit N  cgroup v2 pids.max (-1 = unlimited)\n  \
   --oom-group         kill the whole cgroup on OOM (memory.oom.group)\n  \
   --device-read-bps DEV:BYTES    cgroup v2 io.max read rate (repeatable)\n  \
   --device-write-bps DEV:BYTES   cgroup v2 io.max write rate (repeatable)\n  \
@@ -7061,7 +7090,7 @@ RUN OPTIONS:\n  \
   --stop-signal SIGNAL     stop/restart signal (image StopSignal; default SIGTERM)\n  \
   --stop-timeout S         seconds before stop/restart sends SIGKILL (default 10)\n  \
   --restart POLICY        detached restart policy (no|on-failure[:max]|always|unless-stopped)\n  \
-  --net none|host|bridge\n  \
+  --net, --network none|host|bridge\n  \
                       none = fresh netns + loopback; host = share host net;\n  \
                       bridge = zerun0 bridge + NAT (needs CAP_NET_ADMIN;\n  \
                       rootful default; rootless default is none)\n  \
@@ -8398,6 +8427,45 @@ mod tests {
     fn rootful_defaults_to_bridge_and_rootless_to_none() {
         assert_eq!(default_net(0), NetMode::Bridge);
         assert_eq!(default_net(1000), NetMode::None);
+    }
+
+    #[test]
+    fn accepts_docker_network_and_pids_aliases() {
+        let args: Vec<String> = ["--network=host", "--pids-limit", "128", "alpine", "true"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let parsed = parse_run_args(&args).unwrap();
+        assert_eq!(parsed.net, NetMode::Host);
+        assert!(parsed.net_specified);
+        assert_eq!(parsed.pids, Some(128));
+
+        let args: Vec<String> = ["--net=none", "--pids=64", "alpine", "true"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let parsed = parse_run_args(&args).unwrap();
+        assert_eq!(parsed.net, NetMode::None);
+        assert_eq!(parsed.pids, Some(64));
+        let launch = detached_launch_args(&parsed, Path::new("/tmp/rootfs"));
+        assert!(launch.windows(2).any(|pair| pair == ["--net", "none"]));
+        assert!(launch.windows(2).any(|pair| pair == ["--pids", "64"]));
+
+        let args: Vec<String> = ["--network", "bridge", "--pids-limit=-1", "alpine", "true"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let parsed = parse_run_args(&args).unwrap();
+        assert_eq!(parsed.net, NetMode::Bridge);
+        assert_eq!(parsed.pids, Some(-1));
+
+        assert!(
+            parse_run_args(&["--network=container:web".to_string(), "alpine".to_string()])
+                .err()
+                .expect("container network mode must be rejected")
+                .contains("bridge|host|none")
+        );
+        assert!(parse_run_args(&["--pids-limit=all".to_string(), "alpine".to_string()]).is_err());
     }
 
     #[test]
