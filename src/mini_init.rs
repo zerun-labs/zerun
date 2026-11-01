@@ -82,10 +82,13 @@ fn run_impl(
             crate::syscalls::reset_signal_handler(signal)?;
         }
         if let Err(error) = exec_business(business, env, hostname, id) {
-            if let Some(fd) = error_w {
-                let message = format!("{error}");
-                let _ = crate::syscalls::write_all_fd(fd, message.as_bytes());
-                crate::syscalls::close(fd);
+            match error_w {
+                Some(fd) => {
+                    let message = format!("{error}");
+                    let _ = crate::syscalls::write_all_fd(fd, message.as_bytes());
+                    crate::syscalls::close(fd);
+                }
+                None => eprintln!("zerun-init: {error}"),
             }
             crate::syscalls::exit_process(1);
         }
