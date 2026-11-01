@@ -222,7 +222,7 @@ Run options (current subset):
                      rootful default); none = fresh netns with loopback only (rootless default);
                      host = share host net
 -i, --interactive   keep stdin attached (foreground runs; without it stdin is /dev/null)
--t, --tty           allocate a PTY (foreground runs; often combined as -it)
+-t, --tty           allocate a PTY for foreground or detached output (e.g. -dt)
 -p, --publish [ADDR:]HOST[:CONTAINER][/proto]
                      publish a TCP (default) or UDP port; ADDR supports IPv4 and
                      bracketed IPv6 bind addresses (for example 127.0.0.1 or [::1])
@@ -382,6 +382,11 @@ sudo target/release/zerun system df                   # image and container disk
 Detached containers keep no daemon: the per-container reaper is a tiny process that
 disappears when the container exits. If the host crashes (or the reaper is killed), the
 next `ps`/`rm` reconciles the stale record and reclaims host-side resources.
+
+`-dt` allocates a PTY for a detached workload, so terminal-aware services retain
+line-buffered output and `TERM` defaults. `logs` and `attach` receive the PTY stream;
+detached stdin is not connected, so `-i` remains a foreground-only option. The TTY choice
+is part of the saved launch arguments and survives `start`/`restart`.
 
 `--restart=on-failure[:MAX]` retries non-zero exits (an omitted or zero maximum is
 unlimited), `always` retries every exit, and `unless-stopped` retries every exit until a

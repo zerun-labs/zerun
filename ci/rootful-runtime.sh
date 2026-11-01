@@ -349,14 +349,15 @@ fi
 
 # Restart must stop and resume the same detached record rather than creating a
 # replacement container. Verify that the workload ran once before and once
-# after the restart while retaining the same id and log history.
-restart_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
+# after the restart while retaining the same id, log history, PTY semantics,
+# and resource limits.
+restart_id=$("${zerun[@]}" run -dt --rootfs "$rootfs" --no-overlay --net none \
   --ulimit nofile=64:96 --init -- /bin/sh -c \
-  'printf "restart-ok nofile=%s:%s\\n" "$(ulimit -Sn)" "$(ulimit -Hn)"; sleep 30')
+  'if [ -t 0 ] && [ -t 1 ] && [ -t 2 ]; then tty=yes; else tty=no; fi; printf "restart-ok nofile=%s:%s tty=%s\\n" "$(ulimit -Sn)" "$(ulimit -Hn)" "$tty"; sleep 30')
 cleanup_ids+=("$restart_id")
 for attempt in $(seq 1 50); do
   restart_logs=$("${zerun[@]}" logs "$restart_id" 2>/dev/null || true)
-  if (( $(grep -c 'restart-ok nofile=64:96' <<<"$restart_logs" || true) >= 1 )); then
+  if (( $(grep -c 'restart-ok nofile=64:96 tty=yes' <<<"$restart_logs" || true) >= 1 )); then
     break
   fi
   if (( attempt == 50 )); then
@@ -368,7 +369,7 @@ done
 "${zerun[@]}" restart --time 1 "$restart_id" >/dev/null
 for attempt in $(seq 1 50); do
   restart_logs=$("${zerun[@]}" logs "$restart_id" 2>/dev/null || true)
-  if (( $(grep -c 'restart-ok nofile=64:96' <<<"$restart_logs" || true) >= 2 )); then
+  if (( $(grep -c 'restart-ok nofile=64:96 tty=yes' <<<"$restart_logs" || true) >= 2 )); then
     break
   fi
   if (( attempt == 50 )); then

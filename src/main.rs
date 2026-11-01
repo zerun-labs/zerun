@@ -199,7 +199,7 @@ struct RunArgs {
     argv: Vec<String>,
     /// `-i/--interactive`: keep stdin attached (foreground runs).
     interactive: bool,
-    /// `-t/--tty`: allocate a PTY for the container (foreground runs).
+    /// `-t/--tty`: allocate a PTY for foreground or detached output.
     tty: bool,
     /// `-d/--detach`: fork a reaper and return after the container starts.
     detach: bool,
@@ -241,6 +241,30 @@ impl PullPolicy {
     }
 }
 
+/// Parse a combined short `run` flag such as `-dt` or `-dit`.
+///
+/// Docker commonly combines detach, stdin, and TTY selection in one token.
+/// Only those three short flags are accepted here; every other short flag
+/// keeps its ordinary single-token parsing path.
+fn parse_combined_run_flags(value: &str) -> Option<(bool, bool, bool)> {
+    let flags = value.strip_prefix('-')?;
+    if flags.starts_with('-') || flags.chars().count() < 2 {
+        return None;
+    }
+    let mut detach = false;
+    let mut interactive = false;
+    let mut tty = false;
+    for flag in flags.chars() {
+        match flag {
+            'd' => detach = true,
+            'i' => interactive = true,
+            't' => tty = true,
+            _ => return None,
+        }
+    }
+    Some((detach, interactive, tty))
+}
+
 /// Parse `run` arguments. Two invocation styles:
 ///   legacy:  run --rootfs DIR [opts] [--] CMD [ARGS...]  (first positional = CMD)
 ///   image:   run [opts] IMAGE [CMD [ARGS...]]            (first positional = IMAGE)
@@ -249,6 +273,13 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut i = 0;
     while i < args.len() {
         let s = &args[i];
+        if let Some((detach, interactive, tty)) = parse_combined_run_flags(s) {
+            a.detach |= detach;
+            a.interactive |= interactive;
+            a.tty |= tty;
+            i += 1;
+            continue;
+        }
         match s.as_str() {
             "--rootfs" => {
                 a.rootfs = Some(next_value(args, &mut i, "--rootfs")?);
@@ -814,12 +845,11 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         eprintln!("zerun run: -p/--publish requires --net bridge");
         return 2;
     }
-    if a.tty && a.detach {
-        eprintln!("zerun run: -t/--tty cannot be used with -d/--detach yet");
-        return 2;
-    }
     if a.interactive && a.detach {
-        eprintln!("zerun: warning: -i has no effect with -d (detached stdin is /dev/null)");
+        eprintln!(
+            "zerun: warning: -i has no effect with -d (detached stdin is not connected; \
+             -t still allocates a terminal for the workload)"
+        );
     }
     if !a.dns.is_empty() && a.net != NetMode::Bridge {
         eprintln!("zerun: warning: --dns only applies to --net bridge; ignoring");
@@ -1284,7 +1314,10 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         ulimits,
         group_add,
         tty: a.tty,
-        interactive: a.interactive,
+        // A detached reaper has no caller stdin to pump. Keep the PTY itself
+        // (so the workload sees a terminal) but never poll the collector's
+        // /dev/null stdin as an interactive session.
+        interactive: a.interactive && !a.detach,
         overlay,
         id,
         stop_signal,
@@ -1903,6 +1936,9 @@ fn run_detached(
 /// directory or shell aliases have changed.
 fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     let mut args = vec!["-d".to_string()];
+    if a.tty {
+        args.push("--tty".to_string());
+    }
     if let Some(name) = &a.name {
         args.extend(["--name".to_string(), name.clone()]);
     }
@@ -6772,7 +6808,7 @@ RUN OPTIONS:\n  \
                       bridge = zerun0 bridge + NAT (needs CAP_NET_ADMIN;\n  \
                       rootful default; rootless default is none)\n  \
   -i, --interactive      keep stdin attached (foreground runs)\n  \
-  -t, --tty              allocate a PTY (foreground runs; combine with -i)\n  \
+  -t, --tty              allocate a PTY for foreground or detached output\n  \
   -p, --publish [ADDR:]HOST[:CONTAINER][/proto]\n  \
                                       publish a TCP/UDP port (requires --net bridge)\n  \
   -v, --volume HOST|NAME:CONTAINER[:ro]
@@ -7733,6 +7769,26 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let a = parse_run_args(&args).expect("long flags");
+        assert!(a.interactive);
+        assert!(a.tty);
+
+        let args: Vec<_> = ["-dt", "alpine", "echo"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let a = parse_run_args(&args).expect("detached tty flags");
+        assert!(a.detach);
+        assert!(a.tty);
+        assert!(!a.interactive);
+        let launch = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+        assert!(launch.iter().any(|arg| arg == "--tty"));
+
+        let args: Vec<_> = ["-dit", "alpine", "echo"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let a = parse_run_args(&args).expect("combined detached flags");
+        assert!(a.detach);
         assert!(a.interactive);
         assert!(a.tty);
     }
