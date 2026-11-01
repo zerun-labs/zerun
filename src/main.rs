@@ -208,6 +208,10 @@ struct RunArgs {
     env: Vec<String>,
     /// `--env-file FILE`: ordered image-mode environment files.
     env_files: Vec<String>,
+    /// Ports declared with `--expose` and inherited from an image.
+    exposed_ports: BTreeSet<network::ExposedPort>,
+    /// `-P`/`--publish-all`: map every exposed port to a random host port.
+    publish_all: bool,
     ports: Vec<network::PublishedPort>,
     volumes: Vec<mounts::BindMount>,
     /// `--device HOST[:CONTAINER[:rwm]]` explicit device passthrough.
@@ -267,12 +271,11 @@ impl PullPolicy {
     }
 }
 
-/// Parse a combined short `run` flag such as `-dt` or `-dit`.
+/// Parse a combined short `run` flag such as `-dt`, `-dit`, or `-dP`.
 ///
-/// Docker commonly combines detach, stdin, and TTY selection in one token.
-/// Only those three short flags are accepted here; every other short flag
-/// keeps its ordinary single-token parsing path.
-fn parse_combined_run_flags(value: &str) -> Option<(bool, bool, bool)> {
+/// Docker commonly combines boolean run flags in one token. Every other short
+/// flag keeps its ordinary single-token parsing path.
+fn parse_combined_run_flags(value: &str) -> Option<(bool, bool, bool, bool)> {
     let flags = value.strip_prefix('-')?;
     if flags.starts_with('-') || flags.chars().count() < 2 {
         return None;
@@ -280,15 +283,17 @@ fn parse_combined_run_flags(value: &str) -> Option<(bool, bool, bool)> {
     let mut detach = false;
     let mut interactive = false;
     let mut tty = false;
+    let mut publish_all = false;
     for flag in flags.chars() {
         match flag {
             'd' => detach = true,
             'i' => interactive = true,
             't' => tty = true,
+            'P' => publish_all = true,
             _ => return None,
         }
     }
-    Some((detach, interactive, tty))
+    Some((detach, interactive, tty, publish_all))
 }
 
 /// Parse `run` arguments. Two invocation styles:
@@ -299,10 +304,11 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut i = 0;
     while i < args.len() {
         let s = &args[i];
-        if let Some((detach, interactive, tty)) = parse_combined_run_flags(s) {
+        if let Some((detach, interactive, tty, publish_all)) = parse_combined_run_flags(s) {
             a.detach |= detach;
             a.interactive |= interactive;
             a.tty |= tty;
+            a.publish_all |= publish_all;
             i += 1;
             continue;
         }
@@ -530,6 +536,16 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 let v = next_value(args, &mut i, s)?;
                 a.ports.push(parse_publish(&v)?);
             }
+            "--expose" => {
+                let value = next_value(args, &mut i, "--expose")?;
+                a.exposed_ports.extend(
+                    network::parse_expose_list(&value).map_err(|e| format!("--expose: {e}"))?,
+                );
+            }
+            "--publish-all" | "-P" => {
+                a.publish_all = true;
+                i += 1;
+            }
             "--device-read-bps" => {
                 let v = next_value(args, &mut i, s)?;
                 a.device_read_bps.push(
@@ -701,6 +717,13 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                     return Err("--cidfile path cannot be empty".to_string());
                 }
                 a.cidfile = Some(path.to_string());
+                i += 1;
+            }
+            other if other.starts_with("--expose=") => {
+                let value = &other["--expose=".len()..];
+                a.exposed_ports.extend(
+                    network::parse_expose_list(value).map_err(|e| format!("--expose: {e}"))?,
+                );
                 i += 1;
             }
             other if other.starts_with("--mount=") => {
@@ -1306,8 +1329,8 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         eprintln!("zerun run: --tmpfs-upper requires the writable overlay; remove --no-overlay");
         return 2;
     }
-    if !a.ports.is_empty() && a.net != NetMode::Bridge {
-        eprintln!("zerun run: -p/--publish requires --net bridge");
+    if (a.publish_all || !a.ports.is_empty()) && a.net != NetMode::Bridge {
+        eprintln!("zerun run: -p/--publish and -P/--publish-all require --net bridge");
         return 2;
     }
     if a.interactive && a.detach {
@@ -1660,6 +1683,13 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
                         return 1;
                     }
                 };
+                match image_exposed_ports(&cfg) {
+                    Ok(ports) => a.exposed_ports.extend(ports),
+                    Err(error) => {
+                        eprintln!("zerun run: {error}");
+                        return 1;
+                    }
+                }
                 image_volume_targets = cfg.config.volumes.keys().cloned().collect();
                 let env = match build_image_env(
                     &cfg.config.env,
@@ -1740,6 +1770,13 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
             }
         }
     };
+
+    if a.publish_all {
+        if let Err(error) = network::publish_exposed_ports(&mut a.ports, &a.exposed_ports) {
+            eprintln!("zerun run: {error}");
+            return 1;
+        }
+    }
 
     let mut anonymous_volume_guard = None;
     if resume.is_none() && !image_volume_targets.is_empty() {
@@ -3390,6 +3427,22 @@ fn resolve_stop_signal(explicit: Option<i32>, image: &str) -> Result<i32, String
         return Ok(signal::DEFAULT_STOP_SIGNAL);
     }
     signal::parse(image).map_err(|e| format!("image config StopSignal: {e}"))
+}
+
+/// Parse image `config.ExposedPorts` keys into the same normalized set used
+/// by `--expose`. Docker records these as `PORT/PROTOCOL` keys, but accepting
+/// the bare-port form keeps hand-built OCI configs compatible.
+fn image_exposed_ports(
+    cfg: &image::config::ImageConfig,
+) -> Result<BTreeSet<network::ExposedPort>, String> {
+    let mut ports = BTreeSet::new();
+    for key in cfg.config.exposed_ports.keys() {
+        let parsed = network::parse_expose(key).map_err(|error| {
+            format!("image config ExposedPorts contains invalid key '{key}': {error}")
+        })?;
+        ports.extend(parsed);
+    }
+    Ok(ports)
 }
 
 /// Combine image Entrypoint/Cmd with CLI arguments (docker semantics):
@@ -7615,6 +7668,8 @@ RUN OPTIONS:\n  \
   -t, --tty              allocate a PTY for foreground or detached output\n  \
   -p, --publish [ADDR:]HOST[:CONTAINER][/proto]\n  \
                                       publish a TCP/UDP port (requires --net bridge)\n  \
+  --expose PORT[-PORT][/proto]       expose container ports without publishing them\n  \
+  -P, --publish-all                 publish every image/--expose port to a random host port\n  \
   -v, --volume HOST|NAME:CONTAINER[:ro]\n  \
                                         bind-mount a host path or managed named volume\n  \
   --mount type=bind|volume|tmpfs,src=SOURCE,dst=TARGET[,readonly]\n  \
@@ -8752,6 +8807,54 @@ mod tests {
             ]
         );
         assert!(parse_publish("/udp").is_err());
+    }
+
+    #[test]
+    fn parses_expose_and_publish_all() {
+        let args: Vec<_> = [
+            "--expose",
+            "80,53/udp",
+            "--expose=8000-8001",
+            "-dP",
+            "alpine",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_run_args(&args).expect("expose flags");
+        assert!(a.detach);
+        assert!(a.publish_all);
+        assert_eq!(
+            a.exposed_ports,
+            network::parse_expose_list("80,53/udp,8000-8001")
+                .unwrap()
+                .into_iter()
+                .collect()
+        );
+        assert!(parse_run_args(&["--expose".into(), "0".into(), "alpine".into()]).is_err());
+        assert!(parse_run_args(&["--expose=".into(), "alpine".into()]).is_err());
+    }
+
+    #[test]
+    fn parses_image_exposed_ports_and_rejects_bad_keys() {
+        let cfg = image::config::ImageConfig::parse(
+            br#"{"config":{"ExposedPorts":{"80/tcp":{},"53/udp":{},"8000-8001/tcp":{}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            image_exposed_ports(&cfg).unwrap(),
+            network::parse_expose_list("80,53/udp,8000-8001")
+                .unwrap()
+                .into_iter()
+                .collect()
+        );
+
+        let bad =
+            image::config::ImageConfig::parse(br#"{"config":{"ExposedPorts":{"http/tcp":{}}}}"#)
+                .unwrap();
+        let error = image_exposed_ports(&bad).unwrap_err();
+        assert!(error.contains("ExposedPorts"));
+        assert!(error.contains("http/tcp"));
     }
 
     #[test]

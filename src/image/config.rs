@@ -42,6 +42,9 @@ pub struct ConfigSection {
     /// values are intentionally opaque; only the container paths matter here.
     #[serde(default, rename = "Volumes")]
     pub volumes: BTreeMap<String, serde_json::Value>,
+    /// Ports declared by `EXPOSE`, keyed as `PORT[/tcp|udp]`.
+    #[serde(default, rename = "ExposedPorts")]
+    pub exposed_ports: BTreeMap<String, serde_json::Value>,
     /// Docker's healthcheck extension. OCI itself does not define this field,
     /// but Docker-compatible image configs carry it under `config.Healthcheck`.
     #[serde(default, rename = "Healthcheck")]
@@ -80,6 +83,7 @@ mod tests {
                     "Cmd": ["/bin/sh"],
                     "Labels": {"org.opencontainers.image.title": "nginx"},
                     "Volumes": {"/var/lib/app": {}, "/cache": {}},
+                    "ExposedPorts": {"80/tcp": {}, "443/tcp": {}},
                     "Healthcheck": {
                         "Test": ["CMD-SHELL", "wget -qO- http://127.0.0.1/"],
                         "Interval": 5000000000,
@@ -124,6 +128,14 @@ mod tests {
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
             vec!["/cache", "/var/lib/app"]
+        );
+        assert_eq!(
+            cfg.config
+                .exposed_ports
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["443/tcp", "80/tcp"]
         );
         assert_eq!(cfg.rootfs.diff_ids.len(), 1);
     }

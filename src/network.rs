@@ -40,6 +40,7 @@ use crate::netlink::Netlink;
 use crate::nfnetlink::{NatConfig, Nftables};
 use crate::trace;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::path::Path;
@@ -50,7 +51,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// Transport protocol for a published port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PortProtocol {
     Tcp,
     Udp,
@@ -64,6 +65,148 @@ impl PortProtocol {
             PortProtocol::Udp => "udp",
         }
     }
+}
+
+/// One container port declared with `EXPOSE` or `--expose`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExposedPort {
+    pub port: u16,
+    pub protocol: PortProtocol,
+}
+
+impl fmt::Display for ExposedPort {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.port, self.protocol.label())
+    }
+}
+
+/// Parse a comma-separated `--expose` value, including inclusive port ranges.
+pub fn parse_expose_list(raw: &str) -> Result<Vec<ExposedPort>, String> {
+    let mut ports = Vec::new();
+    for value in raw.split(',') {
+        ports.extend(parse_expose(value)?);
+    }
+    Ok(ports)
+}
+
+/// Parse one exposed port or inclusive range (`80`, `8000-8002/udp`).
+pub fn parse_expose(raw: &str) -> Result<Vec<ExposedPort>, String> {
+    let (spec, protocol) = match raw.split_once('/') {
+        Some((spec, "tcp")) => (spec, PortProtocol::Tcp),
+        Some((spec, "udp")) => (spec, PortProtocol::Udp),
+        Some((_, protocol)) => {
+            return Err(format!(
+                "invalid exposed port '{raw}': protocol must be tcp or udp, not '{protocol}'"
+            ))
+        }
+        None => (raw, PortProtocol::Tcp),
+    };
+    let parse_port = |value: &str| -> Result<u16, String> {
+        value
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| format!("invalid exposed port '{raw}' (expected 1-65535)"))
+    };
+    let (start, end) = match spec.split_once('-') {
+        Some((start, end)) => (parse_port(start)?, parse_port(end)?),
+        None => {
+            let port = parse_port(spec)?;
+            (port, port)
+        }
+    };
+    if start > end {
+        return Err(format!(
+            "invalid exposed port range '{raw}': start must not exceed end"
+        ));
+    }
+    Ok((start..=end)
+        .map(|port| ExposedPort { port, protocol })
+        .collect())
+}
+
+/// Publish every exposed container port not already mapped explicitly. Host
+/// ports are chosen by the kernel from the ephemeral range; the probe sockets
+/// stay open until all choices are made and are then released for the run's
+/// userspace proxies to bind.
+pub fn publish_exposed_ports(
+    published: &mut Vec<PublishedPort>,
+    exposed: &BTreeSet<ExposedPort>,
+) -> ZResult<()> {
+    // The sockets are held only until every ephemeral port has been selected;
+    // dropping them releases the reservations for bind_port_proxies.
+    #[allow(dead_code)]
+    enum Reservation {
+        Tcp(TcpListener),
+        Udp(UdpSocket),
+    }
+
+    let mapped: BTreeSet<(u16, PortProtocol)> = published
+        .iter()
+        .map(|port| (port.container, port.protocol))
+        .collect();
+    let pending: Vec<_> = exposed
+        .iter()
+        .copied()
+        .filter(|port| !mapped.contains(&(port.port, port.protocol)))
+        .collect();
+    // Explicit mappings are not bound yet, so the kernel cannot see them when
+    // choosing ephemeral ports. Reserve their protocol/host-port pairs here to
+    // avoid selecting a random port that bind_port_proxies would later reject.
+    let mut reserved_hosts: BTreeSet<(u16, PortProtocol)> = published
+        .iter()
+        .map(|port| (port.host, port.protocol))
+        .collect();
+    let mut reservations = Vec::with_capacity(pending.len());
+    let mut chosen = Vec::with_capacity(pending.len());
+    for exposed in pending {
+        loop {
+            let (host, reservation) = match exposed.protocol {
+                PortProtocol::Tcp => {
+                    let listener =
+                        TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).map_err(|error| {
+                            crate::zerr!(
+                                "cannot allocate a host port for exposed {}/tcp: {error}",
+                                exposed.port
+                            )
+                        })?;
+                    let port = listener
+                        .local_addr()
+                        .map_err(|error| crate::zerr!("read reserved TCP port: {error}"))?
+                        .port();
+                    (port, Reservation::Tcp(listener))
+                }
+                PortProtocol::Udp => {
+                    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).map_err(|error| {
+                        crate::zerr!(
+                            "cannot allocate a host port for exposed {}/udp: {error}",
+                            exposed.port
+                        )
+                    })?;
+                    let port = socket
+                        .local_addr()
+                        .map_err(|error| crate::zerr!("read reserved UDP port: {error}"))?
+                        .port();
+                    (port, Reservation::Udp(socket))
+                }
+            };
+            if !reserved_hosts.insert((host, exposed.protocol)) {
+                drop(reservation);
+                continue;
+            }
+            reservations.push(reservation);
+            chosen.push((host, exposed));
+            break;
+        }
+    }
+    drop(reservations);
+    published.extend(chosen.into_iter().map(|(host, exposed)| PublishedPort {
+        host_ip: Ipv4Addr::UNSPECIFIED.into(),
+        host,
+        container: exposed.port,
+        protocol: exposed.protocol,
+    }));
+    Ok(())
 }
 
 /// One port publish: host port -> container port.
@@ -994,6 +1137,59 @@ mod tests {
         ] {
             assert!(HostAlias::parse(invalid).is_err(), "{invalid} was accepted");
         }
+    }
+
+    #[test]
+    fn exposed_ports_expand_ranges_and_validate_protocols() {
+        assert_eq!(
+            parse_expose_list("80,443/tcp,53/udp").unwrap(),
+            vec![
+                ExposedPort {
+                    port: 80,
+                    protocol: PortProtocol::Tcp,
+                },
+                ExposedPort {
+                    port: 443,
+                    protocol: PortProtocol::Tcp,
+                },
+                ExposedPort {
+                    port: 53,
+                    protocol: PortProtocol::Udp,
+                },
+            ]
+        );
+        assert_eq!(parse_expose("8000-8002/udp").unwrap().len(), 3);
+        for invalid in ["", "0", "80/sctp", "80/tcp/udp", "8002-8000", "80-", "-80"] {
+            assert!(parse_expose(invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn publish_all_skips_explicit_container_ports() {
+        let mut published = vec![PublishedPort {
+            host_ip: Ipv4Addr::LOCALHOST.into(),
+            host: 8080,
+            container: 80,
+            protocol: PortProtocol::Tcp,
+        }];
+        let exposed: BTreeSet<_> = parse_expose_list("80,81,53/udp")
+            .unwrap()
+            .into_iter()
+            .collect();
+        publish_exposed_ports(&mut published, &exposed).unwrap();
+        assert_eq!(published.len(), 3);
+        assert_eq!(
+            published.iter().filter(|port| port.container == 80).count(),
+            1
+        );
+        assert!(published.iter().skip(1).all(|port| port.host != 0));
+
+        let mut tcp_hosts = published
+            .iter()
+            .filter(|port| port.protocol == PortProtocol::Tcp)
+            .map(|port| port.host);
+        let first = tcp_hosts.next().unwrap();
+        assert!(tcp_hosts.all(|host| host != first));
     }
 
     #[test]

@@ -220,6 +220,13 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--publish".into());
         run_args.push(format!("{}:{}", p.host, p.container));
     }
+    for p in &a.exposed_ports {
+        run_args.push("--expose".into());
+        run_args.push(p.to_string());
+    }
+    if a.publish_all {
+        run_args.push("--publish-all".into());
+    }
     for v in &a.dns {
         run_args.push("--dns".into());
         run_args.push(v.clone());
@@ -385,8 +392,8 @@ fn validate(a: &RunArgs, rootful: bool) -> Result<(), String> {
     } else {
         NetMode::None
     };
-    if !a.ports.is_empty() && effective_net != NetMode::Bridge {
-        return Err("-p/--publish requires --net bridge".into());
+    if (a.publish_all || !a.ports.is_empty()) && effective_net != NetMode::Bridge {
+        return Err("-p/--publish and -P/--publish-all require --net bridge".into());
     }
     if (!a.dns.is_empty() || !a.dns_search.is_empty() || !a.dns_options.is_empty())
         && effective_net != NetMode::Bridge
@@ -574,6 +581,19 @@ mod tests {
         let unit = render(Path::new("/usr/local/bin/zerun"), &a, false).unwrap();
         assert!(unit.contains("--net none"));
         assert!(unit.contains("--pids -1"));
+    }
+
+    #[test]
+    fn renders_expose_and_publish_all() {
+        let a = args(&["--expose", "53/udp,8080", "-P", "alpine", "true"]);
+        let unit = render(Path::new("/usr/local/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains("--expose 53/udp"));
+        assert!(unit.contains("--expose 8080/tcp"));
+        assert!(unit.contains("--publish-all"));
+
+        let isolated = args(&["--net", "none", "-P", "alpine", "true"]);
+        let error = render(Path::new("/usr/local/bin/zerun"), &isolated, true).unwrap_err();
+        assert!(error.contains("require --net bridge"));
     }
 
     #[test]
