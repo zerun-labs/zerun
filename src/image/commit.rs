@@ -37,6 +37,8 @@ pub struct CommitOptions {
     pub user: Option<String>,
     /// Container labels written to the committed image config.
     pub labels: BTreeMap<String, String>,
+    /// Image-declared volume paths retained as `Config.Volumes`.
+    pub volumes: Vec<String>,
     pub comment: Option<String>,
     pub author: Option<String>,
 }
@@ -140,9 +142,9 @@ fn commit_image_in_transaction(
         .ok_or_else(|| crate::zerr!("committed image vanished before it could be reported"))
 }
 
-/// Rebuild an exited overlay container's filesystem from its base rootfs and
-/// upper layer. Once the container's mount namespace exits, the kernel unmounts
-/// the merged view and leaves an empty mount-point directory behind.
+/// Rebuild an overlay container's filesystem from its base rootfs and upper
+/// layer. The host-side upper is authoritative for both running and stopped
+/// containers; a live merged view exists only in the container's namespace.
 pub fn rebuild_rootfs(base_rootfs: &Path, upper: &Path, staging: &Path) -> ZResult<PathBuf> {
     fsutil::remove_dir_all_quiet(staging);
     let result = fsutil::copy_dir_all(base_rootfs, staging)
@@ -335,6 +337,14 @@ fn build_config_json(options: &CommitOptions, diff_id: &str) -> serde_json::Valu
     if !options.labels.is_empty() {
         config["config"]["Labels"] = serde_json::json!(options.labels);
     }
+    if !options.volumes.is_empty() {
+        let volumes: BTreeMap<&str, serde_json::Value> = options
+            .volumes
+            .iter()
+            .map(|path| (path.as_str(), serde_json::json!({})))
+            .collect();
+        config["config"]["Volumes"] = serde_json::json!(volumes);
+    }
     if let Some(comment) = &options.comment {
         config["history"][0]["comment"] = serde_json::Value::String(comment.clone());
     }
@@ -417,6 +427,7 @@ mod tests {
             working_dir: "/".to_string(),
             user: Some("1000:1000".to_string()),
             labels: BTreeMap::from([("tier".to_string(), "prod".to_string())]),
+            volumes: vec!["/var/lib/app".to_string()],
             comment: Some("test snapshot".to_string()),
             author: Some("TheSkyC <0x4fe6@gmail.com>".to_string()),
         };
@@ -437,6 +448,7 @@ mod tests {
         assert_eq!(config["config"]["Cmd"][0], "/bin/committed-marker");
         assert_eq!(config["config"]["User"], "1000:1000");
         assert_eq!(config["config"]["Labels"]["tier"], "prod");
+        assert!(config["config"]["Volumes"]["/var/lib/app"].is_object());
         assert_eq!(config["author"], "TheSkyC <0x4fe6@gmail.com>");
         assert_eq!(config["history"][0]["comment"], "test snapshot");
 

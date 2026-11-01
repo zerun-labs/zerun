@@ -299,6 +299,8 @@ mod tests {
             capabilities: None,
             seccomp: None,
             ulimits: None,
+            anonymous_volumes: Vec::new(),
+            image_volumes: Vec::new(),
             labels: BTreeMap::new(),
             log: String::new(),
             log_max_size: None,

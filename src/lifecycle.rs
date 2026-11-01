@@ -299,6 +299,9 @@ pub fn run_detached(
     // socket, then EOF.
     captured_log.release_attach(code);
     if remove_state {
+        if let Some(st) = ContainerState::load(&store, &id) {
+            crate::remove_anonymous_volumes(&store, &st.id, &st.anonymous_volumes);
+        }
         let dir = state::ContainerState::dir(&store, &id);
         fsutil::remove_dir_all_quiet(&dir);
     }
@@ -1129,6 +1132,8 @@ mod attach_tests {
             capabilities: None,
             seccomp: Some(crate::seccomp::SeccompMode::Unconfined),
             ulimits: None,
+            anonymous_volumes: Vec::new(),
+            image_volumes: Vec::new(),
             log: String::new(),
             log_max_size: None,
             log_max_file: None,

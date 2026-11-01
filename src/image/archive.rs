@@ -599,6 +599,7 @@ mod tests {
                 working_dir: "/".to_string(),
                 user: None,
                 labels: BTreeMap::new(),
+                volumes: Vec::new(),
                 comment: Some("archive round-trip".to_string()),
                 author: None,
             },

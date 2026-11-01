@@ -913,6 +913,154 @@ fn resolve_named_volumes(store: &Store, volumes: &mut [mounts::BindMount]) -> Re
     Ok(())
 }
 
+/// Anonymous volumes created from image `VOLUME` declarations. The guard
+/// removes them if setup fails before a retained container record takes
+/// ownership; detached runs explicitly hand the names to that record.
+struct AnonymousVolumeGuard {
+    store: Store,
+    id: String,
+    names: Option<Vec<String>>,
+}
+
+impl AnonymousVolumeGuard {
+    fn new(store: Store, id: String, names: Vec<String>) -> Self {
+        Self {
+            store,
+            id,
+            names: Some(names),
+        }
+    }
+
+    fn into_names(mut self) -> Vec<String> {
+        self.names.take().unwrap_or_default()
+    }
+}
+
+impl Drop for AnonymousVolumeGuard {
+    fn drop(&mut self) {
+        if let Some(names) = self.names.take() {
+            remove_anonymous_volumes(&self.store, &self.id, &names);
+        }
+    }
+}
+
+fn anonymous_volume_name(id: &str, index: usize) -> String {
+    format!("zerun-anon-{id}-{index}")
+}
+
+fn owned_anonymous_volume_name(id: &str, name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(&format!("zerun-anon-{id}-")) else {
+        return false;
+    };
+    !suffix.is_empty()
+        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        && mounts::validate_volume_name(name).is_ok()
+}
+
+/// Remove only volumes that follow the ownership naming scheme for `id`.
+/// State records are owner-controlled, but validating this boundary prevents a
+/// corrupted `anonymous_volumes` list from deleting an unrelated named volume.
+pub(crate) fn remove_anonymous_volumes(store: &Store, id: &str, names: &[String]) {
+    if !(1..=64).contains(&id.len()) || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return;
+    }
+    for name in names {
+        if !owned_anonymous_volume_name(id, name) {
+            eprintln!(
+                "zerun: warn: refusing to remove volume '{name}' not owned by container {id}"
+            );
+            continue;
+        }
+        fsutil::remove_dir_all_quiet(&store.volume_dir(name));
+    }
+}
+
+fn mount_target_covers(candidate: &Path, target: &Path) -> bool {
+    target == candidate || target.starts_with(candidate)
+}
+
+/// Materialize image-declared volumes as fresh per-container volumes. A user
+/// bind or tmpfs at the same path or an ancestor suppresses the image volume,
+/// matching Docker's "a user mount hides the image declaration" behavior.
+/// Existing image-directory content seeds a new anonymous volume.
+fn materialize_image_volumes(
+    store: &Store,
+    id: &str,
+    rootfs: &Path,
+    targets: &[String],
+    user_mounts: &[mounts::BindMount],
+    user_tmpfs: &[mounts::TmpfsMount],
+) -> Result<(Vec<mounts::BindMount>, Vec<String>), String> {
+    let mut created = Vec::new();
+    let result = (|| {
+        let mut mounts = Vec::new();
+        for raw_target in targets {
+            mounts::validate_container_target("image VOLUME", raw_target)?;
+            if raw_target.contains(':') {
+                return Err(format!(
+                    "image VOLUME path '{raw_target}' cannot contain ':' because restart metadata uses -v syntax"
+                ));
+            }
+            let target = PathBuf::from(raw_target);
+            if user_mounts
+                .iter()
+                .any(|mount| mount_target_covers(&mount.target, &target))
+                || user_tmpfs
+                    .iter()
+                    .any(|mount| mount_target_covers(&mount.target, &target))
+            {
+                continue;
+            }
+
+            let name = anonymous_volume_name(id, created.len());
+            let dir = store.volume_dir(&name);
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&dir)
+                .map_err(|e| format!("create anonymous volume '{name}': {e}"))?;
+            created.push(name.clone());
+
+            let source = mounts::safe_target(rootfs, &target).map_err(|e| e.to_string())?;
+            match std::fs::symlink_metadata(&source) {
+                Ok(meta) if meta.file_type().is_dir() => {
+                    fsutil::copy_dir_all(&source, &dir).map_err(|e| {
+                        format!(
+                            "seed anonymous volume '{name}' from image path {}: {e}",
+                            target.display()
+                        )
+                    })?;
+                }
+                Ok(_) => {
+                    return Err(format!(
+                        "image VOLUME {} exists but is not a directory",
+                        target.display()
+                    ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "inspect image VOLUME target {}: {error}",
+                        target.display()
+                    ))
+                }
+            }
+
+            mounts.push(mounts::BindMount {
+                source: dir,
+                target,
+                readonly: false,
+                named: Some(name.clone()),
+                raw: format!("{name}:{raw_target}"),
+            });
+        }
+        Ok((mounts, created.clone()))
+    })();
+    if result.is_err() {
+        remove_anonymous_volumes(store, id, &created);
+    }
+    result
+}
+
 /// Recover the resolved process environment from a detached state record.
 fn state_env(entries: &[String]) -> Result<Vec<(String, String)>, String> {
     entries
@@ -1193,6 +1341,14 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
 
     // Resolve the container root filesystem and, for image mode, the process
     // environment / working directory / default command from the OCI config.
+    let mut image_volume_targets = resume
+        .as_ref()
+        .map(|st| st.image_volumes.clone())
+        .unwrap_or_default();
+    let mut anonymous_volumes = resume
+        .as_ref()
+        .map(|st| st.anonymous_volumes.clone())
+        .unwrap_or_default();
     let (rootfs, env, cwd, user, stop_signal, stop_timeout, argv, labels, capabilities, seccomp) =
         if let Some(st) = &resume {
             if st.tmpfs_upper {
@@ -1310,6 +1466,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
                             return 1;
                         }
                     };
+                    image_volume_targets = cfg.config.volumes.keys().cloned().collect();
                     let env = match build_image_env(
                         &cfg.config.env,
                         &env_file_overrides,
@@ -1368,6 +1525,30 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
                 }
             }
         };
+
+    let mut anonymous_volume_guard = None;
+    if resume.is_none() && !image_volume_targets.is_empty() {
+        let (image_mounts, names) = match materialize_image_volumes(
+            &store,
+            &id,
+            &rootfs,
+            &image_volume_targets,
+            &a.volumes,
+            &a.tmpfs,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!("zerun run: {error}");
+                return 1;
+            }
+        };
+        a.volumes.splice(0..0, image_mounts);
+        anonymous_volumes = names.clone();
+        if !names.is_empty() {
+            anonymous_volume_guard =
+                Some(AnonymousVolumeGuard::new(store.clone(), id.clone(), names));
+        }
+    }
 
     let ulimits = if let Some(st) = &resume {
         match st.ulimits.as_deref() {
@@ -1517,6 +1698,10 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         .unwrap_or_else(|| fsutil::canonical_or_self(&rootfs).display().to_string());
 
     if a.detach {
+        let anonymous_volumes = match anonymous_volume_guard.take() {
+            Some(guard) => guard.into_names(),
+            None => anonymous_volumes,
+        };
         return run_detached(
             &store,
             spec,
@@ -1537,6 +1722,8 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
                 labels,
                 log: a.log,
                 lower,
+                anonymous_volumes,
+                image_volumes: image_volume_targets,
                 resume,
                 report_id,
                 image_rootfs_lease,
@@ -1769,12 +1956,15 @@ fn start_one(store: &Store, target: &str) -> Result<String, String> {
 /// `Created` container.
 fn cleanup_failed_detached_start(
     store: &Store,
+    id: &str,
     container_fs: Option<&store::ContainerFs>,
+    anonymous_volumes: &[String],
     state_dir: &Path,
 ) {
     if let Some(fs) = container_fs {
         store.cleanup_container_fs(fs);
     }
+    remove_anonymous_volumes(store, id, anonymous_volumes);
     fsutil::remove_dir_all_quiet(state_dir);
 }
 
@@ -1798,6 +1988,11 @@ struct DetachedInfo {
     labels: BTreeMap<String, String>,
     log: logs::LogOptions,
     lower: String,
+    /// Image-declared volumes owned by a new detached container. Empty for
+    /// resumes because the existing state record remains authoritative.
+    anonymous_volumes: Vec<String>,
+    /// Original image `VOLUME` targets retained for commit metadata.
+    image_volumes: Vec<String>,
     resume: Option<ContainerState>,
     report_id: bool,
     image_rootfs_lease: Option<image::store::ImageRootfsLease>,
@@ -1816,13 +2011,20 @@ fn run_detached(
 
     let id = spec.id.clone();
     let resuming = info.resume.is_some();
+    let sdir = state::ContainerState::dir(store, &id);
     let name_lock = if !resuming && info.name.is_some() {
         match state::ContainerNameLock::try_acquire(store) {
             Ok(lock) => Some(lock),
             Err(error) => {
                 eprintln!("zerun run: {error}");
-                if let Some(fs) = container_fs.as_ref() {
-                    store.cleanup_container_fs(fs);
+                if !resuming {
+                    cleanup_failed_detached_start(
+                        store,
+                        &id,
+                        container_fs.as_ref(),
+                        &info.anonymous_volumes,
+                        &sdir,
+                    );
                 }
                 return 1;
             }
@@ -1837,19 +2039,30 @@ fn run_detached(
                 .any(|c| c.name.as_deref() == Some(n))
             {
                 eprintln!("zerun run: name '{n}' is already in use by another container");
-                if let Some(fs) = container_fs.as_ref() {
-                    store.cleanup_container_fs(fs);
+                if !resuming {
+                    cleanup_failed_detached_start(
+                        store,
+                        &id,
+                        container_fs.as_ref(),
+                        &info.anonymous_volumes,
+                        &sdir,
+                    );
                 }
                 return 1;
             }
         }
     }
 
-    let sdir = state::ContainerState::dir(store, &id);
     if let Err(e) = fsutil::mkdir_p_mode(&sdir, 0o700) {
         eprintln!("zerun: {e}");
         if !resuming {
-            cleanup_failed_detached_start(store, container_fs.as_ref(), &sdir);
+            cleanup_failed_detached_start(
+                store,
+                &id,
+                container_fs.as_ref(),
+                &info.anonymous_volumes,
+                &sdir,
+            );
         }
         return 1;
     }
@@ -1876,7 +2089,13 @@ fn run_detached(
         Err(e) => {
             eprintln!("zerun: open {}: {e}", log_path.display());
             if !resuming {
-                cleanup_failed_detached_start(store, container_fs.as_ref(), &sdir);
+                cleanup_failed_detached_start(
+                    store,
+                    &id,
+                    container_fs.as_ref(),
+                    &info.anonymous_volumes,
+                    &sdir,
+                );
             }
             return 1;
         }
@@ -1884,7 +2103,13 @@ fn run_detached(
     if let Err(e) = log_fd.set_permissions(std::fs::Permissions::from_mode(0o600)) {
         eprintln!("zerun: secure {}: {e}", log_path.display());
         if !resuming {
-            cleanup_failed_detached_start(store, container_fs.as_ref(), &sdir);
+            cleanup_failed_detached_start(
+                store,
+                &id,
+                container_fs.as_ref(),
+                &info.anonymous_volumes,
+                &sdir,
+            );
         }
         return 1;
     }
@@ -1928,6 +2153,8 @@ fn run_detached(
         capabilities: None,
         seccomp: None,
         ulimits: None,
+        anonymous_volumes: Vec::new(),
+        image_volumes: Vec::new(),
         labels: BTreeMap::new(),
         log: String::new(),
         log_max_size: None,
@@ -1984,6 +2211,10 @@ fn run_detached(
     st.capabilities = Some(spec.capabilities.names());
     st.seccomp = Some(spec.seccomp);
     st.ulimits = (!spec.ulimits.is_empty()).then(|| spec.ulimits.canonical());
+    if !resuming {
+        st.anonymous_volumes = info.anonymous_volumes.clone();
+        st.image_volumes = info.image_volumes.clone();
+    }
     st.group_add = (!spec.group_add.is_empty()).then(|| spec.group_add.clone());
     st.labels = info.labels;
     st.log = log_path.display().to_string();
@@ -2003,7 +2234,13 @@ fn run_detached(
     if let Err(e) = st.save(store) {
         eprintln!("zerun: {e}");
         if !resuming {
-            cleanup_failed_detached_start(store, container_fs.as_ref(), &sdir);
+            cleanup_failed_detached_start(
+                store,
+                &id,
+                container_fs.as_ref(),
+                &info.anonymous_volumes,
+                &sdir,
+            );
         }
         return 1;
     }
@@ -2024,7 +2261,13 @@ fn run_detached(
         Err(e) => {
             eprintln!("zerun: {e}");
             if !resuming {
-                cleanup_failed_detached_start(store, container_fs.as_ref(), &sdir);
+                cleanup_failed_detached_start(
+                    store,
+                    &id,
+                    container_fs.as_ref(),
+                    &info.anonymous_volumes,
+                    &sdir,
+                );
             }
             return 1;
         }
@@ -2039,7 +2282,13 @@ fn run_detached(
             syscalls::close(started_r);
             syscalls::close(started_w);
             if !resuming {
-                cleanup_failed_detached_start(store, container_fs.as_ref(), &sdir);
+                cleanup_failed_detached_start(
+                    store,
+                    &id,
+                    container_fs.as_ref(),
+                    &info.anonymous_volumes,
+                    &sdir,
+                );
             }
             1
         }
@@ -2547,66 +2796,43 @@ fn cmd_commit(args: &[String]) -> i32 {
         eprintln!("zerun: warning: committing a running container; filesystem changes in progress may be inconsistent");
     }
 
-    // A live container's overlay is mounted inside its own mount namespace; the
-    // host only sees the empty mount-point directory. Archive the live root via
-    // /proc/<pid>/root instead. After exit that mount is gone, so reconstruct
-    // the rootfs from the image lower layer plus the persisted overlay upper.
+    // Reconstruct from the host-side lower rootfs and overlay upper. A live
+    // container's merged view lives in its own mount namespace (and includes
+    // volumes, tmpfs, and pseudo-filesystems), so archiving /proc/<pid>/root
+    // is both host-dependent and would leak mounted volume data into the image.
+    // The persisted upper contains exactly the container's rootfs changes.
     let mut rebuilt: Option<std::path::PathBuf> = None;
-    let rootfs = if matches!(st.status, state::Status::Running) {
-        match st.pid.filter(|p| *p > 0 && st.pid_alive()) {
-            Some(pid) => {
-                let live = std::path::PathBuf::from(format!("/proc/{pid}/root"));
-                if !live.is_dir() {
-                    eprintln!(
-                        "zerun commit: cannot read container {} root at {}",
-                        display_name(&st),
-                        live.display()
-                    );
-                    return 1;
+    let rootfs = match st.overlay.as_ref() {
+        Some(_) => {
+            let upper = store.container_overlay_dir(&st.id).join("upper");
+            let staging = imgstore.blob_tmp("commit-source");
+            match lower_rootfs(&store, &st) {
+                Ok(lower) => {
+                    let root = match image::commit::rebuild_rootfs(&lower, &upper, &staging) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            fsutil::remove_dir_all_quiet(&staging);
+                            eprintln!("zerun commit: rebuild container rootfs: {e}");
+                            return 1;
+                        }
+                    };
+                    rebuilt = Some(root.clone());
+                    root
                 }
-                live
-            }
-            None => {
-                eprintln!(
-                    "zerun commit: container {} is recorded as running but has no live PID",
-                    display_name(&st)
-                );
-                return 1;
-            }
-        }
-    } else {
-        match st.overlay.as_ref() {
-            Some(_) => {
-                let upper = store.container_overlay_dir(&st.id).join("upper");
-                let staging = imgstore.blob_tmp("commit-source");
-                match lower_rootfs(&store, &st) {
-                    Ok(lower) => {
-                        let root = match image::commit::rebuild_rootfs(&lower, &upper, &staging) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                fsutil::remove_dir_all_quiet(&staging);
-                                eprintln!("zerun commit: rebuild exited container rootfs: {e}");
-                                return 1;
-                            }
-                        };
-                        rebuilt = Some(root.clone());
-                        root
-                    }
-                    Err(e) => {
-                        fsutil::remove_dir_all_quiet(&staging);
-                        eprintln!("zerun commit: {e}");
-                        return 1;
-                    }
-                }
-            }
-            None => match lower_rootfs(&store, &st) {
-                Ok(path) => path,
                 Err(e) => {
+                    fsutil::remove_dir_all_quiet(&staging);
                     eprintln!("zerun commit: {e}");
                     return 1;
                 }
-            },
+            }
         }
+        None => match lower_rootfs(&store, &st) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("zerun commit: {e}");
+                return 1;
+            }
+        },
     };
     if !rootfs.is_dir() {
         if let Some(path) = &rebuilt {
@@ -2624,6 +2850,7 @@ fn cmd_commit(args: &[String]) -> i32 {
         working_dir: st.cwd.clone().unwrap_or_else(|| "/".to_string()),
         user: st.user.clone(),
         labels: st.labels.clone(),
+        volumes: st.image_volumes.clone(),
         comment: message,
         author,
     };
@@ -4737,6 +4964,7 @@ fn remove_container_files(
     if st.overlay.is_some() {
         fsutil::remove_dir_all_quiet(&store.container_overlay_dir(&st.id));
     }
+    remove_anonymous_volumes(store, &st.id, &st.anonymous_volumes);
     let dir = state::ContainerState::dir(store, &st.id);
     fsutil::remove_dir_all_quiet(&dir);
     Ok(name)
@@ -7657,6 +7885,151 @@ mod tests {
         assert_eq!(cursor.len(), 3);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn image_volumes_seed_content_and_honor_operator_mounts() {
+        let root = std::env::temp_dir().join(format!("zerun-image-volumes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.join("data"), root.join("run"));
+        store.ensure_dirs().unwrap();
+        let image_root = root.join("image");
+        std::fs::create_dir_all(image_root.join("data")).unwrap();
+        std::fs::write(image_root.join("data/seed.txt"), b"from image\n").unwrap();
+        std::fs::create_dir_all(image_root.join("user-covered")).unwrap();
+        std::fs::create_dir_all(image_root.join("tmp-covered")).unwrap();
+
+        let user_mount = mounts::BindMount {
+            source: root.clone(),
+            target: PathBuf::from("/user-covered"),
+            readonly: false,
+            named: None,
+            raw: format!("{}:/user-covered", root.display()),
+        };
+        let user_tmpfs = mounts::parse_tmpfs("/tmp-covered").unwrap();
+        let targets = vec![
+            "/data".to_string(),
+            "/user-covered".to_string(),
+            "/tmp-covered".to_string(),
+        ];
+        let (image_mounts, names) = materialize_image_volumes(
+            &store,
+            "abc123",
+            &image_root,
+            &targets,
+            std::slice::from_ref(&user_mount),
+            std::slice::from_ref(&user_tmpfs),
+        )
+        .unwrap();
+
+        assert_eq!(image_mounts.len(), 1);
+        assert_eq!(image_mounts[0].target, Path::new("/data"));
+        assert_eq!(names, vec!["zerun-anon-abc123-0".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(image_mounts[0].source.join("seed.txt")).unwrap(),
+            "from image\n"
+        );
+        assert_eq!(image_mounts[0].raw, "zerun-anon-abc123-0:/data");
+        assert!(!store.volume_dir("zerun-anon-abc123-1").exists());
+
+        remove_anonymous_volumes(&store, "abc123", &names);
+        assert!(!image_mounts[0].source.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn image_volumes_keep_parents_of_nested_operator_mounts() {
+        let root =
+            std::env::temp_dir().join(format!("zerun-image-volume-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.join("data"), root.join("run"));
+        store.ensure_dirs().unwrap();
+        let image_root = root.join("image");
+        std::fs::create_dir_all(&image_root).unwrap();
+        let user_mount = mounts::BindMount {
+            source: root.clone(),
+            target: PathBuf::from("/data/cache"),
+            readonly: false,
+            named: None,
+            raw: format!("{}:/data/cache", root.display()),
+        };
+        let (image_mounts, names) = materialize_image_volumes(
+            &store,
+            "def456",
+            &image_root,
+            &["/data".to_string()],
+            std::slice::from_ref(&user_mount),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(image_mounts.len(), 1);
+        assert_eq!(image_mounts[0].target, Path::new("/data"));
+        assert_eq!(names.len(), 1);
+
+        remove_anonymous_volumes(&store, "def456", &names);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn image_volumes_reject_unsafe_paths_and_foreign_cleanup() {
+        let root =
+            std::env::temp_dir().join(format!("zerun-image-volume-safe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.join("data"), root.join("run"));
+        store.ensure_dirs().unwrap();
+        let image_root = root.join("image");
+        std::fs::create_dir_all(&image_root).unwrap();
+
+        for target in ["relative", "/", "/../escape", "/data:tag"] {
+            assert!(
+                materialize_image_volumes(
+                    &store,
+                    "abc123",
+                    &image_root,
+                    &[target.to_string()],
+                    &[],
+                    &[],
+                )
+                .is_err(),
+                "{target} should be rejected"
+            );
+        }
+        let foreign = store.volume_dir("app-data");
+        std::fs::create_dir_all(&foreign).unwrap();
+        remove_anonymous_volumes(
+            &store,
+            "abc123",
+            &["app-data".to_string(), "zerun-anon-def456-0".to_string()],
+        );
+        assert!(foreign.is_dir());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn image_volume_materialization_rolls_back_on_later_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-image-volume-rollback-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.join("data"), root.join("run"));
+        store.ensure_dirs().unwrap();
+        let image_root = root.join("image");
+        std::fs::create_dir_all(image_root.join("data")).unwrap();
+
+        assert!(materialize_image_volumes(
+            &store,
+            "abc123",
+            &image_root,
+            &["/data".to_string(), "/data:tag".to_string()],
+            &[],
+            &[],
+        )
+        .is_err());
+        assert!(!store.volume_dir("zerun-anon-abc123-0").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

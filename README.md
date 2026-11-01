@@ -52,8 +52,9 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   systemd units; `install.sh` verifies checksums, detects architectures, supports rootless
   installation, and creates the `ze` alias; Arch and Homebrew source packaging is included.
 - **M7 — introspection and storage controls (done)**: `inspect`, `port`, `rename`, `top`, `diff`,
-  `cp`, `export`, `import`, `events`, `update`, `system df`, live/rootfs `commit`, persisted
-  labels and user identity, OCI save/load/tag/push flows, and hardened state/resource cleanup.
+  `cp`, `export`, `import`, `events`, `update`, `system df`, live/rootfs `commit`, OCI
+  image-declared volumes, persisted labels and user identity, OCI save/load/tag/push flows,
+  and hardened state/resource cleanup.
 
 ## Continuous integration
 
@@ -63,7 +64,8 @@ advisory auditing, Clippy, the serialized unit/integration suite on Ubuntu 22.04
 isolation, OverlayFS, read-only roots with tmpfs mounts, named-volume persistence,
 cgroups v2, detached lifecycle controls (`pause`/`unpause`/`update`/`rename`/`attach`/`prune`),
 concurrent name uniqueness across creation and rename,
-`inspect`/`stats`/`top`, `system df`, `cp`, `diff`, `export`/`import`, retained-overlay `commit`,
+`inspect`/`stats`/`top`, `system df`, `cp`, `diff`, `export`/`import`, live and retained-overlay
+`commit`,
 bounded `events` replay, bridge/veth networking, and TCP/UDP published-port proxies. A separate
 rootless smoke job creates a dedicated unprivileged runner account and verifies
 user-namespace execution; static GNU and musl builds plus ARM64, ARMv7, and RISC-V64
@@ -359,6 +361,13 @@ sudo zerun run --rm --mount type=volume,src=app-data,dst=/var/lib/app \
 sudo zerun system df   # Volumes shows the managed storage
 ```
 
+Images may declare directories with OCI `Config.Volumes` (Dockerfile `VOLUME`).
+A new container gets a fresh managed anonymous volume for each declaration and
+seeds it from the image directory. A user `-v`/`--mount` at the same path or an
+ancestor suppresses that anonymous volume. The data survives `stop`/`start` and
+detached restarts, is removed with `rm` (or `--rm`), and mounted volume data is
+excluded from `commit`; the declaration itself is preserved in the new image.
+
 ### Offline image transfer (save / load)
 
 Export any local image (or several, sharing blobs by digest) as a standard OCI image
@@ -483,8 +492,11 @@ output. Up to 32 clients may attach to one container; disconnected clients are p
 connections arrive so the reaper's descriptor and memory use stay bounded.
 `exec -i` forwards stdin, `exec -t` allocates a PTY, and `exec -it` combines them;
 without `-i`, the command receives `/dev/null` as stdin.
-`commit` produces a single-layer OCI image from the container rootfs. Exited detached
-containers retain their writable layer until `rm`; `--rm` still removes it on exit.
+`commit` produces a single-layer OCI image from the container's host-side overlay
+(changes in progress may race while it is running). Mounted volumes, tmpfs mounts,
+and pseudo-filesystems are excluded; image-declared `Volumes` are retained in the
+committed config. Exited detached containers retain their writable layer until `rm`;
+`--rm` still removes it on exit.
 
 `ps` supports repeated Docker-style filters, combined with AND:
 `status=created|running|exited`, `name=NAME`, `id=PREFIX`, `image=IMAGE`, `net=MODE`, and

@@ -460,6 +460,15 @@ pub struct ContainerState {
     /// default deny-by-default profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seccomp: Option<SeccompMode>,
+    /// Managed anonymous volumes created from the OCI image `Config.Volumes`
+    /// declaration. These names are owned by this container and are removed
+    /// with its state record. Older records have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anonymous_volumes: Vec<String>,
+    /// Image-declared volume targets (`Config.Volumes`) retained so `commit`
+    /// preserves them in the new image configuration. Older records have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_volumes: Vec<String>,
     /// Canonical per-process rlimits (`--ulimit`). None = legacy record with no
     /// operator overrides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -792,6 +801,8 @@ mod tests {
             capabilities: None,
             seccomp: None,
             ulimits: None,
+            anonymous_volumes: Vec::new(),
+            image_volumes: Vec::new(),
             log: String::new(),
             log_max_size: None,
             log_max_file: None,
@@ -937,6 +948,8 @@ mod tests {
             capabilities: None,
             seccomp: None,
             ulimits: None,
+            anonymous_volumes: Vec::new(),
+            image_volumes: Vec::new(),
             log: String::new(),
             log_max_size: None,
             log_max_file: None,
@@ -1035,6 +1048,8 @@ mod tests {
             capabilities: Some(vec!["CAP_NET_RAW".to_string()]),
             seccomp: Some(SeccompMode::Unconfined),
             ulimits: None,
+            anonymous_volumes: Vec::new(),
+            image_volumes: Vec::new(),
             log: format!("{}/x/console.log", std::env::temp_dir().display()),
             log_max_size: None,
             log_max_file: None,

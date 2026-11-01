@@ -636,11 +636,15 @@ if (( EUID == 0 )); then
 else
   sudo test -s "$export_tar"
 fi
+# Commit while the container is live, then again after exit. Both paths rebuild
+# from the host-side overlay upper so they remain portable to nested hosts and
+# do not archive mounted volumes or pseudo-filesystems.
+live_commit_digest=$("${zerun[@]}" commit -m ci-m7-live "$m7_id" ci-commit-live:test)
+grep -Eq '^sha256:[0-9a-f]{64}$' <<<"$live_commit_digest"
+live_commit_output=$("${zerun[@]}" run --net none ci-commit-live:test /bin/sh -c 'cat /run/m7-file')
+grep -Fxq overlay-data <<<"$live_commit_output"
 "${zerun[@]}" kill --signal TERM "$m7_id" >/dev/null
 "${zerun[@]}" wait "$m7_id" >/dev/null
-# Commit the retained overlay after exit so this check exercises the stable
-# persisted-upper path and remains portable to nested hosts whose live
-# /proc/<pid>/root mount view cannot be archived reliably.
 commit_digest=$("${zerun[@]}" commit -m ci-m7 "$m7_id" ci-commit:test)
 grep -Eq '^sha256:[0-9a-f]{64}$' <<<"$commit_digest"
 "${zerun[@]}" rm "$m7_id" >/dev/null

@@ -93,21 +93,7 @@ pub fn parse_bind(value: &str) -> Result<BindMount, String> {
         "ro" => true,
         other => return Err(format!("-v: unsupported mode '{other}' (rw|ro)")),
     };
-    if !container.starts_with('/') {
-        return Err(format!("-v: container path '{container}' must be absolute"));
-    }
-    if container == "/" {
-        return Err("-v: refusing to mount over the container root".to_string());
-    }
-    if !Path::new(container)
-        .components()
-        .skip(1)
-        .all(|component| matches!(component, std::path::Component::Normal(_)))
-    {
-        return Err(format!(
-            "-v: container path '{container}' must be absolute without '.' or '..'"
-        ));
-    }
+    validate_container_target("-v", container)?;
 
     // Docker accepts either an absolute bind source or a named volume. Named
     // sources are resolved by the caller against the active data root because
@@ -135,6 +121,32 @@ pub fn parse_bind(value: &str) -> Result<BindMount, String> {
         named,
         raw: value.to_string(),
     })
+}
+
+/// Validate an absolute container mount target before it is persisted or
+/// passed to the child. Image metadata is untrusted too, so image-declared
+/// volumes use the same absolute/root/`.`/`..` checks as operator mounts.
+pub fn validate_container_target(option: &str, target: &str) -> Result<(), String> {
+    if !target.starts_with('/') {
+        return Err(format!(
+            "{option}: container path '{target}' must be absolute"
+        ));
+    }
+    if target == "/" {
+        return Err(format!(
+            "{option}: refusing to mount over the container root"
+        ));
+    }
+    if !Path::new(target)
+        .components()
+        .skip(1)
+        .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "{option}: container path '{target}' must be absolute without '.' or '..'"
+        ));
+    }
+    Ok(())
 }
 
 /// Validate Docker-style volume names. Unlike host paths, these become one
@@ -525,21 +537,7 @@ pub fn parse_tmpfs(value: &str) -> Result<TmpfsMount, String> {
         Some((p, o)) if !o.is_empty() => (p, Some(o)),
         _ => (value, None),
     };
-    if !path.starts_with('/') {
-        return Err(format!("--tmpfs: container path '{path}' must be absolute"));
-    }
-    if !Path::new(path)
-        .components()
-        .skip(1)
-        .all(|component| matches!(component, std::path::Component::Normal(_)))
-    {
-        return Err(format!(
-            "--tmpfs: container path '{path}' must be absolute without '.' or '..'"
-        ));
-    }
-    if path == "/" {
-        return Err("--tmpfs: refusing to mount over the container root".to_string());
-    }
+    validate_container_target("--tmpfs", path)?;
 
     let mut data = String::new();
     let mut readonly = false;
@@ -774,7 +772,7 @@ fn mount_volumes(rootless: bool, rootfs: &Path, volumes: &[BindMount]) -> ZResul
 }
 
 /// Convert an absolute container path to a safe path under `rootfs`.
-fn safe_target(rootfs: &Path, target: &Path) -> ZResult<PathBuf> {
+pub(crate) fn safe_target(rootfs: &Path, target: &Path) -> ZResult<PathBuf> {
     let mut cur = rootfs.to_path_buf();
     for comp in target.components().skip(1) {
         match comp {

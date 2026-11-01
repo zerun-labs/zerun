@@ -38,6 +38,10 @@ pub struct ConfigSection {
     /// OCI/Docker image labels, inherited by containers.
     #[serde(default, rename = "Labels")]
     pub labels: BTreeMap<String, String>,
+    /// Directories declared as volumes (`VOLUME` in a Dockerfile). The map
+    /// values are intentionally opaque; only the container paths matter here.
+    #[serde(default, rename = "Volumes")]
+    pub volumes: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -70,7 +74,8 @@ mod tests {
                     "User": "nginx:nginx",
                     "StopSignal": "SIGQUIT",
                     "Cmd": ["/bin/sh"],
-                    "Labels": {"org.opencontainers.image.title": "nginx"}
+                    "Labels": {"org.opencontainers.image.title": "nginx"},
+                    "Volumes": {"/var/lib/app": {}, "/cache": {}}
                 },
                 "rootfs": {
                     "type": "layers",
@@ -92,6 +97,14 @@ mod tests {
             Some("nginx")
         );
         assert_eq!(cfg.config.cmd, vec!["/bin/sh"]);
+        assert_eq!(
+            cfg.config
+                .volumes
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["/cache", "/var/lib/app"]
+        );
         assert_eq!(cfg.rootfs.diff_ids.len(), 1);
     }
 
