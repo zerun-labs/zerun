@@ -176,9 +176,10 @@ where
     let rootless = crate::syscalls::effective_uid() != 0;
 
     // Create the cgroup on the parent side first (attach right after clone).
-    // Detached containers keep one even without limits so pause/unpause can
-    // freeze the whole process tree. Rootless hosts without delegation skip it.
-    let needs_device_policy = !rootless && !spec.devices.is_empty();
+    // Rootful workloads always need one because device access is enforced by a
+    // deny-by-default cgroup/eBPF allowlist, even when no limits or explicit
+    // devices were requested. Rootless hosts without delegation skip cgroups.
+    let needs_device_policy = !rootless;
     let has_limits = spec.limits.memory.is_some()
         || spec.limits.memory_reservation.is_some()
         || spec.limits.memory_swap.is_some()
@@ -187,17 +188,14 @@ where
         || spec.limits.cpuset_mems.is_some()
         || spec.limits.pids.is_some()
         || spec.limits.oom_group
-        || !spec.limits.io.is_empty()
-        // Device permissions are enforced by a cgroup/eBPF allowlist, so an
-        // explicit device request requires a real lifecycle cgroup even when
-        // the operator requested no resource limits.
-        || needs_device_policy;
+        || !spec.limits.io.is_empty();
     // Host PID sharing has no namespace-wide kill boundary. Keep a cgroup
     // where possible so runtime teardown and crash reconciliation can terminate
     // exec workers and other processes that did not descend from the workload.
     let needs_lifecycle_cgroup =
         spec.lifecycle_cgroup || matches!(spec.namespaces.pid, NamespaceMode::Host);
-    let mut cg = if has_limits {
+    let needs_mandatory_cgroup = has_limits || needs_device_policy;
+    let mut cg = if needs_mandatory_cgroup {
         Some(CgroupV2::create(&spec.id, &spec.limits)?)
     } else if needs_lifecycle_cgroup {
         match CgroupV2::create(&spec.id, &spec.limits) {

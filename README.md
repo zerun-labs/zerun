@@ -88,9 +88,10 @@ ci/rootful-runtime.sh target/debug/zerun "$rootfs" "$data" "$runtime"
 - **No external command dependencies**: namespaces, mounts, cgroups, and netlink are driven
   directly (rtnetlink) — no shelling out to `ip`, `nft`, or a daemon.
 - **Secure defaults**: `PR_SET_NO_NEW_PRIVS`, a Docker-compatible capability set with
-  `CAP_NET_RAW`/`CAP_SYS_ADMIN` removed, masked `/proc`/`/sys` paths, and a
-  deny-by-default seccomp allowlist (capabilities can be tuned with
-  `--cap-add`/`--cap-drop`; seccomp can be opted out with `--seccomp unconfined`).
+  `CAP_NET_RAW`/`CAP_SYS_ADMIN` removed, masked `/proc`/`/sys` paths, a deny-by-default
+  seccomp allowlist, and a deny-by-default cgroup v2 device allowlist on rootful runs
+  (capabilities can be tuned with `--cap-add`/`--cap-drop`; seccomp can be opted out with
+  `--seccomp unconfined`, while `--device` extends the device allowlist).
 - **Docker-compatible top 20% CLI**: `run / ps / wait / start / pause / unpause / stop / restart / rm / prune / logs / exec / inspect /
   port / rename / top / diff / cp / export / import / events / update / attach / kill / pull / push / tag / save / load /
   login / logout / images / rmi / commit / generate-service / system df / doctor`.
@@ -259,8 +260,9 @@ Run options (current subset):
                      tmpfs-mode= instead of src= (repeatable)
 --device HOST[:CONTAINER[:rwm]]
                      expose a character or block device (repeatable; default target is
-                     HOST and default permissions are rwm). Rootful runs use a cgroup v2
-                     device allowlist; rootless runs support full rwm only
+                     HOST and default permissions are rwm). Rootful runs always use a
+                     deny-by-default cgroup v2 device allowlist; --device extends it. Rootless
+                     runs support full rwm only
 --no-overlay        pivot directly into the rootfs (no writable upper layer)
 --tmpfs-upper       keep the overlay writable layer in tmpfs (not committable)
 --read-only         remount the container root read-only before exec

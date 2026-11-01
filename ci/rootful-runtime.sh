@@ -307,6 +307,14 @@ device_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
   "${device_args[@]}" --init -- /bin/sh -c "$device_check")
 grep -Fx device-ok <<<"$device_output" >/dev/null
 
+# The baseline policy applies even when no --device flag is present. Creating a
+# non-allowlisted device node must be denied by the parent-side cgroup policy.
+default_device_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+  --init -- /bin/sh -c \
+  'if /bin/busybox mknod /dev/zerun-forbidden c 1 11 2>/dev/null; then exit 1; fi;
+   printf "default-device-policy-ok\n"')
+grep -Fx default-device-policy-ok <<<"$default_device_output" >/dev/null
+
 # Resource limits require an actual cgroup v2 hierarchy and exercise the
 # parent-side cgroup creation/attach path.
 cgroup_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
