@@ -219,6 +219,29 @@ pub struct PublishedPort {
     pub protocol: PortProtocol,
 }
 
+impl fmt::Display for PublishedPort {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Docker's short syntax omits the address for the default wildcard
+        // IPv4 bind. Any explicit address, including IPv6 wildcard, must be
+        // retained or recreating the container could expose it more broadly.
+        if self.host_ip == IpAddr::V4(Ipv4Addr::UNSPECIFIED) {
+            write!(formatter, "{}:{}", self.host, self.container)?;
+        } else {
+            write!(
+                formatter,
+                "{}:{}:{}",
+                host_ip_label(self.host_ip),
+                self.host,
+                self.container
+            )?;
+        }
+        if self.protocol == PortProtocol::Udp {
+            formatter.write_str("/udp")?;
+        }
+        Ok(())
+    }
+}
+
 /// Host bridge every bridge-mode container shares (like Docker's docker0).
 pub const BRIDGE_NAME: &str = "zerun0";
 /// Gateway address of `BRIDGE_NAME` inside the 10.88.0.0/24 subnet.
@@ -1190,6 +1213,40 @@ mod tests {
             .map(|port| port.host);
         let first = tcp_hosts.next().unwrap();
         assert!(tcp_hosts.all(|host| host != first));
+    }
+
+    #[test]
+    fn published_port_display_preserves_bind_address_and_protocol() {
+        assert_eq!(
+            PublishedPort {
+                host_ip: Ipv4Addr::UNSPECIFIED.into(),
+                host: 8080,
+                container: 80,
+                protocol: PortProtocol::Tcp,
+            }
+            .to_string(),
+            "8080:80"
+        );
+        assert_eq!(
+            PublishedPort {
+                host_ip: Ipv4Addr::LOCALHOST.into(),
+                host: 5353,
+                container: 53,
+                protocol: PortProtocol::Udp,
+            }
+            .to_string(),
+            "127.0.0.1:5353:53/udp"
+        );
+        assert_eq!(
+            PublishedPort {
+                host_ip: std::net::Ipv6Addr::UNSPECIFIED.into(),
+                host: 8443,
+                container: 443,
+                protocol: PortProtocol::Tcp,
+            }
+            .to_string(),
+            "[::]:8443:443"
+        );
     }
 
     #[test]

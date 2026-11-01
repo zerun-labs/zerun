@@ -2814,17 +2814,7 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
         args.extend(["--env".to_string(), v.clone()]);
     }
     for p in &a.ports {
-        let base = format!(
-            "{}:{}:{}",
-            network::host_ip_label(p.host_ip),
-            p.host,
-            p.container
-        );
-        let publish = match p.protocol {
-            network::PortProtocol::Tcp => base,
-            network::PortProtocol::Udp => format!("{base}/udp"),
-        };
-        args.extend(["--publish".to_string(), publish]);
+        args.extend(["--publish".to_string(), p.to_string()]);
     }
     for v in &a.volumes {
         args.extend(["--volume".to_string(), v.raw.clone()]);
@@ -7912,7 +7902,7 @@ mod tests {
                 "--env",
                 "MODE=prod",
                 "--publish",
-                "0.0.0.0:8080:80",
+                "8080:80",
                 "--label",
                 "tier=prod",
                 "alpine",

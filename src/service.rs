@@ -218,7 +218,7 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
     }
     for p in &a.ports {
         run_args.push("--publish".into());
-        run_args.push(format!("{}:{}", p.host, p.container));
+        run_args.push(p.to_string());
     }
     for p in &a.exposed_ports {
         run_args.push("--expose".into());
@@ -571,8 +571,21 @@ mod tests {
         assert!(unit.contains("--net bridge"));
         assert!(unit.contains("--publish 8080:80"));
         assert!(unit.contains("alpine -- echo hello\n"));
-        assert!(unit.contains("--publish 8080:80"));
         assert!(unit.contains("WantedBy=multi-user.target"));
+    }
+
+    #[test]
+    fn renders_published_port_address_and_protocol() {
+        let a = args(&[
+            "--net",
+            "bridge",
+            "-p",
+            "127.0.0.1:5353:53/udp",
+            "alpine",
+            "true",
+        ]);
+        let unit = render(Path::new("/usr/local/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains("--publish 127.0.0.1:5353:53/udp"));
     }
 
     #[test]
