@@ -186,6 +186,7 @@ where
         || spec.limits.memory_reservation.is_some()
         || spec.limits.memory_swap.is_some()
         || spec.limits.cpus.is_some()
+        || spec.limits.cpu_shares.is_some()
         || spec.limits.cpuset_cpus.is_some()
         || spec.limits.cpuset_mems.is_some()
         || spec.limits.pids.is_some()

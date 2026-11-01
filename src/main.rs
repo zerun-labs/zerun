@@ -142,6 +142,8 @@ struct RunArgs {
     /// Docker-style total memory+swap; -1/unlimited.
     memory_swap: Option<i64>,
     cpus: Option<f64>,
+    /// Docker-compatible relative CPU weight (`--cpu-shares`).
+    cpu_shares: Option<u64>,
     cpuset_cpus: Option<String>,
     cpuset_mems: Option<String>,
     pids: Option<i64>,
@@ -325,6 +327,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             "--cpus" => {
                 let v = next_value(args, &mut i, "--cpus")?;
                 a.cpus = Some(cgroup::parse_cpus(&v).map_err(|e| e.to_string())?);
+            }
+            "--cpu-shares" => {
+                let v = next_value(args, &mut i, "--cpu-shares")?;
+                a.cpu_shares = Some(cgroup::parse_cpu_shares(&v).map_err(|e| e.to_string())?);
             }
             "--cpuset-cpus" => {
                 let v = next_value(args, &mut i, "--cpuset-cpus")?;
@@ -599,6 +605,11 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                     units::parse_size(value)
                         .map_err(|e| format!("invalid --shm-size '{value}': {e}"))?,
                 );
+                i += 1;
+            }
+            other if other.starts_with("--cpu-shares=") => {
+                let value = &other["--cpu-shares=".len()..];
+                a.cpu_shares = Some(cgroup::parse_cpu_shares(value).map_err(|e| e.to_string())?);
                 i += 1;
             }
             other if other.starts_with("--device=") => {
@@ -1418,6 +1429,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
             memory_reservation: a.memory_reservation,
             memory_swap: a.memory_swap,
             cpus: a.cpus,
+            cpu_shares: a.cpu_shares,
             cpuset_cpus: a.cpuset_cpus,
             cpuset_mems: a.cpuset_mems,
             pids: a.pids,
@@ -2081,6 +2093,9 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     }
     if let Some(v) = a.cpus {
         args.extend(["--cpus".to_string(), v.to_string()]);
+    }
+    if let Some(v) = a.cpu_shares {
+        args.extend(["--cpu-shares".to_string(), v.to_string()]);
     }
     if let Some(v) = &a.cpuset_cpus {
         args.extend(["--cpuset-cpus".to_string(), v.clone()]);
@@ -5128,7 +5143,8 @@ fn cmd_update(args: &[String]) -> i32 {
             "-h" | "--help" => {
                 println!(
                     "usage: zerun update [--memory SIZE] [--memory-reservation SIZE] \
-                     [--memory-swap SIZE] [--cpus VALUE] [--cpuset-cpus LIST] \
+                     [--memory-swap SIZE] [--cpus VALUE] [--cpu-shares SHARES] \
+                     [--cpuset-cpus LIST] \
                      [--cpuset-mems LIST] [--pids N] \
                      [--device-read-bps DEV:BYTES] [--device-write-bps DEV:BYTES] \
                      [--device-read-iops DEV:COUNT] [--device-write-iops DEV:COUNT] \
@@ -5180,6 +5196,22 @@ fn cmd_update(args: &[String]) -> i32 {
                     }
                     Err(e) => {
                         eprintln!("zerun update: invalid --cpus '{v}': {e}");
+                        return 2;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("zerun update: {e}");
+                    return 2;
+                }
+            },
+            "--cpu-shares" => match next_value(args, &mut i, a) {
+                Ok(v) => match cgroup::parse_cpu_shares(&v) {
+                    Ok(shares) => {
+                        limits.cpu_shares = Some(shares);
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("zerun update: invalid --cpu-shares '{v}': {e}");
                         return 2;
                     }
                 },
@@ -5322,6 +5354,7 @@ fn cmd_update(args: &[String]) -> i32 {
         && limits.memory_reservation.is_none()
         && limits.memory_swap.is_none()
         && limits.cpus.is_none()
+        && limits.cpu_shares.is_none()
         && limits.cpuset_cpus.is_none()
         && limits.cpuset_mems.is_none()
         && limits.pids.is_none()
@@ -7007,6 +7040,7 @@ RUN OPTIONS:\n  \
   --memory-reservation 64M    cgroup v2 memory.high soft limit\n  \
   --memory-swap 128M  total memory+swap ceiling (-1 = unlimited)\n  \
   --cpus 0.5          cgroup v2 cpu.max (cores)\n  \
+  --cpu-shares 512    relative CPU weight (Docker-compatible shares)\n  \
   --cpuset-cpus 0-3   pin CPUs (cgroups v2 cpuset.cpus)\n  \
   --cpuset-mems 0     pin memory nodes (cgroups v2 cpuset.mems)\n  \
   --pids 256          cgroup v2 pids.max\n  \
@@ -8175,10 +8209,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_and_launches_cpuset_limits() {
+    fn parses_and_launches_cpu_limits() {
         let args: Vec<_> = [
             "--cpus",
             "0.5",
+            "--cpu-shares",
+            "2048",
             "--cpuset-cpus",
             "0-3,8",
             "--cpuset-mems",
@@ -8191,16 +8227,22 @@ mod tests {
         .collect();
         let a = parse_run_args(&args).expect("valid cpuset flags");
         assert_eq!(a.cpus, Some(0.5));
+        assert_eq!(a.cpu_shares, Some(2048));
         assert_eq!(a.cpuset_cpus.as_deref(), Some("0-3,8"));
         assert_eq!(a.cpuset_mems.as_deref(), Some("0"));
         let launch_args = detached_launch_args(&a, Path::new("/tmp/rootfs"));
         assert!(launch_args.contains(&"--cpus".to_string()));
         assert!(launch_args.contains(&"0.5".to_string()));
+        assert!(launch_args
+            .windows(2)
+            .any(|pair| pair == ["--cpu-shares", "2048"]));
         assert!(launch_args.contains(&"--cpuset-cpus".to_string()));
         assert!(launch_args.contains(&"0-3,8".to_string()));
         assert!(launch_args.contains(&"--cpuset-mems".to_string()));
         assert!(launch_args.contains(&"0".to_string()));
         assert!(cgroup::parse_cpuset("4-2").is_err());
+        assert!(cgroup::parse_cpu_shares("1").is_err());
+        assert!(cgroup::parse_cpu_shares("262145").is_err());
     }
 
     #[test]

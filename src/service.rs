@@ -67,6 +67,10 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--cpus".into());
         run_args.push(v.to_string());
     }
+    if let Some(v) = a.cpu_shares {
+        run_args.push("--cpu-shares".into());
+        run_args.push(v.to_string());
+    }
     if let Some(v) = &a.cpuset_cpus {
         run_args.push("--cpuset-cpus".into());
         run_args.push(v.clone());
@@ -592,6 +596,13 @@ mod tests {
         let a = args(&["--device", "/dev/null:r", "alpine", "true"]);
         let error = render(Path::new("/usr/local/bin/zerun"), &a, false).unwrap_err();
         assert!(error.contains("permission subsets require rootful"));
+    }
+
+    #[test]
+    fn renders_cpu_shares() {
+        let a = args(&["--cpu-shares", "512", "alpine", "true"]);
+        let unit = render(Path::new("/usr/local/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains("--cpu-shares 512"));
     }
 
     #[test]

@@ -24,6 +24,8 @@ pub struct ResourceLimits {
     pub memory_swap: Option<i64>,
     /// CPU cores (fractional), e.g. 0.5 -> cpu.max "50000 100000".
     pub cpus: Option<f64>,
+    /// Docker-compatible v1 CPU shares, translated to cgroup v2 `cpu.weight`.
+    pub cpu_shares: Option<u64>,
     /// CPU list bound to `cpuset.cpus`, e.g. "0-3" or "0,2".
     pub cpuset_cpus: Option<String>,
     /// Memory-node list bound to `cpuset.mems`, e.g. "0".
@@ -197,7 +199,7 @@ impl CgroupV2 {
         {
             require_controller(parent, "memory")?;
         }
-        if limits.cpus.is_some() {
+        if limits.cpus.is_some() || limits.cpu_shares.is_some() {
             require_controller(parent, "cpu")?;
         }
         if limits.pids.is_some() {
@@ -438,6 +440,9 @@ fn plan_limit_writes(
     if let Some(cpus) = limits.cpus {
         writes.push(("cpu.max", format!("{} 100000", cpu_quota(cpus)?)));
     }
+    if let Some(shares) = limits.cpu_shares {
+        writes.push(("cpu.weight", cpu_weight(shares)?.to_string()));
+    }
     if let Some(cpuset) = &limits.cpuset_cpus {
         writes.push(("cpuset.cpus", parse_cpuset(cpuset)?));
     }
@@ -662,6 +667,39 @@ fn parse_positive_byte_size(value: &str) -> ZResult<u64> {
         return Err(crate::zerr!("byte size must be greater than zero"));
     }
     Ok(bytes)
+}
+
+/// Parse Docker's `--cpu-shares` value. Zero means the default relative
+/// weight; non-zero values use the historical cgroup v1 range.
+pub fn parse_cpu_shares(value: &str) -> ZResult<u64> {
+    let shares = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| crate::zerr!("cannot parse cpu shares: '{value}'"))?;
+    if shares != 0 && !(2..=262_144).contains(&shares) {
+        return Err(crate::zerr!(
+            "cpu shares must be 0 or between 2 and 262144, got {shares}"
+        ));
+    }
+    Ok(shares)
+}
+
+/// Translate cgroup v1 shares to cgroup v2's 1..10000 weight range using the
+/// same piecewise mapping as OCI/runc. An explicit zero resets the default.
+fn cpu_weight(shares: u64) -> ZResult<u64> {
+    if shares == 0 {
+        return Ok(100);
+    }
+    if !(2..=262_144).contains(&shares) {
+        return Err(crate::zerr!(
+            "cpu shares must be between 2 and 262144, got {shares}"
+        ));
+    }
+    Ok(if shares >= 1024 {
+        1 + (shares - 2) * 9999 / 262_142
+    } else {
+        1 + (shares - 2) * 9998 / 1022
+    })
 }
 
 /// Validate a cgroups v2 CPU/memory-node list (`cpuset.cpus` or `cpuset.mems`).
@@ -1008,6 +1046,34 @@ mod tests {
         assert!(parse_size("-1M").is_err());
         assert!(parse_size("1..5M").is_err());
         assert!(parse_size("18446744073709551616").is_err());
+    }
+
+    #[test]
+    fn translates_cpu_shares_to_cgroup_v2_weight() {
+        assert_eq!(parse_cpu_shares("0").unwrap(), 0);
+        assert_eq!(parse_cpu_shares("2").unwrap(), 2);
+        assert_eq!(parse_cpu_shares("1024").unwrap(), 1024);
+        assert_eq!(parse_cpu_shares("262144").unwrap(), 262_144);
+        assert!(parse_cpu_shares("1").is_err());
+        assert!(parse_cpu_shares("262145").is_err());
+        assert!(parse_cpu_shares("-1").is_err());
+        assert_eq!(cpu_weight(0).unwrap(), 100);
+        assert_eq!(cpu_weight(2).unwrap(), 1);
+        assert_eq!(cpu_weight(1024).unwrap(), 39);
+        assert_eq!(cpu_weight(2048).unwrap(), 79);
+        assert_eq!(cpu_weight(262_144).unwrap(), 10_000);
+    }
+
+    #[test]
+    fn cpu_share_plan_writes_cgroup_v2_weight() {
+        let limits = ResourceLimits {
+            cpu_shares: Some(2048),
+            ..ResourceLimits::default()
+        };
+        assert_eq!(
+            plan_limit_writes(&limits, None, None).unwrap(),
+            vec![("cpu.weight", "79".to_string())]
+        );
     }
 
     #[test]

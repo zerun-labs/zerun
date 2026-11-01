@@ -203,6 +203,8 @@ Run options (current subset):
                      cgroup v2 memory.high soft limit
 --memory-swap 128M   total memory+swap ceiling; -1/unlimited
 --cpus 0.5           cgroup v2 cpu.max (cores)
+--cpu-shares 512     relative CPU weight via cgroup v2 cpu.weight
+                     (Docker-compatible 2-262144 shares; 0 restores the default)
 --cpuset-cpus 0-3    pin CPUs (cgroups v2 cpuset.cpus)
 --cpuset-mems 0      pin memory nodes (cgroups v2 cpuset.mems)
 --pids 256           cgroup v2 pids.max
@@ -291,8 +293,8 @@ repeated type uses its last value. Detached restart and `exec` restore the
 persisted limits; raising a hard limit above the host ceiling still requires
 the corresponding host privilege and otherwise fails explicitly.
 
-`zerun update` can change memory, CPU, cpuset, PID, OOM-group, and per-device I/O
-limits on a running detached container. I/O updates merge into the current `io.max` view,
+`zerun update` can change memory, CPU quota and shares, cpuset, PID, OOM-group,
+and per-device I/O limits on a running detached container. I/O updates merge into the current `io.max` view,
 so changing one device or direction leaves the other kernel limits intact; `restart`
 returns to the limits captured at launch.
 

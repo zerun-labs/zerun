@@ -353,9 +353,15 @@ grep -Fx 'soft=64 hard=96' <<<"$ulimit_output" >/dev/null
 # Detached exec must join the same cgroup as the container. This also guards
 # the persisted cgroup-path validation used by the exec joiner.
 exec_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
-  --pids 32 --ulimit nofile=64:96 --group-add testgroup --init -- \
+  --pids 32 --cpu-shares 2048 --ulimit nofile=64:96 --group-add testgroup --init -- \
   /bin/sh -c 'sleep 30')
 cleanup_ids+=("$exec_id")
+exec_cgroup=$("${zerun[@]}" inspect "$exec_id" |
+  sed -n 's/^  "cgroup": "\([^"]*\)".*/\1/p')
+test -n "$exec_cgroup"
+test "$(cat "$exec_cgroup/cpu.weight")" = 79
+"${zerun[@]}" update --cpu-shares 4096 "$exec_id"
+test "$(cat "$exec_cgroup/cpu.weight")" = 157
 exec_output=$("${zerun[@]}" exec "$exec_id" /bin/sh -c 'printf "exec-ok\\n"')
 grep -Fx exec-ok <<<"$exec_output" >/dev/null
 exec_limits=$("${zerun[@]}" exec "$exec_id" /bin/sh -c \
