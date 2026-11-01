@@ -227,8 +227,9 @@ impl CgroupV2 {
             .map_err(|e| crate::zerr!("write {} = {} failed: {e}", p.display(), value))
     }
 
-    /// Write the cloned init PID into cgroup.procs right after clone.
-    /// The child may already have exited (e.g. /bin/true): ESRCH/ENOENT is normal.
+    /// Write the parked workload PID into cgroup.procs immediately after the
+    /// supervisor forks it. The worker may already have exited: ESRCH/ENOENT is
+    /// normal for callers on non-launch paths.
     pub fn attach(&self, pid: i32) -> ZResult<()> {
         match fs::write(self.path.join("cgroup.procs"), pid.to_string()) {
             Ok(_) => Ok(()),

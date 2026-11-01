@@ -1,10 +1,11 @@
 //! Isolation orchestration.
 //!
 //! Parent: create cgroup -> fork a short-lived supervisor -> the supervisor
-//! enters the requested namespaces and forks the workload -> write cgroup.procs
-//! -> forward signals -> wait. Child: mount/pivot -> pseudo-fs -> (bridge:
-//! net-ready sync + container-side network config) -> security hardening ->
-//! execve (or run the built-in mini-init first).
+//! enters the requested namespaces and forks the workload -> attach the parked
+//! worker to cgroup.procs and assemble host networking -> release the worker ->
+//! forward signals -> wait. Worker: mount/pivot -> pseudo-fs -> (bridge:
+//! container-side network config) -> security hardening -> execve (or run the
+//! built-in mini-init first).
 //!
 //! For `--net bridge` a second pipe synchronizes networking between parent and
 //! child: the parent builds the bridge/veth and moves the peer into the child's
@@ -216,6 +217,11 @@ where
         None
     };
 
+    // The worker must not begin mount or security setup until the parent has
+    // attached it to the configured cgroup. This closes the race where a very
+    // fast workload could run before its resource limits were effective.
+    let (start_gate_r, start_gate_w) = syscalls::pipe2_cloexec()?;
+
     // Bridge mode needs a second pipe (parent -> child) so the child does not
     // exec before the veth peer has been moved into its netns. See module docs.
     let net_sync = if matches!(spec.net, NetMode::Bridge) {
@@ -279,6 +285,8 @@ where
         ChildIpc {
             err_w,
             err_r,
+            start_gate_r,
+            start_gate_w,
             net_sync,
             tty_slave: slave,
         },
@@ -295,6 +303,8 @@ where
             // long-lived detached reaper can retry without leaking resources.
             syscalls::close(err_r);
             syscalls::close(err_w);
+            syscalls::close(start_gate_r);
+            syscalls::close(start_gate_w);
             if let Some((net_r, net_w)) = net_sync {
                 syscalls::close(net_r);
                 syscalls::close(net_w);
@@ -316,8 +326,33 @@ where
 
     // The parent keeps neither the write end nor the child end of the error pipe.
     syscalls::close(err_w);
+    syscalls::close(start_gate_r);
     TARGET_STOP_SIGNAL.store(spec.stop_signal, Ordering::Relaxed);
     TARGET_CHILD.store(pid, Ordering::Relaxed);
+
+    // Attach the parked worker before it performs any workload setup. The
+    // supervisor reports the worker PID immediately but the worker blocks on
+    // start_gate_w until this succeeds.
+    if let Some(cgroup) = &cg {
+        if let Err(error) = cgroup.attach(pid) {
+            syscalls::close(start_gate_w);
+            syscalls::close(err_r);
+            if let Some((net_r, net_w)) = net_sync {
+                syscalls::close(net_r);
+                syscalls::close(net_w);
+            }
+            let _ = syscalls::kill(pid, libc::SIGKILL);
+            let _ = wait_child(supervisor_pid);
+            if let Err(cleanup_error) = cgroup.kill_all() {
+                eprintln!("zerun: warning: terminate cgroup after attach failure: {cleanup_error}");
+            }
+            if let Some(cg) = cg {
+                cg.cleanup();
+            }
+            release_bridge_ip(&spec);
+            return Err(error);
+        }
+    }
 
     // Bridge mode: build the host side now. The child is parked on the net-ready
     // pipe, so the veth peer can be moved into its netns before it execs. On
@@ -341,16 +376,41 @@ where
         syscalls::close(net_w);
     }
 
-    // Write cgroup.procs (the child may already have exited; attach ignores ESRCH).
-    if let Some(cg) = &cg {
-        cg.attach(pid)?;
-    }
-
     // Forward terminal signals to the container PID 1.
     for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
         if let Err(error) = install_forward(signal) {
             eprintln!("zerun: warning: install signal forwarder: {error}");
         }
+    }
+
+    // The worker is attached and any bridge setup result is queued. Let it
+    // proceed into child setup and then wait for the error-pipe handshake.
+    let start_result = syscalls::write_all_fd(start_gate_w, &[1]);
+    syscalls::close(start_gate_w);
+    if let Err(error) = start_result {
+        syscalls::close(err_r);
+        if let Some((net_r, net_w)) = net_sync {
+            syscalls::close(net_r);
+            syscalls::close(net_w);
+        }
+        let _ = syscalls::kill(pid, libc::SIGKILL);
+        let _ = wait_child(supervisor_pid);
+        reap_host_pid_descendants(spec.namespaces);
+        if let Some(net) = &host_net {
+            crate::network::teardown_host_side(net);
+        }
+        if let Some(cg) = &cg {
+            if let Err(cleanup_error) = cg.kill_all() {
+                eprintln!(
+                    "zerun: warning: terminate cgroup after start-gate failure: {cleanup_error}"
+                );
+            }
+        }
+        if let Some(cg) = cg {
+            cg.cleanup();
+        }
+        release_bridge_ip(&spec);
+        return Err(error);
     }
 
     // Block on the error pipe: EOF means the child successfully exec'd
@@ -554,6 +614,10 @@ fn release_bridge_ip(spec: &RunSpec) {
 struct ChildIpc {
     err_w: RawFd,
     err_r: RawFd,
+    /// Parent -> worker release gate. The worker remains parked until the
+    /// parent has attached it to its cgroup and assembled host networking.
+    start_gate_r: RawFd,
+    start_gate_w: RawFd,
     net_sync: Option<(RawFd, RawFd)>,
     tty_slave: RawFd,
 }
@@ -658,6 +722,7 @@ fn supervisor_main(
         Err(error) => supervisor_fail(status_w, &error),
     };
     if worker_pid == 0 {
+        syscalls::close(ipc.start_gate_w);
         syscalls::close(status_w);
         // The supervisor ignores terminal signals so it can outlive the
         // runtime parent's signal-forwarding window. The workload must not
@@ -679,6 +744,8 @@ fn supervisor_main(
         }
     }
 
+    syscalls::close(ipc.start_gate_r);
+    syscalls::close(ipc.start_gate_w);
     let status = format!("P{worker_pid}\n");
     if let Err(error) = syscalls::write_all_fd(status_w, status.as_bytes()) {
         eprintln!("zerun: report namespaced child: {error}");
@@ -756,7 +823,14 @@ fn child_main(spec: RunSpec, ipc: ChildIpc, identity: ChildIdentity) -> ZResult<
     });
 
     // Report any failure to the parent over the pipe; the worker then exits 1.
-    let result = child_stage(&spec, &identity, ipc.err_w, net_r, ipc.tty_slave);
+    let result = child_stage(
+        &spec,
+        &identity,
+        ipc.err_w,
+        ipc.start_gate_r,
+        net_r,
+        ipc.tty_slave,
+    );
     if let Err(e) = result {
         let msg = format!("{e}");
         let _ = syscalls::write_all_fd(ipc.err_w, msg.as_bytes());
@@ -787,10 +861,16 @@ fn child_stage(
     spec: &RunSpec,
     identity: &ChildIdentity,
     err_w: RawFd,
+    start_gate_r: RawFd,
     net_r: Option<RawFd>,
     tty_slave: RawFd,
 ) -> ZResult<()> {
-    // 0. Put the container on the requested PTY before other stages can emit
+    // 0. Wait until the parent has attached this worker to its cgroup and
+    // finished host-side launch preparation.
+    wait_for_parent_start(start_gate_r)?;
+    syscalls::close(start_gate_r);
+
+    // Put the container on the requested PTY before other stages can emit
     // diagnostics; make it the session's controlling terminal so shells/signals
     // behave normally.
     if tty_slave >= 0 {
@@ -804,7 +884,7 @@ fn child_stage(
         syscalls::redirect_stdin_devnull()?;
     }
 
-    // 0. rootless: the user-namespace mapping was written by the single-
+    // rootless: the user-namespace mapping was written by the single-
     // threaded supervisor before forking this worker, so this child already
     // has its in-namespace credentials.
     if identity.rootless && std::env::var_os("ZERUN_DEBUG").is_some() {
@@ -1007,6 +1087,25 @@ fn write_self_id_mapping(host_euid: u32, host_egid: u32) -> ZResult<()> {
     Ok(())
 }
 
+/// Wait for the parent to release the worker start gate.
+///
+/// The parent writes one byte only after cgroup attachment and host-side
+/// network setup. EOF means the parent abandoned startup before the worker was
+/// allowed to touch the rootfs.
+fn wait_for_parent_start(fd: RawFd) -> ZResult<()> {
+    let mut release = [0u8; 1];
+    let n = read_all(fd, &mut release)?;
+    if n == 0 {
+        return Err(crate::zerr!("runtime parent closed the worker start gate"));
+    }
+    if release[0] != 1 {
+        return Err(crate::zerr!(
+            "runtime parent sent an invalid worker start-gate byte"
+        ));
+    }
+    Ok(())
+}
+
 /// Wait for the parent's net-ready signal over `fd`.
 ///
 /// Protocol: a single `0` byte means the host side (bridge/veth) is ready; a
@@ -1114,6 +1213,26 @@ mod tests {
         assert_ne!(flags & libc::CLONE_NEWNS, 0);
         assert_ne!(flags & libc::CLONE_NEWCGROUP, 0);
         assert_ne!(flags & libc::CLONE_NEWUSER, 0);
+    }
+
+    #[test]
+    fn worker_start_gate_requires_an_explicit_release_byte() {
+        let (read_fd, write_fd) = syscalls::pipe2_cloexec().unwrap();
+        syscalls::write_all_fd(write_fd, &[1]).unwrap();
+        syscalls::close(write_fd);
+        assert!(wait_for_parent_start(read_fd).is_ok());
+        syscalls::close(read_fd);
+
+        let (read_fd, write_fd) = syscalls::pipe2_cloexec().unwrap();
+        syscalls::write_all_fd(write_fd, &[2]).unwrap();
+        syscalls::close(write_fd);
+        assert!(wait_for_parent_start(read_fd).is_err());
+        syscalls::close(read_fd);
+
+        let (read_fd, write_fd) = syscalls::pipe2_cloexec().unwrap();
+        syscalls::close(write_fd);
+        assert!(wait_for_parent_start(read_fd).is_err());
+        syscalls::close(read_fd);
     }
 
     #[test]
