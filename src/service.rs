@@ -210,6 +210,14 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--dns".into());
         run_args.push(v.clone());
     }
+    for v in &a.dns_search {
+        run_args.push("--dns-search".into());
+        run_args.push(v.clone());
+    }
+    for v in &a.dns_options {
+        run_args.push("--dns-option".into());
+        run_args.push(v.clone());
+    }
     for v in &a.add_hosts {
         run_args.push("--add-host".into());
         run_args.push(v.render());
@@ -350,12 +358,6 @@ fn validate(a: &RunArgs, rootful: bool) -> Result<(), String> {
     if a.no_overlay && a.tmpfs_upper {
         return Err("--tmpfs-upper requires the writable overlay; remove --no-overlay".into());
     }
-    if !a.ports.is_empty() && a.net != NetMode::Bridge {
-        return Err("-p/--publish requires --net bridge".into());
-    }
-    if !a.dns.is_empty() && a.net != NetMode::Bridge {
-        return Err("--dns requires --net bridge".into());
-    }
     let effective_net = if a.net_specified {
         a.net
     } else if rootful {
@@ -363,6 +365,14 @@ fn validate(a: &RunArgs, rootful: bool) -> Result<(), String> {
     } else {
         NetMode::None
     };
+    if !a.ports.is_empty() && effective_net != NetMode::Bridge {
+        return Err("-p/--publish requires --net bridge".into());
+    }
+    if (!a.dns.is_empty() || !a.dns_search.is_empty() || !a.dns_options.is_empty())
+        && effective_net != NetMode::Bridge
+    {
+        return Err("DNS options require --net bridge".into());
+    }
     if !a.add_hosts.is_empty() && effective_net == NetMode::Host {
         return Err("--add-host cannot be used with --net host".into());
     }
@@ -584,6 +594,24 @@ mod tests {
         let a = args(&["--ipc=none", "alpine", "true"]);
         let unit = render(Path::new("/usr/local/bin/zerun"), &a, true).unwrap();
         assert!(unit.contains("--ipc none"));
+    }
+
+    #[test]
+    fn renders_dns_search_domains_and_options() {
+        let a = args(&[
+            "--dns=1.1.1.1",
+            "--dns-search=svc.local",
+            "--dns-option=ndots:2",
+            "alpine",
+            "true",
+        ]);
+        let unit = render(Path::new("/usr/local/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains("--dns 1.1.1.1"));
+        assert!(unit.contains("--dns-search svc.local"));
+        assert!(unit.contains("--dns-option ndots:2"));
+
+        let error = render(Path::new("/usr/local/bin/zerun"), &a, false).unwrap_err();
+        assert!(error.contains("require --net bridge"));
     }
 
     #[test]

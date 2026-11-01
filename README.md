@@ -37,8 +37,9 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   (10.88.0.1/24) and a per-container veth pair with container-side `eth0` and a default
   route (verified: host ↔ container reachable). Per-container egress NAT via nf_tables
   (pure netlink, shared `zerun-nat` subnet rule), `-p [ADDR:]HOST[:CONTAINER][/tcp|/udp]` publishing through a built-in userland
-  proxy (Docker's docker-proxy in-binary), `--dns` / host resolv.conf inheritance, and
-  repeatable `--add-host NAME:IP` aliases (including `host-gateway`).
+  proxy (Docker's docker-proxy in-binary), `--dns` / host resolv.conf inheritance,
+  `--dns-search` / `--dns-option` resolver controls, and repeatable
+  `--add-host NAME:IP` aliases (including `host-gateway`).
 - **M5 — detached lifecycle (done)**: `run -d` forks a tiny per-container reaper that
   redirects stdio to `console.log` and persists state to disk;
   `ps [-a] [-q] [--format table|json] [--filter KEY=VALUE]`, `start`, `pause`, `unpause`, `stop`, `restart`,
@@ -230,6 +231,12 @@ Run options (current subset):
                      publish a TCP (default) or UDP port; ADDR supports IPv4 and
                      bracketed IPv6 bind addresses (for example 127.0.0.1 or [::1])
 --add-host HOST:IP  add an /etc/hosts entry (repeatable; IP or host-gateway)
+--dns IP            container DNS server (repeatable/comma-separated; bridge mode;
+                    defaults to the host's)
+--dns-search DOMAIN resolver search domain (repeatable/comma-separated;
+                    defaults to the host's)
+--dns-option OPTION resolver option such as ndots:2 (repeatable/comma-separated;
+                    defaults to the host's)
 --init               run built-in mini-init (reap orphans, forward signals)
 --seccomp default|unconfined   seccomp policy (default: deny-by-default allowlist)
 --cap-add CAP|ALL              add capabilities to the default set (repeatable/comma-separated)

@@ -688,6 +688,15 @@ bridge_output=$("${zerun[@]}" run --rootfs "$rootfs" --net bridge --no-overlay -
   /bin/sh -c '/bin/busybox ip -4 addr show dev eth0 | /bin/busybox grep -q "10.88.0."; printf "bridge-ok\\n"')
 grep -Fx bridge-ok <<<"$bridge_output" >/dev/null
 
+# Bridge resolv.conf injection accepts explicit search domains and options
+# without exposing them to the source rootfs.
+dns_output=$("${zerun[@]}" run --rootfs "$rootfs" --net bridge \
+  --dns 203.0.113.53 --dns-search svc.local --dns-search corp.example \
+  --dns-option ndots:2 --dns-option rotate -- /bin/cat /etc/resolv.conf)
+grep -Fx 'nameserver 203.0.113.53' <<<"$dns_output" >/dev/null
+grep -Fx 'search svc.local corp.example' <<<"$dns_output" >/dev/null
+grep -Fx 'options ndots:2 rotate' <<<"$dns_output" >/dev/null
+
 # The detached reaper owns logging and port-proxy threads before it starts a
 # namespace child. Repeated starts guard the supervisor/worker split that keeps
 # those threads' locks from being inherited by the workload process.

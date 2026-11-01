@@ -26,6 +26,7 @@ mod procinfo;
 mod prompt;
 mod psfilter;
 mod pty;
+mod resolv;
 mod restart;
 mod rlimit;
 mod seccomp;
@@ -197,6 +198,10 @@ struct RunArgs {
     ports: Vec<network::PublishedPort>,
     volumes: Vec<mounts::BindMount>,
     dns: Vec<String>,
+    /// `--dns-search DOMAIN`: bridge-mode resolver search domains.
+    dns_search: Vec<String>,
+    /// `--dns-option OPTION`: bridge-mode resolver options.
+    dns_options: Vec<String>,
     /// `--add-host NAME:ADDRESS` entries written to the container `/etc/hosts`.
     add_hosts: Vec<network::HostAlias>,
     labels: BTreeMap<String, String>,
@@ -494,9 +499,15 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--dns" => {
                 let v = next_value(args, &mut i, "--dns")?;
-                v.parse::<std::net::IpAddr>()
-                    .map_err(|_| format!("invalid --dns address '{v}'"))?;
-                a.dns.push(v);
+                append_dns_servers(&mut a.dns, &v)?;
+            }
+            "--dns-search" => {
+                let v = next_value(args, &mut i, "--dns-search")?;
+                append_dns_search(&mut a.dns_search, &v)?;
+            }
+            "--dns-option" | "--dns-opt" => {
+                let v = next_value(args, &mut i, "--dns-option")?;
+                append_dns_options(&mut a.dns_options, &v)?;
             }
             "--add-host" => {
                 let v = next_value(args, &mut i, "--add-host")?;
@@ -581,6 +592,26 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 a.namespaces.ipc = state::IpcMode::parse(&other["--ipc=".len()..])?;
                 i += 1;
             }
+            other if other.starts_with("--dns=") => {
+                let value = &other["--dns=".len()..];
+                append_dns_servers(&mut a.dns, value)?;
+                i += 1;
+            }
+            other if other.starts_with("--dns-search=") => {
+                let value = &other["--dns-search=".len()..];
+                append_dns_search(&mut a.dns_search, value)?;
+                i += 1;
+            }
+            other if other.starts_with("--dns-option=") => {
+                let value = &other["--dns-option=".len()..];
+                append_dns_options(&mut a.dns_options, value)?;
+                i += 1;
+            }
+            other if other.starts_with("--dns-opt=") => {
+                let value = &other["--dns-opt=".len()..];
+                append_dns_options(&mut a.dns_options, value)?;
+                i += 1;
+            }
             other if other.starts_with("--uts=") => {
                 a.namespaces.uts = state::NamespaceMode::parse("--uts", &other["--uts=".len()..])?;
                 i += 1;
@@ -637,6 +668,27 @@ fn append_group_additions(target: &mut Vec<String>, raw: &str) -> Result<(), Str
         if !target.contains(&group) {
             target.push(group);
         }
+    }
+    Ok(())
+}
+
+fn append_dns_servers(target: &mut Vec<String>, raw: &str) -> Result<(), String> {
+    for value in raw.split(',') {
+        target.push(resolv::parse_nameserver(value).map_err(|e| format!("--dns: {e}"))?);
+    }
+    Ok(())
+}
+
+fn append_dns_search(target: &mut Vec<String>, raw: &str) -> Result<(), String> {
+    for value in raw.split(',') {
+        target.push(resolv::parse_search_domain(value).map_err(|e| format!("--dns-search: {e}"))?);
+    }
+    Ok(())
+}
+
+fn append_dns_options(target: &mut Vec<String>, raw: &str) -> Result<(), String> {
+    for value in raw.split(',') {
+        target.push(resolv::parse_option(value).map_err(|e| format!("--dns-option: {e}"))?);
     }
     Ok(())
 }
@@ -855,8 +907,10 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
              -t still allocates a terminal for the workload)"
         );
     }
-    if !a.dns.is_empty() && a.net != NetMode::Bridge {
-        eprintln!("zerun: warning: --dns only applies to --net bridge; ignoring");
+    if (!a.dns.is_empty() || !a.dns_search.is_empty() || !a.dns_options.is_empty())
+        && a.net != NetMode::Bridge
+    {
+        eprintln!("zerun: warning: DNS options only apply to --net bridge; ignoring");
     }
     if a.rootfs.is_none() && a.image.is_none() {
         eprintln!("zerun run: an IMAGE (or --rootfs DIR for legacy mode) is required");
@@ -1249,7 +1303,13 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
             }
         }
     };
-    inject_resolv_conf(a.net, a.dns.as_slice(), container_fs.as_ref());
+    inject_resolv_conf(
+        a.net,
+        &a.dns,
+        &a.dns_search,
+        &a.dns_options,
+        container_fs.as_ref(),
+    );
     let (pivot_root, overlay) = match &container_fs {
         Some(fs) => (
             fs.root().to_path_buf(),
@@ -2102,6 +2162,12 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     for v in &a.dns {
         args.extend(["--dns".to_string(), v.clone()]);
     }
+    for v in &a.dns_search {
+        args.extend(["--dns-search".to_string(), v.clone()]);
+    }
+    for v in &a.dns_options {
+        args.extend(["--dns-option".to_string(), v.clone()]);
+    }
     for v in &a.add_hosts {
         args.extend(["--add-host".to_string(), v.render()]);
     }
@@ -2472,13 +2538,16 @@ fn net_label(net: NetMode) -> String {
 
 /// Give bridge-mode containers a working `/etc/resolv.conf`.
 ///
-/// Docker semantics: explicit `--dns` wins; otherwise the host's nameservers
-/// are inherited. The file is written into the per-run overlay `upper` on the
-/// host side, so it appears in the container's `/etc` once the overlay is
-/// mounted — no bind mounts across the pivot are needed.
+/// Docker semantics: explicit `--dns`, `--dns-search`, and `--dns-option`
+/// values replace their corresponding host lists, while unspecified lists are
+/// inherited. The file is written into the per-run overlay `upper` on the host
+/// side, so it appears in the container's `/etc` once the overlay is mounted —
+/// no bind mounts across the pivot are needed.
 fn inject_resolv_conf(
     net: NetMode,
-    explicit: &[String],
+    explicit_nameservers: &[String],
+    explicit_search: &[String],
+    explicit_options: &[String],
     container_fs: Option<&store::ContainerFs>,
 ) {
     if net != NetMode::Bridge {
@@ -2488,23 +2557,18 @@ fn inject_resolv_conf(
         eprintln!("zerun: warning: --no-overlay has no writable layer; DNS is not injected");
         return;
     };
-    let servers = if !explicit.is_empty() {
-        explicit.to_vec()
-    } else {
-        host_nameservers()
+    let config = match resolv::ResolvConf::effective(
+        explicit_nameservers,
+        explicit_search,
+        explicit_options,
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("zerun: warning: DNS injection: {error}");
+            return;
+        }
     };
-    if servers.is_empty() {
-        return; // no nameserver available; keep the image's resolv.conf
-    }
-    let content = servers
-        .iter()
-        .map(|s| {
-            format!(
-                "nameserver {s}
-"
-            )
-        })
-        .collect::<String>();
+    let content = config.render();
     let etc = fs.upper.join("etc");
     if let Err(e) = fsutil::mkdir_p(&etc) {
         eprintln!("zerun: warning: DNS injection: {e}");
@@ -2513,33 +2577,6 @@ fn inject_resolv_conf(
     if let Err(e) = fsutil::atomic_write(&etc.join("resolv.conf"), content.as_bytes()) {
         eprintln!("zerun: warning: DNS injection: {e}");
     }
-}
-
-/// Nameserver IPs from the host's `/etc/resolv.conf`.
-///
-/// Loopback servers (systemd-resolved's 127.0.0.53) are useless inside a
-/// container netns, so they are skipped; when nothing usable is left we fall
-/// back to public resolvers so `--net bridge` containers get DNS out of the
-/// box even on stub-resolver hosts.
-fn host_nameservers() -> Vec<String> {
-    let mut out = Vec::new();
-    if let Ok(text) = std::fs::read_to_string("/etc/resolv.conf") {
-        for line in text.lines() {
-            let mut it = line.split_whitespace();
-            if it.next() == Some("nameserver") {
-                if let Some(ip) = it.next() {
-                    if !ip.starts_with("127.") && !ip.starts_with("::1") {
-                        out.push(ip.to_string());
-                    }
-                }
-            }
-        }
-    }
-    if out.is_empty() {
-        out.push("1.1.1.1".to_string());
-        out.push("8.8.8.8".to_string());
-    }
-    out
 }
 
 /// Resolve an image for `run`: find it locally or pull it. Returns the
@@ -6863,7 +6900,12 @@ RUN OPTIONS:\n  \
                                       publish a TCP/UDP port (requires --net bridge)\n  \
   -v, --volume HOST|NAME:CONTAINER[:ro]
                                         bind-mount a host path or managed named volume\n  \
-  --dns IP            container DNS server (repeatable; bridge mode; defaults to the host's)\n  \
+  --dns IP            container DNS server (repeatable/comma-separated; bridge mode;\n  \
+                      defaults to the host's)\n  \
+  --dns-search DOMAIN resolver search domain (repeatable/comma-separated;\n  \
+                      defaults to the host's)\n  \
+  --dns-option OPTION resolver option such as ndots:2 (repeatable/comma-separated;\n  \
+                      defaults to the host's)\n  \
   --add-host HOST:IP  add an /etc/hosts entry (repeatable; IP or host-gateway)\n  \
   --init              run the built-in mini-init (reap orphans + forward signals)\n  \
   --seccomp default|unconfined\n  \
@@ -7786,6 +7828,65 @@ mod tests {
             .any(|w| w == ["--add-host", "host.zerun.internal:host-gateway"]));
 
         assert!(parse_run_args(&["--add-host".to_string(), "host:not-an-ip".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parses_and_persists_dns_resolver_options() {
+        let args: Vec<_> = [
+            "--net",
+            "bridge",
+            "--dns=2001:0db8::53,198.51.100.53",
+            "--dns-search",
+            "svc.local",
+            "--dns-search=corp.example,legacy.local",
+            "--dns-option",
+            "ndots:2",
+            "--dns-opt=rotate,edns0",
+            "alpine",
+            "true",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_run_args(&args).expect("valid DNS options");
+        assert_eq!(a.dns, ["2001:db8::53", "198.51.100.53"]);
+        assert_eq!(a.dns_search, ["svc.local", "corp.example", "legacy.local"]);
+        assert_eq!(a.dns_options, ["ndots:2", "rotate", "edns0"]);
+
+        let launch = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--dns", "2001:db8::53"]));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--dns-search", "corp.example"]));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--dns-search", "legacy.local"]));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--dns-option", "rotate"]));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--dns-option", "edns0"]));
+
+        for args in [
+            ["--dns=not-an-ip", "alpine"],
+            ["--dns=1.1.1.1,", "alpine"],
+            ["--dns-search= svc.local", "alpine"],
+            ["--dns-search=bad domain", "alpine"],
+            ["--dns-option=rotate ", "alpine"],
+            ["--dns-option=ndots:2 rotate", "alpine"],
+        ] {
+            let args = args
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>();
+            assert!(
+                parse_run_args(&args).is_err(),
+                "{args:?} should be rejected"
+            );
+        }
     }
 
     #[test]
