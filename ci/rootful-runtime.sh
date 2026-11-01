@@ -90,6 +90,17 @@ printf '%s\n' "$foreground_output"
 test "$foreground_status" -eq 17
 grep -Fx foreground-ok <<<"$foreground_output" >/dev/null
 
+# A failed direct exec must stay on the error pipe until execve succeeds or
+# reports an error. Closing it before exec makes the parent mistake a dead
+# workload for a successful start.
+set +e
+exec_failure_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay -- \
+  /definitely-missing-zerun-command 2>&1)
+exec_failure_status=$?
+set -e
+test "$exec_failure_status" -eq 1
+grep -F "container setup failed: execve failed:" <<<"$exec_failure_output" >/dev/null
+
 # PID/IPC/UTS sharing must be opt-in, and host-shared /dev/shm must be the
 # host's mount rather than a private tmpfs. The default private run is checked
 # against the host namespace identities, not just the visible hostname.

@@ -1012,16 +1012,14 @@ fn child_stage(
     //    /proc/self/exe being visible under the new root). Instead the container
     //    PID 1 directly runs the mini-init logic: it forks the workload (PID 2),
     //    reaps orphans, forwards signals, and _exit()s with the workload code.
-    //    Setup has succeeded at this point, so close the error-pipe write end
-    //    explicitly so the parent's blocking read gets EOF.
-    //    (The direct-exec path relies on O_CLOEXEC; the --init path never execs,
-    //    so it must close the write end manually, otherwise the parent would block
-    //    forever on the sync read.)
-    syscalls::close(err_w);
     trace::mark("child:exec:begin");
     let env = exec_environment(spec);
     let argv = crate::workload::resolve_argv(env.as_deref(), &spec.argv);
     if spec.use_init {
+        // Setup has succeeded at this point, so close the error-pipe write end
+        // explicitly so the parent's blocking read gets EOF. This path never
+        // execs, unlike the direct-exec path where O_CLOEXEC closes the pipe.
+        syscalls::close(err_w);
         let code =
             crate::mini_init::run(&argv, env.as_deref(), spec.hostname.as_deref(), &spec.id)?;
         crate::syscalls::exit_process(code);
