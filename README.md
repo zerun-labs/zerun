@@ -260,6 +260,11 @@ repeated type uses its last value. Detached restart and `exec` restore the
 persisted limits; raising a hard limit above the host ceiling still requires
 the corresponding host privilege and otherwise fails explicitly.
 
+`zerun update` can change memory, CPU, cpuset, PID, OOM-group, and per-device I/O
+limits on a running detached container. I/O updates merge into the current `io.max` view,
+so changing one device or direction leaves the other kernel limits intact; `restart`
+returns to the limits captured at launch.
+
 `--group-add` replaces the inherited supplementary group list, whether the workload
 runs as root or another user. Names are resolved against the container's `/etc/group`
 after `pivot_root`; numeric gids need no group file. Rootless containers deny `setgroups`

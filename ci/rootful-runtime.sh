@@ -501,6 +501,23 @@ grep -q '"paused": true' <<<"$paused_inspect"
 unpaused_inspect=$("${zerun[@]}" inspect "$m7_id")
 grep -q '"paused": false' <<<"$unpaused_inspect"
 "${zerun[@]}" update --pids 16 "$m7_id" >/dev/null
+# io.max is stateful. Updating one direction must not reset a previously
+# configured direction for the same device, and the cgroupfs write must be one
+# device record at a time (a multi-line write is rejected with EINVAL).
+io_device=$(lsblk -ndo MAJ:MIN | head -n 1 | tr -d '[:space:]')
+if [[ $io_device =~ ^[0-9]+:[0-9]+$ ]]; then
+  cgroup_path=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["cgroup"])'     <<<"$inspect_output")
+  "${zerun[@]}" update --device-read-bps "$io_device:1m" "$m7_id" >/dev/null
+  "${zerun[@]}" update --device-write-bps "$io_device:2m" "$m7_id" >/dev/null
+  if (( EUID == 0 )); then
+    io_max=$(cat "$cgroup_path/io.max")
+  else
+    io_max=$(sudo cat "$cgroup_path/io.max")
+  fi
+  grep -Eq "^${io_device} rbps=1048576 wbps=2097152 riops=max wiops=max$" <<<"$io_max"
+else
+  echo "skipping cgroup I/O update check: no block device was discovered" >&2
+fi
 "${zerun[@]}" rename "$m7_id" ci-m7-renamed
 renamed_inspect=$("${zerun[@]}" inspect ci-m7-renamed)
 grep -q '"name": "ci-m7-renamed"' <<<"$renamed_inspect"

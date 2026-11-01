@@ -4838,13 +4838,14 @@ fn human_duration(usec: u64) -> String {
 }
 
 /// `zerun update [opts] CONTAINER` — change cgroup v2 limits of a running
-/// container in place (memory, CPU, cpuset, pids, oom-group).
+/// container in place (memory, CPU, cpuset, pids, I/O, oom-group).
 ///
 /// The container must have been started with at least one resource flag so
 /// its cgroup exists; otherwise there is nothing to update and `restart`
-/// with the desired flags is the safe path. I/O ceilings are not yet
-/// updatable (io.max merges device state), and `restart` reverts to the
-/// launch-time limits captured in `launch_args`.
+/// with the desired flags is the safe path. I/O updates merge with the
+/// kernel's current `io.max`, so only the named devices and directions
+/// change. `restart` still reverts to the launch-time limits captured in
+/// `launch_args`.
 fn cmd_update(args: &[String]) -> i32 {
     let mut limits = cgroup::ResourceLimits::default();
     let mut targets: Vec<&str> = Vec::new();
@@ -4855,8 +4856,10 @@ fn cmd_update(args: &[String]) -> i32 {
             "-h" | "--help" => {
                 println!(
                     "usage: zerun update [--memory SIZE] [--memory-reservation SIZE] \
-                     [--memory-swap SIZE] [--cpuset-cpus LIST] [--cpuset-mems LIST] \
-                     [--pids N] \
+                     [--memory-swap SIZE] [--cpus VALUE] [--cpuset-cpus LIST] \
+                     [--cpuset-mems LIST] [--pids N] \
+                     [--device-read-bps DEV:BYTES] [--device-write-bps DEV:BYTES] \
+                     [--device-read-iops DEV:COUNT] [--device-write-iops DEV:COUNT] \
                      [--oom-group] CONTAINER"
                 );
                 return 0;
@@ -4961,6 +4964,70 @@ fn cmd_update(args: &[String]) -> i32 {
                     return 2;
                 }
             },
+            "--device-read-bps" => match next_value(args, &mut i, a) {
+                Ok(v) => match cgroup::parse_io_limit("device-read-bps", &v) {
+                    Ok(limit) => {
+                        limits.io.push(limit);
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("zerun update: invalid --device-read-bps '{v}': {e}");
+                        return 2;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("zerun update: {e}");
+                    return 2;
+                }
+            },
+            "--device-write-bps" => match next_value(args, &mut i, a) {
+                Ok(v) => match cgroup::parse_io_limit("device-write-bps", &v) {
+                    Ok(limit) => {
+                        limits.io.push(limit);
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("zerun update: invalid --device-write-bps '{v}': {e}");
+                        return 2;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("zerun update: {e}");
+                    return 2;
+                }
+            },
+            "--device-read-iops" => match next_value(args, &mut i, a) {
+                Ok(v) => match cgroup::parse_io_limit("device-read-iops", &v) {
+                    Ok(limit) => {
+                        limits.io.push(limit);
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("zerun update: invalid --device-read-iops '{v}': {e}");
+                        return 2;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("zerun update: {e}");
+                    return 2;
+                }
+            },
+            "--device-write-iops" => match next_value(args, &mut i, a) {
+                Ok(v) => match cgroup::parse_io_limit("device-write-iops", &v) {
+                    Ok(limit) => {
+                        limits.io.push(limit);
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("zerun update: invalid --device-write-iops '{v}': {e}");
+                        return 2;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("zerun update: {e}");
+                    return 2;
+                }
+            },
             "--oom-group" => {
                 limits.oom_group = true;
                 i += 1;
@@ -4986,6 +5053,7 @@ fn cmd_update(args: &[String]) -> i32 {
         && limits.cpuset_cpus.is_none()
         && limits.cpuset_mems.is_none()
         && limits.pids.is_none()
+        && limits.io.is_empty()
         && !limits.oom_group
     {
         eprintln!("zerun update: provide at least one limit to change");

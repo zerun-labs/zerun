@@ -189,7 +189,6 @@ impl CgroupV2 {
             } else {
                 None
             };
-        let writes = plan_limit_writes(limits, current_memory)?;
 
         if limits.memory.is_some()
             || limits.memory_reservation.is_some()
@@ -207,9 +206,21 @@ impl CgroupV2 {
         if limits.cpuset_cpus.is_some() || limits.cpuset_mems.is_some() {
             require_controller(parent, "cpuset")?;
         }
-        if !limits.io.is_empty() {
+
+        // io.max is stateful: writing a subset of devices or dimensions would
+        // reset every omitted device/dimension to "max". Read the kernel view
+        // first and merge updates so a live `update` changes only what the
+        // operator named.
+        let current_io = if limits.io.is_empty() {
+            None
+        } else {
             require_controller(parent, "io")?;
-        }
+            Some(
+                fs::read_to_string(self.path.join("io.max"))
+                    .map_err(|e| crate::zerr!("read current io.max failed: {e}"))?,
+            )
+        };
+        let writes = plan_limit_writes(limits, current_memory, current_io.as_deref())?;
         for (file, value) in writes {
             self.write(file, value)?;
         }
@@ -399,6 +410,7 @@ fn read_populated(path: &Path) -> Option<bool> {
 fn plan_limit_writes(
     limits: &ResourceLimits,
     current_memory: Option<u64>,
+    current_io: Option<&str>,
 ) -> ZResult<Vec<(&'static str, String)>> {
     let mut writes = Vec::new();
     if let Some(mem) = &limits.memory {
@@ -439,7 +451,14 @@ fn plan_limit_writes(
         writes.push(("pids.max", pids.to_string()));
     }
     if !limits.io.is_empty() {
-        writes.push(("io.max", io_max_value(&limits.io)));
+        let current_io = current_io.ok_or_else(|| crate::zerr!("current io.max is unavailable"))?;
+        let merged = merge_io_max(current_io, &limits.io)?;
+        // cgroupfs io.max accepts one complete device record per write. Keep
+        // each line separate even though the merged view is easier to build as
+        // one string; a multi-line write is rejected with EINVAL.
+        for line in merged.lines() {
+            writes.push(("io.max", line.to_string()));
+        }
     }
     if limits.oom_group {
         writes.push(("memory.oom.group", "1".to_string()));
@@ -447,16 +466,99 @@ fn plan_limit_writes(
     Ok(writes)
 }
 
-/// Turn Docker-style device limits into one compact `io.max` value.
-fn io_max_value(limits: &[IoLimit]) -> String {
-    let mut by_device: BTreeMap<String, IoLimit> = BTreeMap::new();
+fn merge_io_limits(by_device: &mut BTreeMap<String, IoLimit>, limits: &[IoLimit]) {
     for limit in limits {
-        let entry = by_device.entry(limit.device.clone()).or_default();
+        let entry = by_device
+            .entry(limit.device.clone())
+            .or_insert_with(|| IoLimit {
+                device: limit.device.clone(),
+                ..IoLimit::default()
+            });
         entry.read_bps = limit.read_bps.or(entry.read_bps);
         entry.write_bps = limit.write_bps.or(entry.write_bps);
         entry.read_iops = limit.read_iops.or(entry.read_iops);
         entry.write_iops = limit.write_iops.or(entry.write_iops);
     }
+}
+
+/// Merge new device limits into the kernel's current `io.max` view.
+///
+/// A cgroup `io.max` write is line-oriented: each supplied device line replaces
+/// the complete four-dimension record for that device. Without this merge,
+/// updating one rate would silently reset unrelated devices or the other
+/// directions to `max`.
+fn merge_io_max(current: &str, updates: &[IoLimit]) -> ZResult<String> {
+    let mut by_device = parse_io_max(current)?;
+    merge_io_limits(&mut by_device, updates);
+    Ok(render_io_limits(by_device))
+}
+
+fn parse_io_max(current: &str) -> ZResult<BTreeMap<String, IoLimit>> {
+    let mut by_device = BTreeMap::new();
+    for (line_index, line) in current.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let device = fields
+            .next()
+            .ok_or_else(|| crate::zerr!("malformed io.max line {}", line_index + 1))?;
+        let device = parse_device(device)?;
+        let mut limit = IoLimit {
+            device: device.clone(),
+            ..IoLimit::default()
+        };
+        let mut seen = [false; 4];
+        for field in fields {
+            let (key, value) = field.split_once('=').ok_or_else(|| {
+                crate::zerr!(
+                    "malformed io.max field '{field}' on line {}",
+                    line_index + 1
+                )
+            })?;
+            let (index, slot) = match key {
+                "rbps" => (0, &mut limit.read_bps),
+                "wbps" => (1, &mut limit.write_bps),
+                "riops" => (2, &mut limit.read_iops),
+                "wiops" => (3, &mut limit.write_iops),
+                _ => {
+                    return Err(crate::zerr!(
+                        "unknown io.max field '{key}' on line {}",
+                        line_index + 1
+                    ))
+                }
+            };
+            if seen[index] {
+                return Err(crate::zerr!(
+                    "duplicate io.max field '{key}' on line {}",
+                    line_index + 1
+                ));
+            }
+            seen[index] = true;
+            *slot = parse_io_max_value(value, line_index + 1, key)?;
+        }
+        if by_device.insert(device.clone(), limit).is_some() {
+            return Err(crate::zerr!(
+                "duplicate io.max device '{device}' on line {}",
+                line_index + 1
+            ));
+        }
+    }
+    Ok(by_device)
+}
+
+fn parse_io_max_value(value: &str, line: usize, key: &str) -> ZResult<Option<u64>> {
+    if value == "max" {
+        return Ok(None);
+    }
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| crate::zerr!("invalid io.max {key} value '{value}' on line {line}"))?;
+    Ok(Some(parsed))
+}
+
+fn render_io_limits(by_device: BTreeMap<String, IoLimit>) -> String {
     by_device
         .into_iter()
         .map(|(device, limit)| {
@@ -798,27 +900,92 @@ mod tests {
 
     #[test]
     fn groups_device_limits_into_io_max() {
-        let value = io_max_value(&[
-            IoLimit {
-                device: "8:48".into(),
-                read_bps: Some(1024),
-                ..IoLimit::default()
-            },
-            IoLimit {
-                device: "8:48".into(),
-                write_iops: Some(20),
-                ..IoLimit::default()
-            },
-            IoLimit {
-                device: "8:16".into(),
-                read_iops: Some(3),
-                ..IoLimit::default()
-            },
-        ]);
+        let value = merge_io_max(
+            "",
+            &[
+                IoLimit {
+                    device: "8:48".into(),
+                    read_bps: Some(1024),
+                    ..IoLimit::default()
+                },
+                IoLimit {
+                    device: "8:48".into(),
+                    write_iops: Some(20),
+                    ..IoLimit::default()
+                },
+                IoLimit {
+                    device: "8:16".into(),
+                    read_iops: Some(3),
+                    ..IoLimit::default()
+                },
+            ],
+        )
+        .unwrap();
         assert_eq!(
             value,
             "8:16 rbps=max wbps=max riops=3 wiops=max\n\
              8:48 rbps=1024 wbps=max riops=max wiops=20"
+        );
+    }
+
+    #[test]
+    fn io_updates_preserve_unmentioned_devices_and_dimensions() {
+        let current = "8:16 rbps=100 wbps=200 riops=max wiops=50\n                       8:32 rbps=10 wbps=max riops=20 wiops=max";
+        let updates = [
+            IoLimit {
+                device: "8:16".into(),
+                read_bps: Some(300),
+                ..IoLimit::default()
+            },
+            IoLimit {
+                device: "8:48".into(),
+                write_iops: Some(7),
+                ..IoLimit::default()
+            },
+        ];
+        assert_eq!(
+            merge_io_max(current, &updates).unwrap(),
+            concat!(
+                "8:16 rbps=300 wbps=200 riops=max wiops=50\n",
+                "8:32 rbps=10 wbps=max riops=20 wiops=max\n",
+                "8:48 rbps=max wbps=max riops=max wiops=7"
+            )
+        );
+        assert!(merge_io_max("not-a-device rbps=1", &[]).is_err());
+        assert!(merge_io_max("8:16 rbps=1 rbps=2", &[]).is_err());
+        assert!(merge_io_max("8:16 rbps=1 unknown=2", &[]).is_err());
+    }
+
+    #[test]
+    fn io_plan_uses_one_cgroup_write_per_device() {
+        let limits = ResourceLimits {
+            io: vec![IoLimit {
+                device: "8:16".into(),
+                write_bps: Some(2048),
+                ..IoLimit::default()
+            }],
+            ..ResourceLimits::default()
+        };
+        let writes = plan_limit_writes(
+            &limits,
+            None,
+            Some(concat!(
+                "8:16 rbps=1024 wbps=max riops=max wiops=max\n",
+                "8:32 rbps=max wbps=4096 riops=max wiops=max"
+            )),
+        )
+        .unwrap();
+        let io_writes: Vec<_> = writes
+            .iter()
+            .filter(|(file, _)| *file == "io.max")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(
+            io_writes,
+            [
+                "8:16 rbps=1024 wbps=2048 riops=max wiops=max",
+                "8:32 rbps=max wbps=4096 riops=max wiops=max"
+            ]
         );
     }
 
@@ -935,6 +1102,39 @@ mod tests {
         assert!(cgroup.apply_limits(&parent, &limits).is_err());
         assert_eq!(std::fs::read(leaf.join("memory.max")).unwrap(), b"max");
         assert!(!leaf.join("memory.swap.max").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn io_update_merges_with_the_existing_io_max_file() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-cgroup-io-merge-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let leaf = root.join("leaf");
+        let parent = root.join("parent");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(parent.join("cgroup.controllers"), b"io").unwrap();
+        let current = "8:16 rbps=100 wbps=200 riops=max wiops=50";
+        std::fs::write(leaf.join("io.max"), current).unwrap();
+
+        let cgroup = CgroupV2::open(&leaf).unwrap();
+        let limits = ResourceLimits {
+            io: vec![IoLimit {
+                device: "8:16".into(),
+                read_bps: Some(300),
+                ..IoLimit::default()
+            }],
+            ..ResourceLimits::default()
+        };
+        cgroup.apply_limits(&parent, &limits).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(leaf.join("io.max")).unwrap(),
+            "8:16 rbps=300 wbps=200 riops=max wiops=50"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
