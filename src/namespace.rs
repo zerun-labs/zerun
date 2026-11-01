@@ -20,8 +20,9 @@
 use crate::cgroup::{CgroupV2, ResourceLimits};
 use crate::error::ZResult;
 use crate::mounts::{
-    make_root_readonly, mount_extra_tmpfs, open_rootless_device_sources, setup_rootfs, BindMount,
-    OverlayPaths, RootfsConfig, TmpfsMount,
+    make_root_readonly, mount_extra_tmpfs, open_requested_device_sources,
+    open_rootless_device_sources, setup_rootfs, BindMount, DeviceMount, OverlayPaths, RootfsConfig,
+    TmpfsMount,
 };
 use crate::pty::PtyPair;
 use crate::seccomp::SeccompMode;
@@ -96,6 +97,8 @@ pub struct RunSpec {
     pub ports: Vec<crate::network::PublishedPort>,
     /// Host bind mounts (simple file/directory volumes).
     pub volumes: Vec<BindMount>,
+    /// Explicit host device nodes (`--device`).
+    pub devices: Vec<DeviceMount>,
     /// Operator-provided names resolved into the container `/etc/hosts`.
     pub hosts: Vec<crate::network::HostEntry>,
     /// Bridge IPv4 assigned by the parent from the file IPAM (set before
@@ -175,6 +178,7 @@ where
     // Create the cgroup on the parent side first (attach right after clone).
     // Detached containers keep one even without limits so pause/unpause can
     // freeze the whole process tree. Rootless hosts without delegation skip it.
+    let needs_device_policy = !rootless && !spec.devices.is_empty();
     let has_limits = spec.limits.memory.is_some()
         || spec.limits.memory_reservation.is_some()
         || spec.limits.memory_swap.is_some()
@@ -183,7 +187,11 @@ where
         || spec.limits.cpuset_mems.is_some()
         || spec.limits.pids.is_some()
         || spec.limits.oom_group
-        || !spec.limits.io.is_empty();
+        || !spec.limits.io.is_empty()
+        // Device permissions are enforced by a cgroup/eBPF allowlist, so an
+        // explicit device request requires a real lifecycle cgroup even when
+        // the operator requested no resource limits.
+        || needs_device_policy;
     // Host PID sharing has no namespace-wide kill boundary. Keep a cgroup
     // where possible so runtime teardown and crash reconciliation can terminate
     // exec workers and other processes that did not descend from the workload.
@@ -221,6 +229,21 @@ where
     // attached it to the configured cgroup. This closes the race where a very
     // fast workload could run before its resource limits were effective.
     let mut start_gate = syscalls::Pipe::new()?;
+
+    // Rootful explicit devices need a second handshake. The child creates the
+    // requested nodes while it still has CAP_MKNOD, then parks before exec;
+    // only then can the parent install the deny-by-default device BPF policy.
+    // Attaching it any earlier would also deny the runtime's own setup mknod.
+    let mut device_policy_ready = if needs_device_policy {
+        Some(syscalls::Pipe::new()?)
+    } else {
+        None
+    };
+    let mut device_policy_release = if needs_device_policy {
+        Some(syscalls::Pipe::new()?)
+    } else {
+        None
+    };
 
     // Bridge mode needs a second pipe (parent -> child) so the child does not
     // exec before the veth peer has been moved into its netns. See module docs.
@@ -281,6 +304,15 @@ where
     let net_sync_fds = net_sync
         .as_ref()
         .map(|pipe| (pipe.read_fd(), pipe.write_fd()));
+    let device_policy_fds = device_policy_ready
+        .as_ref()
+        .zip(device_policy_release.as_ref())
+        .map(|(ready, release)| DevicePolicyIpc {
+            ready_r: ready.read_fd(),
+            ready_w: ready.write_fd(),
+            release_r: release.read_fd(),
+            release_w: release.write_fd(),
+        });
     let child_spec = spec.clone();
     let spawned = match spawn_namespaced_child(
         flags,
@@ -291,6 +323,7 @@ where
             start_gate_r: start_gate.read_fd(),
             start_gate_w: start_gate.write_fd(),
             net_sync: net_sync_fds,
+            device_policy: device_policy_fds,
             tty_slave: slave,
         },
         ChildIdentity {
@@ -320,6 +353,12 @@ where
     // pipe, nor the read end of the start gate.
     err_pipe.close_write();
     start_gate.close_read();
+    if let Some(pipe) = &mut device_policy_ready {
+        pipe.close_write();
+    }
+    if let Some(pipe) = &mut device_policy_release {
+        pipe.close_read();
+    }
     TARGET_STOP_SIGNAL.store(spec.stop_signal, Ordering::Relaxed);
     TARGET_CHILD.store(pid, Ordering::Relaxed);
 
@@ -376,6 +415,82 @@ where
             &mut cg,
         );
         return Err(error);
+    }
+
+    if needs_device_policy {
+        let ready_pipe = device_policy_ready
+            .as_mut()
+            .expect("device policy readiness pipe was created");
+        let mut ready = [0u8; 1];
+        let ready_count = match read_all(ready_pipe.read_fd(), &mut ready) {
+            Ok(count) => count,
+            Err(error) => {
+                ready_pipe.close_read();
+                abort_started_attempt(
+                    &spec,
+                    supervisor_pid,
+                    worker_pidfd.as_ref(),
+                    host_net.as_ref(),
+                    &mut cg,
+                );
+                return Err(error);
+            }
+        };
+        ready_pipe.close_read();
+        if ready_count > 0 {
+            if ready[0] != 1 {
+                abort_started_attempt(
+                    &spec,
+                    supervisor_pid,
+                    worker_pidfd.as_ref(),
+                    host_net.as_ref(),
+                    &mut cg,
+                );
+                return Err(crate::zerr!(
+                    "child sent an invalid device-policy readiness byte"
+                ));
+            }
+            let Some(cgroup) = cg.as_ref() else {
+                let error = crate::zerr!("device policy requires a lifecycle cgroup");
+                abort_started_attempt(
+                    &spec,
+                    supervisor_pid,
+                    worker_pidfd.as_ref(),
+                    host_net.as_ref(),
+                    &mut cg,
+                );
+                return Err(error);
+            };
+            if let Err(error) = crate::device_cgroup::attach(cgroup.path(), &spec.devices) {
+                abort_started_attempt(
+                    &spec,
+                    supervisor_pid,
+                    worker_pidfd.as_ref(),
+                    host_net.as_ref(),
+                    &mut cg,
+                );
+                return Err(error);
+            }
+            let release_pipe = device_policy_release
+                .as_mut()
+                .expect("device policy release pipe was created");
+            let release_result = syscalls::write_all_fd(release_pipe.write_fd(), &[1]);
+            release_pipe.close_write();
+            if let Err(error) = release_result {
+                abort_started_attempt(
+                    &spec,
+                    supervisor_pid,
+                    worker_pidfd.as_ref(),
+                    host_net.as_ref(),
+                    &mut cg,
+                );
+                return Err(error);
+            }
+        } else if let Some(pipe) = &mut device_policy_release {
+            // The child failed during rootfs setup and cannot consume a
+            // release byte; the error pipe below carries the actionable cause.
+            pipe.close_write();
+        }
     }
 
     // Block on the error pipe: EOF means the child successfully exec'd
@@ -620,7 +735,23 @@ struct ChildIpc {
     start_gate_r: RawFd,
     start_gate_w: RawFd,
     net_sync: Option<(RawFd, RawFd)>,
+    /// Two-way setup handshake for installing the rootful device allowlist.
+    device_policy: Option<DevicePolicyIpc>,
     tty_slave: RawFd,
+}
+
+#[derive(Clone, Copy)]
+struct DevicePolicyIpc {
+    ready_r: RawFd,
+    ready_w: RawFd,
+    release_r: RawFd,
+    release_w: RawFd,
+}
+
+#[derive(Clone, Copy)]
+struct DevicePolicyChild {
+    ready_w: RawFd,
+    release_r: RawFd,
 }
 
 struct ChildIdentity {
@@ -836,6 +967,14 @@ fn child_main(spec: RunSpec, ipc: ChildIpc, identity: ChildIdentity) -> ZResult<
         syscalls::close(w);
         r
     });
+    let device_policy = ipc.device_policy.map(|policy| {
+        syscalls::close(policy.ready_r);
+        syscalls::close(policy.release_w);
+        DevicePolicyChild {
+            ready_w: policy.ready_w,
+            release_r: policy.release_r,
+        }
+    });
 
     // Report any failure to the parent over the pipe; the worker then exits 1.
     let result = child_stage(
@@ -844,6 +983,7 @@ fn child_main(spec: RunSpec, ipc: ChildIpc, identity: ChildIdentity) -> ZResult<
         ipc.err_w,
         ipc.start_gate_r,
         net_r,
+        device_policy,
         ipc.tty_slave,
     );
     if let Err(e) = result {
@@ -878,6 +1018,7 @@ fn child_stage(
     err_w: RawFd,
     start_gate_r: RawFd,
     net_r: Option<RawFd>,
+    device_policy: Option<DevicePolicyChild>,
     tty_slave: RawFd,
 ) -> ZResult<()> {
     // 0. Wait until the parent has attached this worker to its cgroup and
@@ -911,6 +1052,7 @@ fn child_stage(
 
     // Open rootless device handles before pivot_root hides the host /dev.
     let device_sources = open_rootless_device_sources(identity.rootless);
+    let requested_device_sources = open_requested_device_sources(identity.rootless, &spec.devices)?;
     // Host IPC shares the host POSIX shared-memory directory as well as SysV
     // IPC. Clone the mount before pivot_root detaches the old root, then attach
     // it after the private /dev is built.
@@ -928,11 +1070,16 @@ fn child_stage(
         rootless: identity.rootless,
         overlay: spec.overlay.as_ref(),
         volumes: &spec.volumes,
+        devices: &spec.devices,
         device_sources: &device_sources,
+        requested_device_sources: &requested_device_sources,
         host_shm: host_shm.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
         mount_shm: !matches!(spec.namespaces.ipc, IpcMode::None),
     };
     setup_rootfs(&cfg)?;
+    // Device nodes must exist before the parent installs the deny-by-default
+    // device policy. Park here so no workload can open anything in the gap.
+    finish_device_policy_setup(device_policy)?;
 
     // 1b. /etc/hosts: a container should resolve its own hostname and id.
     //     Written from inside the child because the bridge IP is only known
@@ -1033,6 +1180,36 @@ fn child_stage(
     crate::workload::apply_env(&mut cmd, env.as_deref(), spec.hostname.as_deref(), &spec.id);
     let err = cmd.exec(); // only returns on failure
     Err(crate::zerr!("execve failed: {err}"))
+}
+
+/// Tell the parent that rootfs/device setup is complete, then wait for the
+/// parent-side cgroup device policy before allowing any later setup or exec.
+fn finish_device_policy_setup(policy: Option<DevicePolicyChild>) -> ZResult<()> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    let ready = syscalls::write_all_fd(policy.ready_w, &[1]);
+    syscalls::close(policy.ready_w);
+    if let Err(error) = ready {
+        syscalls::close(policy.release_r);
+        return Err(error);
+    }
+
+    let mut release = [0u8; 1];
+    let result = read_all(policy.release_r, &mut release);
+    syscalls::close(policy.release_r);
+    let count = result?;
+    if count == 0 {
+        return Err(crate::zerr!(
+            "runtime parent closed the device-policy release gate"
+        ));
+    }
+    if release[0] != 1 {
+        return Err(crate::zerr!(
+            "runtime parent sent an invalid device-policy release byte"
+        ));
+    }
+    Ok(())
 }
 
 /// Generate `/etc/hosts` for the container (Docker-style entries) and write it
@@ -1258,6 +1435,20 @@ mod tests {
         syscalls::close(write_fd);
         assert!(wait_for_parent_start(read_fd).is_err());
         syscalls::close(read_fd);
+    }
+
+    #[test]
+    fn device_policy_handshake_waits_for_the_parent_release() {
+        let (ready_r, ready_w) = syscalls::pipe2_cloexec().unwrap();
+        let (release_r, release_w) = syscalls::pipe2_cloexec().unwrap();
+        syscalls::write_all_fd(release_w, &[1]).unwrap();
+        syscalls::close(release_w);
+        finish_device_policy_setup(Some(DevicePolicyChild { ready_w, release_r })).unwrap();
+
+        let mut ready = [0u8; 1];
+        assert_eq!(read_all(ready_r, &mut ready).unwrap(), 1);
+        assert_eq!(ready[0], 1);
+        syscalls::close(ready_r);
     }
 
     #[test]

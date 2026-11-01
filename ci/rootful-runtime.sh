@@ -289,6 +289,24 @@ mounted_tmpfs_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-over
   --init -- /bin/sh -c 'printf "mounted-tmpfs-ok\n" >/mnt/scratch/marker; cat /mnt/scratch/marker')
 grep -Fx mounted-tmpfs-ok <<<"$mounted_tmpfs_output" >/dev/null
 
+# Explicit devices are recreated from the host major/minor pair. A read-only
+# permission subset must clear write bits instead of silently granting rwm.
+device_args=(--device /dev/null:/dev/zerun-null:rw --device /dev/zero:/dev/zerun-read:r)
+device_check='test -c /dev/zerun-null && test -c /dev/zerun-read &&
+  test "$(/bin/busybox stat -c %a /dev/zerun-read)" = 444 &&
+  printf "device-ok" >/dev/zerun-null && printf "device-ok\n"'
+# /dev/kmsg is not in the built-in allowlist, so it also verifies that the
+# parent-side cgroup device policy denies a write omitted from the request.
+if [[ -c /dev/kmsg ]]; then
+  device_args+=(--device /dev/kmsg:/dev/zerun-kmsg:r)
+  device_check+=' &&
+  test -c /dev/zerun-kmsg &&
+  if printf x >/dev/zerun-kmsg 2>/dev/null; then exit 1; fi'
+fi
+device_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+  "${device_args[@]}" --init -- /bin/sh -c "$device_check")
+grep -Fx device-ok <<<"$device_output" >/dev/null
+
 # Resource limits require an actual cgroup v2 hierarchy and exercise the
 # parent-side cgroup creation/attach path.
 cgroup_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \

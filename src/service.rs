@@ -180,6 +180,10 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--volume".into());
         run_args.push(v.raw.clone());
     }
+    for device in &a.devices {
+        run_args.push("--device".into());
+        run_args.push(device.raw.clone());
+    }
     if let Some(v) = &a.platform {
         run_args.push("--platform".into());
         run_args.push(v.clone());
@@ -362,6 +366,8 @@ fn validate(a: &RunArgs, rootful: bool) -> Result<(), String> {
     if a.no_overlay && a.tmpfs_upper {
         return Err("--tmpfs-upper requires the writable overlay; remove --no-overlay".into());
     }
+    crate::mounts::validate_device_permissions(!rootful, &a.devices)?;
+    crate::mounts::validate_device_targets(&a.devices)?;
     let effective_net = if a.net_specified {
         a.net
     } else if rootful {
@@ -566,12 +572,22 @@ mod tests {
             "type=volume,source=app-data,target=/var/lib/app,readonly",
             "--mount",
             "type=tmpfs,target=/scratch,tmpfs-size=16m",
+            "--device",
+            "/dev/null:/dev/zerun-null:rw",
             "alpine",
             "true",
         ]);
         let unit = render(Path::new("/usr/local/bin/zerun"), &a, true).unwrap();
         assert!(unit.contains("--volume app-data:/var/lib/app:ro"));
         assert!(unit.contains("--tmpfs /scratch:size=16777216"));
+        assert!(unit.contains("--device /dev/null:/dev/zerun-null:rw"));
+    }
+
+    #[test]
+    fn rejects_restricted_device_permissions_for_rootless_services() {
+        let a = args(&["--device", "/dev/null:r", "alpine", "true"]);
+        let error = render(Path::new("/usr/local/bin/zerun"), &a, false).unwrap_err();
+        assert!(error.contains("permission subsets require rootful"));
     }
 
     #[test]

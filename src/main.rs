@@ -9,6 +9,7 @@
 //!   zerun doctor                          environment diagnostics
 mod cgroup;
 mod containerdiff;
+mod device_cgroup;
 mod error;
 mod events;
 mod execc;
@@ -197,6 +198,8 @@ struct RunArgs {
     env_files: Vec<String>,
     ports: Vec<network::PublishedPort>,
     volumes: Vec<mounts::BindMount>,
+    /// `--device HOST[:CONTAINER[:rwm]]` explicit device passthrough.
+    devices: Vec<mounts::DeviceMount>,
     dns: Vec<String>,
     /// `--dns-search DOMAIN`: bridge-mode resolver search domains.
     dns_search: Vec<String>,
@@ -473,6 +476,11 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 let v = next_value(args, &mut i, "--mount")?;
                 append_run_mount(&mut a, &v)?;
             }
+            "--device" => {
+                let v = next_value(args, &mut i, "--device")?;
+                a.devices
+                    .push(mounts::parse_device(&v).map_err(|e| e.to_string())?);
+            }
             "--publish" | "-p" => {
                 let v = next_value(args, &mut i, s)?;
                 a.ports.push(parse_publish(&v)?);
@@ -577,6 +585,12 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 append_run_mount(&mut a, &other["--mount=".len()..])?;
                 i += 1;
             }
+            other if other.starts_with("--device=") => {
+                a.devices.push(
+                    mounts::parse_device(&other["--device=".len()..]).map_err(|e| e.to_string())?,
+                );
+                i += 1;
+            }
             other if other.starts_with("--restart=") => {
                 a.restart = Some(other["--restart=".len()..].parse()?);
                 i += 1;
@@ -666,6 +680,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     if a.namespaces.uts == state::NamespaceMode::Host && a.hostname.is_some() {
         return Err("--hostname cannot be used with --uts host".to_string());
     }
+    mounts::validate_device_targets(&a.devices)?;
     Ok(a)
 }
 
@@ -908,6 +923,16 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
     };
     if !a.net_specified {
         a.net = default_net(syscalls::effective_uid());
+    }
+    if let Err(error) =
+        mounts::validate_device_permissions(syscalls::effective_uid() != 0, &a.devices)
+    {
+        eprintln!("zerun run: {error}");
+        return 2;
+    }
+    if let Err(error) = mounts::validate_device_targets(&a.devices) {
+        eprintln!("zerun run: {error}");
+        return 2;
     }
     if a.no_overlay && a.tmpfs_upper {
         eprintln!("zerun run: --tmpfs-upper requires the writable overlay; remove --no-overlay");
@@ -1406,6 +1431,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         user,
         ports: a.ports,
         volumes: a.volumes,
+        devices: a.devices,
         hosts: host_aliases,
         readonly: a.readonly,
         tmpfs: a.tmpfs,
@@ -2174,6 +2200,9 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     }
     for v in &a.volumes {
         args.extend(["--volume".to_string(), v.raw.clone()]);
+    }
+    for device in &a.devices {
+        args.extend(["--device".to_string(), device.raw.clone()]);
     }
     for v in &a.dns {
         args.extend(["--dns".to_string(), v.clone()]);
@@ -6919,6 +6948,7 @@ RUN OPTIONS:\n  \
   --mount type=bind|volume|tmpfs,src=SOURCE,dst=TARGET[,readonly]\n  \
                                         Docker-style mount syntax; tmpfs accepts\n  \
                                         tmpfs-size= and tmpfs-mode= options\n  \
+  --device HOST[:CONTAINER[:rwm]]      expose a host device node\n  \
   --dns IP            container DNS server (repeatable/comma-separated; bridge mode;\n  \
                       defaults to the host's)\n  \
   --dns-search DOMAIN resolver search domain (repeatable/comma-separated;\n  \
@@ -7669,6 +7699,50 @@ mod tests {
             "type=tmpfs,target=/scratch,unknown=true",
         ] {
             let args = vec![format!("--mount={value}"), "alpine".to_string()];
+            assert!(
+                parse_run_args(&args).is_err(),
+                "{value:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_and_captures_device_passthrough() {
+        let args: Vec<_> = [
+            "--device",
+            "/dev/null:/dev/zerun-null:rw",
+            "--device=/dev/zero:r",
+            "alpine",
+            "true",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_run_args(&args).expect("valid --device requests");
+        assert_eq!(a.devices.len(), 2);
+        assert_eq!(a.devices[0].target, Path::new("/dev/zerun-null"));
+        assert!(a.devices[0].permissions.read);
+        assert!(a.devices[0].permissions.write);
+        assert!(!a.devices[0].permissions.mknod);
+        assert_eq!(a.devices[1].target, Path::new("/dev/zero"));
+        assert!(a.devices[1].permissions.read);
+        assert!(!a.devices[1].permissions.write);
+
+        let launch = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--device", "/dev/null:/dev/zerun-null:rw"]));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--device", "/dev/zero:r"]));
+
+        for value in [
+            "relative",
+            "/tmp",
+            "/dev/null:/dev/zerun-null:rx",
+            "/dev/null:/../zerun-null:rw",
+        ] {
+            let args = vec![format!("--device={value}"), "alpine".to_string()];
             assert!(
                 parse_run_args(&args).is_err(),
                 "{value:?} should be rejected"

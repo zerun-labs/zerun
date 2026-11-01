@@ -320,13 +320,43 @@ jobs:
             exit 92
           fi
 
-          # Exercise exec's pidfd-based namespace join from a non-root host
-          # process, including the separate user-namespace join path.
           zerun=(sudo -u "$ci_user" env
             HOME="$home"
             ZERUN_DATA_ROOT="$data"
             ZERUN_RUNTIME_ROOT="$runtime"
             "$binary")
+
+          # Explicit rootless devices bind the pre-opened host inode through
+          # /proc/self/fd; full rwm is the only request that can be represented
+          # without changing the host node's mode.
+          if ! "${zerun[@]}" run --rootfs "$rootfs" --no-overlay --net none \
+            --device /dev/null:/dev/zerun-null:rwm -- \
+            /bin/sh -c 'test -c /dev/zerun-null &&
+              printf "rootless-device-ok\n" >/dev/zerun-null &&
+              printf "rootless-device-ok\n"' \
+            >"$base/rootless-device.out" 2>"$base/rootless-device.err"; then
+            cat "$base/rootless-device.out" "$base/rootless-device.err" >&2
+            exit 96
+          fi
+          if ! grep -Fx rootless-device-ok "$base/rootless-device.out"; then
+            echo "rootless explicit device marker is missing" >&2
+            exit 97
+          fi
+          set +e
+          "${zerun[@]}" run --rootfs "$rootfs" --no-overlay --net none \
+            --device /dev/null:r -- /bin/sh -c ':' \
+            >"$base/rootless-device-subset.out" 2>"$base/rootless-device-subset.err"
+          subset_status=$?
+          set -e
+          if test "$subset_status" -ne 2 ||
+            ! grep -F "permission subsets require rootful" "$base/rootless-device-subset.err"; then
+            cat "$base/rootless-device-subset.out" "$base/rootless-device-subset.err" >&2
+            echo "rootless restricted --device was not rejected with status 2" >&2
+            exit 98
+          fi
+
+          # Exercise exec's pidfd-based namespace join from a non-root host
+          # process, including the separate user-namespace join path.
           if ! id="$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
             --ulimit nofile=64:96 --init --name ci-rootless-exec -- /bin/sh -c 'sleep 30' \
             2>"$base/rootless-run.err")"; then

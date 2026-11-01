@@ -257,6 +257,10 @@ Run options (current subset):
 --mount type=bind|volume|tmpfs,src=SOURCE,dst=TARGET[,readonly]
                      Docker-style mount syntax; `type=tmpfs` accepts tmpfs-size= and
                      tmpfs-mode= instead of src= (repeatable)
+--device HOST[:CONTAINER[:rwm]]
+                     expose a character or block device (repeatable; default target is
+                     HOST and default permissions are rwm). Rootful runs use a cgroup v2
+                     device allowlist; rootless runs support full rwm only
 --no-overlay        pivot directly into the rootfs (no writable upper layer)
 --tmpfs-upper       keep the overlay writable layer in tmpfs (not committable)
 --read-only         remount the container root read-only before exec

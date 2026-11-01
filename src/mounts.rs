@@ -15,7 +15,7 @@ use libc::{
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 /// Sensitive procfs/sysfs paths that are masked inside the container
@@ -31,7 +31,7 @@ const MASKED_PATHS: &[&str] = &[
 
 const READONLY_PATHS: &[&str] = &["/proc/sys", "/proc/sysrq-trigger", "/proc/irq", "/proc/bus"];
 
-const DEVICE_NODES: &[(&str, u32, u32)] = &[
+pub(crate) const DEVICE_NODES: &[(&str, u32, u32)] = &[
     ("/dev/null", 1, 3),
     ("/dev/zero", 1, 5),
     ("/dev/full", 1, 7),
@@ -168,6 +168,190 @@ pub struct TmpfsMount {
     pub readonly: bool,
     /// The original `--tmpfs` argument.
     pub raw: String,
+}
+
+/// The device-node type passed through by `--device`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceKind {
+    Char,
+    Block,
+}
+
+/// Docker-compatible device permissions (`rwm`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DevicePermissions {
+    pub read: bool,
+    pub write: bool,
+    pub mknod: bool,
+}
+
+impl DevicePermissions {
+    pub const FULL: Self = Self {
+        read: true,
+        write: true,
+        mknod: true,
+    };
+
+    pub fn is_full(self) -> bool {
+        self.read && self.write && self.mknod
+    }
+}
+
+/// A host device exposed through `--device HOST[:CONTAINER[:PERMISSIONS]]`.
+///
+/// `source` is canonicalized to validate the actual device, while `target`
+/// and `raw` retain the operator-visible request. Rootful runs recreate the
+/// node with `mknod`; rootless runs bind an O_PATH handle opened before pivot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceMount {
+    pub source: PathBuf,
+    pub target: PathBuf,
+    pub permissions: DevicePermissions,
+    pub kind: DeviceKind,
+    pub major: u32,
+    pub minor: u32,
+    /// Original CLI token, preserved for restart and service generation.
+    pub raw: String,
+}
+
+/// Parse Docker's `--device HOST[:CONTAINER[:PERMISSIONS]]` syntax.
+///
+/// A two-field form accepts either a container target (absolute path) or a
+/// permission set, so both `--device /dev/fuse:/dev/fuse` and
+/// `--device /dev/fuse:rw` are unambiguous. Only character and block devices
+/// are accepted as sources.
+pub fn parse_device(value: &str) -> Result<DeviceMount, String> {
+    let parts = value.split(':').collect::<Vec<_>>();
+    if parts.len() > 3 {
+        return Err(format!(
+            "--device: invalid device '{value}' (HOST[:CONTAINER[:rwm]])"
+        ));
+    }
+    let source = parts[0];
+    if source.is_empty() || !source.starts_with('/') {
+        return Err(format!("--device: host path '{source}' must be absolute"));
+    }
+    let (target, permissions) = match parts.as_slice() {
+        [source] => (*source, DevicePermissions::FULL),
+        [source, second] if second.starts_with('/') => (*second, DevicePermissions::FULL),
+        [source, permissions] => (*source, parse_device_permissions(permissions)?),
+        [_, target, permissions] => {
+            if !target.starts_with('/') {
+                return Err(format!(
+                    "--device: container path '{target}' must be absolute"
+                ));
+            }
+            (*target, parse_device_permissions(permissions)?)
+        }
+        _ => unreachable!("device field count was checked"),
+    };
+    if target == "/" {
+        return Err("--device: refusing to mount over the container root".to_string());
+    }
+    if !Path::new(target)
+        .components()
+        .skip(1)
+        .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "--device: container path '{target}' must be absolute without '.' or '..'"
+        ));
+    }
+
+    let source = std::fs::canonicalize(source)
+        .map_err(|error| format!("--device: host path '{source}' is not accessible: {error}"))?;
+    let metadata = std::fs::metadata(&source)
+        .map_err(|error| format!("--device: stat host path {}: {error}", source.display()))?;
+    let file_type = metadata.file_type();
+    let kind = if file_type.is_char_device() {
+        DeviceKind::Char
+    } else if file_type.is_block_device() {
+        DeviceKind::Block
+    } else {
+        return Err(format!(
+            "--device: host path {} must be a character or block device",
+            source.display()
+        ));
+    };
+    let rdev = metadata.rdev();
+    let (major, minor) = device_numbers(rdev);
+
+    Ok(DeviceMount {
+        source,
+        target: PathBuf::from(target),
+        permissions,
+        kind,
+        major,
+        minor,
+        raw: value.to_string(),
+    })
+}
+
+fn device_numbers(rdev: u64) -> (u32, u32) {
+    let major = (((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff)) as u32;
+    let minor = ((rdev & 0xff) | ((rdev >> 12) & !0xff)) as u32;
+    (major, minor)
+}
+
+fn parse_device_permissions(value: &str) -> Result<DevicePermissions, String> {
+    if value.is_empty() {
+        return Err("--device: permissions cannot be empty (use rwm)".to_string());
+    }
+    let mut permissions = DevicePermissions {
+        read: false,
+        write: false,
+        mknod: false,
+    };
+    for permission in value.chars() {
+        let slot = match permission {
+            'r' => &mut permissions.read,
+            'w' => &mut permissions.write,
+            'm' => &mut permissions.mknod,
+            other => {
+                return Err(format!(
+                    "--device: invalid permission '{other}' (use r, w, or m)"
+                ))
+            }
+        };
+        if *slot {
+            return Err(format!(
+                "--device: duplicate permission '{permission}' in '{value}'"
+            ));
+        }
+        *slot = true;
+    }
+    Ok(permissions)
+}
+
+/// Rootless device passthrough binds the host inode, so it cannot safely
+/// emulate Docker's read/write subsets without mutating the host node. Require
+/// full rwm access there; rootful runs recreate the node with filtered mode
+/// bits.
+pub fn validate_device_permissions(rootless: bool, devices: &[DeviceMount]) -> Result<(), String> {
+    if rootless && devices.iter().any(|device| !device.permissions.is_full()) {
+        return Err(
+            "--device permission subsets require rootful execution; rootless runs inherit the \
+             host node's rwm access"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Reject duplicate container targets before starting a container. The child
+/// can detect the collision too, but doing it during argument parsing produces
+/// a clear error without allocating any runtime state.
+pub fn validate_device_targets(devices: &[DeviceMount]) -> Result<(), String> {
+    let mut targets = std::collections::BTreeSet::new();
+    for device in devices {
+        if !targets.insert(&device.target) {
+            return Err(format!(
+                "--device: duplicate container path {}",
+                device.target.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A parsed Docker-style `--mount` request.
@@ -477,8 +661,12 @@ pub struct RootfsConfig<'a> {
     pub overlay: Option<&'a OverlayPaths>,
     /// Host bind mounts, established while the host root is still reachable.
     pub volumes: &'a [BindMount],
+    /// Explicit `--device` requests, installed after the private `/dev` tmpfs.
+    pub devices: &'a [DeviceMount],
     /// O_PATH handles for rootless host devices opened before pivot_root.
     pub device_sources: &'a [Option<File>],
+    /// O_PATH handles for explicit rootless `--device` sources.
+    pub requested_device_sources: &'a [File],
     /// Detached clone of the host `/dev/shm` mount for `--ipc host`.
     pub host_shm: Option<RawFd>,
     /// Mount a private `/dev/shm` tmpfs. False for `--ipc none`, which keeps a
@@ -524,7 +712,12 @@ pub fn setup_rootfs(cfg: &RootfsConfig) -> ZResult<()> {
     trace::mark("child:pivot_root:done");
 
     mount_pseudo_fs(cfg.rootless, cfg.host_shm, cfg.mount_shm)?;
-    populate_dev(cfg.rootless, cfg.device_sources)?;
+    populate_dev(
+        cfg.rootless,
+        cfg.device_sources,
+        cfg.devices,
+        cfg.requested_device_sources,
+    )?;
     apply_masked_and_readonly(cfg.rootless)?;
 
     if cfg.set_hostname {
@@ -829,12 +1022,33 @@ pub fn open_rootless_device_sources(rootless: bool) -> Vec<Option<File>> {
     }
     DEVICE_NODES
         .iter()
-        .map(|(path, _, _)| match open_device_source(path) {
+        .map(|(path, _, _)| match open_device_source(Path::new(path)) {
             Ok(source) => Some(source),
             Err(error) => {
                 eprintln!("zerun: warn: cannot open rootless host device {path}: {error}");
                 None
             }
+        })
+        .collect()
+}
+
+/// Open explicit rootless `--device` sources before pivot_root. Rootless
+/// namespaces cannot recreate device nodes with `mknod`, so they bind the
+/// original host inode through `/proc/self/fd` after the private `/dev` tmpfs
+/// exists. Rootful launches recreate nodes from their major/minor pair instead.
+pub fn open_requested_device_sources(
+    rootless: bool,
+    devices: &[DeviceMount],
+) -> ZResult<Vec<File>> {
+    if !rootless {
+        return Ok(Vec::new());
+    }
+    devices
+        .iter()
+        .map(|device| {
+            open_device_source(&device.source).map_err(|error| {
+                crate::zerr!("open --device source {}: {error}", device.source.display())
+            })
         })
         .collect()
 }
@@ -849,7 +1063,12 @@ pub fn clone_host_shm_mount() -> ZResult<std::os::fd::OwnedFd> {
 /// Minimal /dev device nodes and conventional symlinks.
 /// rootful: mknod character devices; rootless (non-initial user ns): bind the
 /// pre-opened host whitelist devices through procfs fd magic links.
-fn populate_dev(rootless: bool, device_sources: &[Option<File>]) -> ZResult<()> {
+fn populate_dev(
+    rootless: bool,
+    device_sources: &[Option<File>],
+    devices: &[DeviceMount],
+    requested_device_sources: &[File],
+) -> ZResult<()> {
     for (index, &(path, maj, min)) in DEVICE_NODES.iter().enumerate() {
         if rootless {
             // Create an empty file on tmpfs as the mount point, then bind the
@@ -869,7 +1088,82 @@ fn populate_dev(rootless: bool, device_sources: &[Option<File>]) -> ZResult<()> 
                 &format!("bind rootless device {path}"),
             )?;
         } else {
+            // An explicit request for the same built-in node must be recreated
+            // with the requested permission mode by the loop below.
+            if devices.iter().any(|device| {
+                device.target == Path::new(path)
+                    && device_matches_numbers(device, DeviceKind::Char, maj, min)
+            }) {
+                continue;
+            }
             syscalls::mknod_char(path, maj, min, 0o666)?;
+        }
+    }
+    for (index, device) in devices.iter().enumerate() {
+        let target = safe_target(Path::new("/"), &device.target)?;
+        let existing = match std::fs::symlink_metadata(&target) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(crate::zerr!(
+                    "inspect --device target {}: {error}",
+                    device.target.display()
+                ))
+            }
+        };
+        if let Some(parent) = target.parent() {
+            syscalls::mkdir_p(parent, 0o755)?;
+        }
+
+        if rootless {
+            if let Some(metadata) = existing {
+                if device_matches_metadata(device, &metadata) {
+                    // A built-in device already provides this exact
+                    // major/minor and the rootless path only supports full
+                    // permissions, so the existing bind is equivalent.
+                    continue;
+                }
+                return Err(crate::zerr!(
+                    "--device target {} already exists",
+                    device.target.display()
+                ));
+            }
+            std::fs::write(&target, b"").map_err(|error| {
+                crate::zerr!(
+                    "create --device mount point {}: {error}",
+                    device.target.display()
+                )
+            })?;
+            let source = requested_device_sources.get(index).ok_or_else(|| {
+                crate::zerr!(
+                    "missing pre-opened source for --device {}",
+                    device.target.display()
+                )
+            })?;
+            let source_path = format!("/proc/self/fd/{}", source.as_raw_fd());
+            syscalls::mount(
+                Some(&source_path),
+                target.to_string_lossy(),
+                None,
+                MS_BIND,
+                None,
+            )?;
+        } else {
+            if existing.is_some() {
+                return Err(crate::zerr!(
+                    "--device target {} already exists",
+                    device.target.display()
+                ));
+            }
+            let mode = device_node_mode(device.permissions);
+            match device.kind {
+                DeviceKind::Char => {
+                    syscalls::mknod_char(&target, device.major, device.minor, mode)?
+                }
+                DeviceKind::Block => {
+                    syscalls::mknod_block(&target, device.major, device.minor, mode)?
+                }
+            };
         }
     }
     let _ = syscalls::symlink("/proc/self/fd", "/dev/fd");
@@ -880,7 +1174,31 @@ fn populate_dev(rootless: bool, device_sources: &[Option<File>]) -> ZResult<()> 
     Ok(())
 }
 
-fn open_device_source(path: &str) -> std::io::Result<File> {
+fn device_matches_metadata(device: &DeviceMount, metadata: &std::fs::Metadata) -> bool {
+    let file_type = metadata.file_type();
+    let kind_matches = match device.kind {
+        DeviceKind::Char => file_type.is_char_device(),
+        DeviceKind::Block => file_type.is_block_device(),
+    };
+    kind_matches && device_numbers(metadata.rdev()) == (device.major, device.minor)
+}
+
+fn device_matches_numbers(device: &DeviceMount, kind: DeviceKind, major: u32, minor: u32) -> bool {
+    device.kind == kind && device.major == major && device.minor == minor
+}
+
+fn device_node_mode(permissions: DevicePermissions) -> libc::mode_t {
+    let mut mode = 0;
+    if permissions.read {
+        mode |= 0o444;
+    }
+    if permissions.write {
+        mode |= 0o222;
+    }
+    mode
+}
+
+fn open_device_source(path: &Path) -> std::io::Result<File> {
     OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
@@ -1108,5 +1426,84 @@ mod bind_tests {
         ] {
             assert!(parse_mount(value).is_err(), "{value:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn parse_device_accepts_docker_forms() {
+        let device = parse_device("/dev/null:/dev/zerun-null:rw").unwrap();
+        assert_eq!(device.source, PathBuf::from("/dev/null"));
+        assert_eq!(device.target, PathBuf::from("/dev/zerun-null"));
+        assert_eq!(device.kind, DeviceKind::Char);
+        assert_eq!((device.major, device.minor), (1, 3));
+        assert!(device.permissions.read);
+        assert!(device.permissions.write);
+        assert!(!device.permissions.mknod);
+        assert_eq!(device.raw, "/dev/null:/dev/zerun-null:rw");
+
+        let default_target = parse_device("/dev/null").unwrap();
+        assert_eq!(default_target.target, PathBuf::from("/dev/null"));
+        assert!(default_target.permissions.is_full());
+
+        let explicit_target = parse_device("/dev/null:/dev/fuse").unwrap();
+        assert_eq!(explicit_target.target, PathBuf::from("/dev/fuse"));
+        assert!(explicit_target.permissions.is_full());
+
+        let explicit_permissions = parse_device("/dev/null:r").unwrap();
+        assert_eq!(explicit_permissions.target, PathBuf::from("/dev/null"));
+        assert!(explicit_permissions.permissions.read);
+        assert!(!explicit_permissions.permissions.write);
+        assert!(!explicit_permissions.permissions.mknod);
+    }
+
+    #[test]
+    fn parse_device_rejects_non_devices_and_bad_permissions() {
+        for value in [
+            "",
+            "dev/null",
+            "/dev/null:/dev/zerun-null:",
+            "/dev/null:/dev/zerun-null:rx",
+            "/dev/null:/dev/zerun-null:rr",
+            "/dev/null:relative",
+            "/dev/null:/../zerun-null:rw",
+            "/dev/null:/dev/a:/dev/b:rwm",
+            "/tmp",
+            "/dev",
+        ] {
+            assert!(parse_device(value).is_err(), "{value:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn device_node_mode_reflects_read_and_write_permissions() {
+        let mode = |value: &str| {
+            device_node_mode(
+                parse_device(&format!("/dev/null:{value}"))
+                    .unwrap()
+                    .permissions,
+            )
+        };
+        assert_eq!(mode("rwm"), 0o666);
+        assert_eq!(mode("rw"), 0o666);
+        assert_eq!(mode("r"), 0o444);
+        assert_eq!(mode("w"), 0o222);
+        assert_eq!(mode("m"), 0o000);
+    }
+
+    #[test]
+    fn device_numbers_decode_large_minors() {
+        for (major, minor) in [(8, 0), (8, 300), (12, 1_048_575)] {
+            assert_eq!(device_numbers(libc::makedev(major, minor)), (major, minor));
+        }
+    }
+
+    #[test]
+    fn device_validation_rejects_rootless_subsets_and_duplicate_targets() {
+        let restricted = parse_device("/dev/null:/dev/zerun-null:r").unwrap();
+        assert!(validate_device_permissions(true, std::slice::from_ref(&restricted)).is_err());
+        assert!(validate_device_permissions(false, &[restricted]).is_ok());
+
+        let first = parse_device("/dev/null:/dev/zerun-null:rwm").unwrap();
+        let duplicate = parse_device("/dev/zero:/dev/zerun-null:rwm").unwrap();
+        assert!(validate_device_targets(&[first, duplicate]).is_err());
     }
 }
