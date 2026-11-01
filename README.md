@@ -67,6 +67,16 @@ user-namespace execution; static GNU and musl builds plus ARM64, ARMv7, and RISC
 cross-builds are checked as well. Tagged releases are gated on both debug and release-profile
 source tests before artifacts are published.
 
+The rootful integration fixture is reproducible locally (root or passwordless sudo is required):
+
+```bash
+rootfs=$(mktemp -d)
+data=$(mktemp -d)
+runtime=$(mktemp -d)
+ci/prepare-rootful-fixtures.sh "$rootfs"
+ci/rootful-runtime.sh target/debug/zerun "$rootfs" "$data" "$runtime"
+```
+
 ## Highlights
 
 - **Daemonless**: every command is a short-lived CLI process. Foreground runs leave zero
