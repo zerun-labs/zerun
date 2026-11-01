@@ -146,6 +146,22 @@ grep -Fx private-shm-ok <<<"$private_shm" >/dev/null
   /bin/sh -c "printf host-shm-ok > '$host_shm_marker'"
 grep -Fx host-shm-ok "$host_shm_marker" >/dev/null
 
+# --ipc none keeps the private IPC namespace but omits the shared-memory
+# mount. Detached exec must still join that private namespace.
+ipc_none_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --net none \
+  --ipc none --init -- /bin/sh -c 'sleep 30')
+cleanup_ids+=("$ipc_none_id")
+ipc_none_inspect=$("${zerun[@]}" inspect "$ipc_none_id")
+grep -q '"ipc": "none"' <<<"$ipc_none_inspect"
+ipc_none_exec=$("${zerun[@]}" exec "$ipc_none_id" /bin/sh -c \
+  'test "$(/bin/busybox readlink /proc/self/ns/ipc)" != "$1";
+   if /bin/grep -q " /dev/shm " /proc/self/mounts; then exit 1; fi; printf ipc-none-ok' \
+  sh "$host_ipc_ns")
+grep -Fx ipc-none-ok <<<"$ipc_none_exec" >/dev/null
+"${zerun[@]}" kill --signal TERM "$ipc_none_id" >/dev/null
+"${zerun[@]}" wait "$ipc_none_id" >/dev/null
+"${zerun[@]}" rm "$ipc_none_id" >/dev/null
+
 # A host PID namespace has no kernel-wide kill boundary when its top-level
 # process exits. The runtime must act as a subreaper and reap every remaining
 # descendant before returning, or a background workload would escape to the

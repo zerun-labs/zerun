@@ -319,6 +319,9 @@ pub struct RootfsConfig<'a> {
     pub device_sources: &'a [Option<File>],
     /// Detached clone of the host `/dev/shm` mount for `--ipc host`.
     pub host_shm: Option<RawFd>,
+    /// Mount a private `/dev/shm` tmpfs. False for `--ipc none`, which keeps a
+    /// private IPC namespace but deliberately leaves `/dev/shm` unmounted.
+    pub mount_shm: bool,
 }
 
 /// Full root migration + pseudo-filesystem assembly, run by the child inside the
@@ -358,7 +361,7 @@ pub fn setup_rootfs(cfg: &RootfsConfig) -> ZResult<()> {
     syscalls::chdir("/")?;
     trace::mark("child:pivot_root:done");
 
-    mount_pseudo_fs(cfg.rootless, cfg.host_shm)?;
+    mount_pseudo_fs(cfg.rootless, cfg.host_shm, cfg.mount_shm)?;
     populate_dev(cfg.rootless, cfg.device_sources)?;
     apply_masked_and_readonly(cfg.rootless)?;
 
@@ -500,7 +503,7 @@ fn setup_overlay(rootless: bool, ovl: &OverlayPaths) -> ZResult<()> {
 /// rootful: any critical mount failure is an error. rootless: locked-down hosts
 /// (or nested-container LSM policy) may refuse userns mounts of proc/sys; in that
 /// case warn and continue, with `doctor` explaining the environment limit.
-fn mount_pseudo_fs(rootless: bool, host_shm: Option<RawFd>) -> ZResult<()> {
+fn mount_pseudo_fs(rootless: bool, host_shm: Option<RawFd>, mount_shm: bool) -> ZResult<()> {
     let common = MS_NOSUID | MS_NOEXEC | MS_NODEV;
 
     // /proc is remounted in the container's mount namespace. Under the default
@@ -547,7 +550,10 @@ fn mount_pseudo_fs(rootless: bool, host_shm: Option<RawFd>) -> ZResult<()> {
         "/dev/pts",
     )?;
     syscalls::mkdir_p("/dev/shm", 0o1777)?;
-    if let Some(source) = host_shm {
+    if !mount_shm {
+        // Docker's --ipc none keeps a private SysV/POSIX IPC namespace but
+        // deliberately does not provide the shared-memory mount.
+    } else if let Some(source) = host_shm {
         require_or_warn(
             rootless,
             syscalls::move_mount(source, "/dev/shm"),

@@ -340,7 +340,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--ipc" => {
                 let value = next_value(args, &mut i, "--ipc")?;
-                a.namespaces.ipc = state::NamespaceMode::parse("--ipc", &value)?;
+                a.namespaces.ipc = state::IpcMode::parse(&value)?;
             }
             "--uts" => {
                 let value = next_value(args, &mut i, "--uts")?;
@@ -578,7 +578,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 i += 1;
             }
             other if other.starts_with("--ipc=") => {
-                a.namespaces.ipc = state::NamespaceMode::parse("--ipc", &other["--ipc=".len()..])?;
+                a.namespaces.ipc = state::IpcMode::parse(&other["--ipc=".len()..])?;
                 i += 1;
             }
             other if other.starts_with("--uts=") => {
@@ -2013,14 +2013,13 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     if let Some(v) = &a.hostname {
         args.extend(["--hostname".to_string(), v.clone()]);
     }
-    for (flag, mode) in [
-        ("--pid", a.namespaces.pid),
-        ("--ipc", a.namespaces.ipc),
-        ("--uts", a.namespaces.uts),
-    ] {
+    for (flag, mode) in [("--pid", a.namespaces.pid), ("--uts", a.namespaces.uts)] {
         if mode == state::NamespaceMode::Host {
             args.extend([flag.to_string(), mode.label().to_string()]);
         }
+    }
+    if a.namespaces.ipc != state::IpcMode::Private {
+        args.extend(["--ipc".to_string(), a.namespaces.ipc.label().to_string()]);
     }
     if let Some(v) = &a.user {
         args.extend(["--user".to_string(), v.clone()]);
@@ -6845,7 +6844,9 @@ RUN OPTIONS:\n  \
   --ulimit TYPE=SOFT[:HARD]      per-process rlimit (repeatable; -1 = unlimited)\n  \
   -h, --hostname H    container hostname (new UTS namespace)\n  \
   --pid private|host  private PID namespace (default) or share host PID (sensitive)\n  \
-  --ipc private|host  private IPC/shm (default) or share host IPC (sensitive)\n  \
+  --ipc private|none|host\n  \
+                      private IPC+shm (default), private IPC without /dev/shm, or\n  \
+                      share host IPC (sensitive)\n  \
   --uts private|host  private UTS namespace (default) or share host name (sensitive)\n  \
   -u, --user USER[:GROUP]  run as container user (numeric or /etc/passwd name)\n  \
   --group-add NAME|GID     add a supplementary group (repeatable/comma-separated)\n  \
@@ -7631,14 +7632,28 @@ mod tests {
         .collect();
         let a = parse_run_args(&args).expect("namespace modes");
         assert_eq!(a.namespaces.pid, state::NamespaceMode::Host);
-        assert_eq!(a.namespaces.ipc, state::NamespaceMode::Host);
+        assert_eq!(a.namespaces.ipc, state::IpcMode::Host);
         assert_eq!(a.namespaces.uts, state::NamespaceMode::Private);
         let launch = detached_launch_args(&a, Path::new("/tmp/rootfs"));
         assert!(launch.windows(2).any(|pair| pair == ["--pid", "host"]));
         assert!(launch.windows(2).any(|pair| pair == ["--ipc", "host"]));
         assert!(!launch.iter().any(|arg| arg == "--uts"));
 
-        for option in ["--pid=container:web", "--ipc=none", "--uts="] {
+        let ipc_none = ["--ipc=none", "alpine", "true"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        let ipc_none = parse_run_args(&ipc_none).expect("--ipc none");
+        assert_eq!(ipc_none.namespaces.ipc, state::IpcMode::None);
+        let launch = detached_launch_args(&ipc_none, Path::new("/tmp/rootfs"));
+        assert!(launch.windows(2).any(|pair| pair == ["--ipc", "none"]));
+
+        for option in [
+            "--pid=container:web",
+            "--pid=none",
+            "--ipc=container:web",
+            "--uts=",
+        ] {
             let args = vec![option.to_string(), "alpine".to_string()];
             assert!(parse_run_args(&args).is_err(), "{option} should fail");
         }

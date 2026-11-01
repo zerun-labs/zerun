@@ -311,14 +311,14 @@ fn namespace_flags(
     modes: crate::state::NamespaceModes,
     net: &str,
 ) -> ZResult<(Option<libc::c_int>, libc::c_int)> {
-    use crate::state::NamespaceMode;
+    use crate::state::{IpcMode, NamespaceMode};
 
     let user = rootless.then_some(libc::CLONE_NEWUSER);
     let mut rest = libc::CLONE_NEWNS | libc::CLONE_NEWCGROUP;
     if matches!(modes.uts, NamespaceMode::Private) {
         rest |= libc::CLONE_NEWUTS;
     }
-    if matches!(modes.ipc, NamespaceMode::Private) {
+    if !matches!(modes.ipc, IpcMode::Host) {
         rest |= libc::CLONE_NEWIPC;
     }
     match net {
@@ -607,7 +607,7 @@ mod tests {
     fn host_shared_namespaces_are_not_rejoined_by_exec() {
         let modes = NamespaceModes {
             pid: NamespaceMode::Host,
-            ipc: NamespaceMode::Host,
+            ipc: crate::state::IpcMode::Host,
             uts: NamespaceMode::Host,
         };
         let (_, flags) = namespace_flags(false, modes, "host").unwrap();
@@ -617,6 +617,16 @@ mod tests {
         assert_eq!(flags & libc::CLONE_NEWNET, 0);
         assert_ne!(flags & libc::CLONE_NEWNS, 0);
         assert_ne!(flags & libc::CLONE_NEWCGROUP, 0);
+    }
+
+    #[test]
+    fn ipc_without_shm_still_joins_the_private_ipc_namespace() {
+        let modes = NamespaceModes {
+            ipc: crate::state::IpcMode::None,
+            ..NamespaceModes::default()
+        };
+        let (_, flags) = namespace_flags(false, modes, "none").unwrap();
+        assert_ne!(flags & libc::CLONE_NEWIPC, 0);
     }
 
     #[test]

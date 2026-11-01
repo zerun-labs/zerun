@@ -114,15 +114,15 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--hostname".into());
         run_args.push(v.clone());
     }
-    for (flag, mode) in [
-        ("--pid", a.namespaces.pid),
-        ("--ipc", a.namespaces.ipc),
-        ("--uts", a.namespaces.uts),
-    ] {
+    for (flag, mode) in [("--pid", a.namespaces.pid), ("--uts", a.namespaces.uts)] {
         if mode == crate::state::NamespaceMode::Host {
             run_args.push(flag.into());
             run_args.push(mode.label().into());
         }
+    }
+    if a.namespaces.ipc != crate::state::IpcMode::Private {
+        run_args.push("--ipc".into());
+        run_args.push(a.namespaces.ipc.label().into());
     }
     if let Some(v) = &a.user {
         run_args.push("--user".into());
@@ -577,6 +577,13 @@ mod tests {
         assert!(unit.contains("--pid host"));
         assert!(unit.contains("--ipc host"));
         assert!(unit.contains("--uts host"));
+    }
+
+    #[test]
+    fn renders_ipc_without_shared_memory() {
+        let a = args(&["--ipc=none", "alpine", "true"]);
+        let unit = render(Path::new("/usr/local/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains("--ipc none"));
     }
 
     #[test]

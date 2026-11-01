@@ -33,10 +33,10 @@ fn default_stop_timeout() -> u64 {
     DEFAULT_STOP_TIMEOUT_SECS
 }
 
-/// Namespace-sharing mode for the PID, IPC, and UTS namespaces.
+/// Namespace-sharing mode for the PID and UTS namespaces.
 ///
 /// The mount, network, cgroup, and user namespaces are still selected by their
-/// own runtime options. These three modes share a simple persisted shape so
+/// own runtime options. These modes share a simple persisted shape so
 /// `run`, restart, and `exec` make the same namespace decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -49,7 +49,7 @@ pub enum NamespaceMode {
 }
 
 impl NamespaceMode {
-    /// Parse a Docker-style `--pid`, `--ipc`, or `--uts` value.
+    /// Parse a Docker-style `--pid` or `--uts` value.
     pub fn parse(option: &str, value: &str) -> Result<Self, String> {
         match value {
             "private" => Ok(Self::Private),
@@ -66,12 +66,50 @@ impl NamespaceMode {
     }
 }
 
+/// IPC namespace mode for one container.
+///
+/// `none` keeps a private IPC namespace but does not mount `/dev/shm`, while
+/// `private` is the normal isolated namespace with a private shared-memory
+/// tmpfs. Both private forms are joined by `zerun exec`; only the `/dev/shm`
+/// setup differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IpcMode {
+    /// Private IPC namespace and `/dev/shm` tmpfs.
+    #[default]
+    Private,
+    /// Private IPC namespace without a `/dev/shm` mount.
+    None,
+    /// Join the runtime's (host) IPC namespace and `/dev/shm` mount.
+    Host,
+}
+
+impl IpcMode {
+    /// Parse a Docker-style `--ipc` value.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "private" => Ok(Self::Private),
+            "none" => Ok(Self::None),
+            "host" => Ok(Self::Host),
+            other => Err(format!("invalid --ipc value '{other}' (private|none|host)")),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::None => "none",
+            Self::Host => "host",
+        }
+    }
+}
+
 /// Persisted PID/IPC/UTS namespace choices for one container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NamespaceModes {
     pub pid: NamespaceMode,
-    pub ipc: NamespaceMode,
+    pub ipc: IpcMode,
     pub uts: NamespaceMode,
 }
 
@@ -796,11 +834,22 @@ mod tests {
     fn namespace_modes_round_trip_through_state_json() {
         let modes = NamespaceModes {
             pid: NamespaceMode::Host,
-            ipc: NamespaceMode::Host,
+            ipc: IpcMode::Host,
             uts: NamespaceMode::Private,
         };
         let json = serde_json::to_string(&modes).unwrap();
         assert_eq!(json, r#"{"pid":"host","ipc":"host","uts":"private"}"#);
+        assert_eq!(
+            serde_json::from_str::<NamespaceModes>(&json).unwrap(),
+            modes
+        );
+
+        let modes = NamespaceModes {
+            ipc: IpcMode::None,
+            ..NamespaceModes::default()
+        };
+        let json = serde_json::to_string(&modes).unwrap();
+        assert_eq!(json, r#"{"pid":"private","ipc":"none","uts":"private"}"#);
         assert_eq!(
             serde_json::from_str::<NamespaceModes>(&json).unwrap(),
             modes

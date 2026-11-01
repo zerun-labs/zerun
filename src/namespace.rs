@@ -26,7 +26,7 @@ use crate::mounts::{
 use crate::pty::PtyPair;
 use crate::seccomp::SeccompMode;
 use crate::security;
-use crate::state::{ContainerMetrics, NamespaceMode, NamespaceModes};
+use crate::state::{ContainerMetrics, IpcMode, NamespaceMode, NamespaceModes};
 use crate::syscalls;
 use crate::trace;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -523,7 +523,7 @@ fn namespace_flags(rootless: bool, namespaces: NamespaceModes, net: NetMode) -> 
     if matches!(namespaces.uts, NamespaceMode::Private) {
         flags |= libc::CLONE_NEWUTS;
     }
-    if matches!(namespaces.ipc, NamespaceMode::Private) {
+    if !matches!(namespaces.ipc, IpcMode::Host) {
         flags |= libc::CLONE_NEWIPC;
     }
     if !matches!(net, NetMode::Host) {
@@ -914,7 +914,7 @@ fn child_stage(
     // Host IPC shares the host POSIX shared-memory directory as well as SysV
     // IPC. Clone the mount before pivot_root detaches the old root, then attach
     // it after the private /dev is built.
-    let host_shm = if matches!(spec.namespaces.ipc, NamespaceMode::Host) {
+    let host_shm = if matches!(spec.namespaces.ipc, IpcMode::Host) {
         Some(crate::mounts::clone_host_shm_mount()?)
     } else {
         None
@@ -930,6 +930,7 @@ fn child_stage(
         volumes: &spec.volumes,
         device_sources: &device_sources,
         host_shm: host_shm.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
+        mount_shm: !matches!(spec.namespaces.ipc, IpcMode::None),
     };
     setup_rootfs(&cfg)?;
 
@@ -1212,7 +1213,7 @@ mod tests {
     fn namespace_flags_honor_host_namespace_modes() {
         let modes = NamespaceModes {
             pid: NamespaceMode::Host,
-            ipc: NamespaceMode::Host,
+            ipc: IpcMode::Host,
             uts: NamespaceMode::Host,
         };
         let flags = namespace_flags(true, modes, NetMode::Host);
@@ -1227,6 +1228,16 @@ mod tests {
         assert_ne!(flags & libc::CLONE_NEWNS, 0);
         assert_ne!(flags & libc::CLONE_NEWCGROUP, 0);
         assert_ne!(flags & libc::CLONE_NEWUSER, 0);
+    }
+
+    #[test]
+    fn namespace_flags_keep_ipc_private_without_shm() {
+        let modes = NamespaceModes {
+            ipc: IpcMode::None,
+            ..NamespaceModes::default()
+        };
+        let flags = namespace_flags(false, modes, NetMode::None);
+        assert_ne!(flags & libc::CLONE_NEWIPC, 0);
     }
 
     #[test]

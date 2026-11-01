@@ -202,7 +202,9 @@ Run options (current subset):
 --ulimit TYPE=SOFT[:HARD]     per-process rlimit (repeatable; -1/unlimited)
 -h, --hostname H     container hostname (new UTS namespace)
 --pid private|host   private PID namespace (default) or share the host PID namespace
---ipc private|host   private IPC and /dev/shm (default) or share host IPC and /dev/shm
+--ipc private|none|host
+                     private IPC and /dev/shm (default), a private IPC namespace
+                     without /dev/shm mounted, or the host IPC namespace
 --uts private|host   private UTS namespace (default) or share the host hostname
                      (host PID/IPC/UTS sharing is security-sensitive; --hostname is
                      incompatible with --uts host)
