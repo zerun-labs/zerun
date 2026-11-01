@@ -269,14 +269,29 @@ pub fn run_detached(
             terminal_lock = Some(lock);
             break;
         }
-        match ContainerState::load(&store, &id) {
+        let current = match ContainerState::load(&store, &id) {
             Some(current)
                 if current.restart_pending
-                    && reaper_owns_state(&current, reaper_pid, reaper_start_time) => {}
+                    && reaper_owns_state(&current, reaper_pid, reaper_start_time) =>
+            {
+                current
+            }
             _ => {
                 terminal_lock = Some(lock);
                 break;
             }
+        };
+        // `update --restart` may have changed the policy while the reaper was
+        // sleeping. Re-evaluate against the current state so disabling or
+        // tightening the policy cancels the attempt that has not started yet.
+        if !pending_restart_allowed(
+            current.exit_code,
+            current.restart_policy,
+            current.restart_count,
+        ) {
+            finish_cancelled_restart(&store, &id, reaper_pid, reaper_start_time);
+            terminal_lock = Some(lock);
+            break;
         }
         held_restart_lock = Some(lock);
     }
@@ -353,6 +368,17 @@ fn finish_cancelled_restart(store: &Store, id: &str, pid: i32, start_time: Optio
 
 fn next_restart_delay(delay: Duration) -> Duration {
     delay.saturating_mul(2).min(RESTART_MAX_DELAY)
+}
+
+/// Decide whether a terminal attempt persisted by this reaper may still launch.
+/// `restart_count` already includes the pending attempt, while
+/// `RestartPolicy::should_restart` counts completed automatic attempts.
+fn pending_restart_allowed(
+    exit_code: Option<i32>,
+    policy: crate::restart::RestartPolicy,
+    restart_count: u32,
+) -> bool {
+    exit_code.is_some_and(|code| policy.should_restart(code, restart_count.saturating_sub(1)))
 }
 
 /// Background pipe -> timestamped console.log collector.
@@ -848,6 +874,42 @@ fn terminate_and_remove_cgroup(id: &str, path: &Path) -> ZResult<()> {
 /// Write all of `buf` to `fd`, tolerating EINTR (best effort).
 fn write_all(fd: RawFd, buf: &[u8]) -> ZResult<()> {
     crate::syscalls::write_all_fd(fd, buf)
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+
+    #[test]
+    fn pending_restart_rechecks_the_current_policy() {
+        use crate::restart::RestartPolicy;
+
+        assert!(!pending_restart_allowed(Some(7), RestartPolicy::No, 1));
+        assert!(pending_restart_allowed(Some(7), RestartPolicy::Always, 1));
+        assert!(pending_restart_allowed(Some(0), RestartPolicy::Always, 1));
+        assert!(!pending_restart_allowed(
+            Some(0),
+            RestartPolicy::OnFailure {
+                max_retries: Some(2)
+            },
+            1
+        ));
+        assert!(pending_restart_allowed(
+            Some(7),
+            RestartPolicy::OnFailure {
+                max_retries: Some(2)
+            },
+            1
+        ));
+        assert!(!pending_restart_allowed(
+            Some(7),
+            RestartPolicy::OnFailure {
+                max_retries: Some(1)
+            },
+            2
+        ));
+        assert!(!pending_restart_allowed(None, RestartPolicy::Always, 1));
+    }
 }
 
 #[cfg(test)]

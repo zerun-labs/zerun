@@ -6142,8 +6142,7 @@ fn cmd_update(args: &[String]) -> i32 {
         return 1;
     }
     let restart_only = restart_policy.is_some() && !limits_requested;
-    let restart_on_exited =
-        restart_only && st.status == state::Status::Exited && !st.restart_pending;
+    let restart_on_exited = restart_only && st.status == state::Status::Exited;
     if !restart_on_exited && (st.status != state::Status::Running || !st.pid_alive()) {
         eprintln!(
             "zerun update: container {} is not running (only --restart may be changed on an exited container)",
@@ -7770,7 +7769,7 @@ USAGE:\n  \
   zerun rm [-f] CONTAINER...            remove stopped containers (-f: kill first)\n  \
   zerun logs [--tail N] [--since TIME] [--until TIME] [-f] [-t] CONTAINER\n  \
   zerun stats [-a] [CONTAINER...]        one-shot resource metrics\n  \
-  zerun update [opts] CONTAINER          change live resource limits\n  \
+  zerun update [opts] CONTAINER          change live limits or restart policy\n  \
   zerun inspect CONTAINER...             dump container state as JSON\n  \
   zerun port CONTAINER                   list published port mappings\n  \
   zerun rename OLD NEW                   rename a container\n  \

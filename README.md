@@ -331,7 +331,8 @@ per-device I/O limits, and the restart policy of a running detached container. I
 merge into the current `io.max` view, so changing one device or direction leaves the other
 kernel limits intact; the updated restart policy is used by the reaper on the next exit and
 is retained by manual `start`/`restart`. `--restart` may also be changed on an exited
-container. Resource limits return to their launch-time values after `restart`.
+container. Changing the policy to `no` while the reaper is between attempts cancels the
+pending retry. Resource limits return to their launch-time values after `restart`.
 
 `--group-add` replaces the inherited supplementary group list, whether the workload
 runs as root or another user. Names are resolved against the container's `/etc/group`
