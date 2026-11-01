@@ -144,14 +144,12 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--stop-timeout".into());
         run_args.push(v.to_string());
     }
-    if a.net != NetMode::None {
-        run_args.push("--net".into());
-        run_args.push(match a.net {
-            NetMode::Host => "host".into(),
-            NetMode::Bridge => "bridge".into(),
-            NetMode::None => unreachable!("handled above"),
-        });
-    }
+    run_args.push("--net".into());
+    run_args.push(match a.net {
+        NetMode::Host => "host".into(),
+        NetMode::Bridge => "bridge".into(),
+        NetMode::None => "none".into(),
+    });
     if a.use_init {
         run_args.push("--init".into());
     }
@@ -559,6 +557,14 @@ mod tests {
     }
 
     #[test]
+    fn renders_explicit_isolated_network_and_pid_aliases() {
+        let a = args(&["--network=none", "--pids-limit=-1", "alpine", "true"]);
+        let unit = render(Path::new("/usr/local/bin/zerun"), &a, false).unwrap();
+        assert!(unit.contains("--net none"));
+        assert!(unit.contains("--pids -1"));
+    }
+
+    #[test]
     fn renders_cpuset_limits() {
         let a = args(&[
             "--cpuset-cpus",
@@ -920,7 +926,10 @@ mod tests {
         let dir_str = dir.display().to_string();
         let a = args(&["--rootfs", &dir_str, "--init", "--", "/bin/true"]);
         let unit = render(Path::new("/bin/zerun"), &a, true).unwrap();
-        assert!(unit.contains(&format!("--rootfs {} --init -- /bin/true", dir.display())));
+        assert!(unit.contains(&format!(
+            "--rootfs {} --net none --init -- /bin/true",
+            dir.display()
+        )));
         std::fs::remove_dir(&dir).unwrap();
     }
 
@@ -928,7 +937,7 @@ mod tests {
     fn image_command_is_separated_from_run_options() {
         let a = args(&["--name", "web", "alpine", "echo", "hi"]);
         let unit = render(Path::new("/bin/zerun"), &a, true).unwrap();
-        assert!(unit.contains("ExecStart=/bin/zerun run --name web alpine -- echo hi\n"));
+        assert!(unit.contains("ExecStart=/bin/zerun run --name web --net none alpine -- echo hi\n"));
     }
 
     #[test]
