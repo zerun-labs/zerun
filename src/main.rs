@@ -3539,7 +3539,7 @@ fn cmd_doctor() -> i32 {
     if let Some(rel) = syscalls::kernel_release() {
         println!("kernel release : {rel}  (baseline recommendation >= 5.10 LTS)");
     }
-    match cgroup::detect_cgroup2_root() {
+    let cgroup_available = match cgroup::detect_cgroup2_root() {
         Ok(root) => {
             let ctrl = std::fs::read_to_string(root.join("cgroup.controllers")).unwrap_or_default();
             println!(
@@ -3547,8 +3547,29 @@ fn cmd_doctor() -> i32 {
                 root.display(),
                 ctrl.trim()
             );
+            true
         }
-        Err(e) => println!("cgroup v2      : MISSING ({e})"),
+        Err(e) => {
+            println!("cgroup v2      : MISSING ({e})");
+            false
+        }
+    };
+    let uid = syscalls::effective_uid();
+    if uid == 0 {
+        if cgroup_available {
+            match device_cgroup::probe() {
+                Ok(()) => println!(
+                    "device policy  : OK (mandatory cgroup v2 eBPF allowlist for rootful runs)"
+                ),
+                Err(e) => {
+                    println!("device policy  : UNAVAILABLE ({e}); rootful runs will be refused")
+                }
+            }
+        } else {
+            println!("device policy  : UNAVAILABLE (cgroup v2 is required); rootful runs will be refused");
+        }
+    } else {
+        println!("device policy  : not required for rootless runs");
     }
     match std::fs::read_to_string("/proc/sys/user/max_user_namespaces") {
         Ok(v) => println!("user namespaces: max = {}", v.trim()),
@@ -3584,7 +3605,7 @@ fn cmd_doctor() -> i32 {
     }
     println!(
         "uid            : {} (rootful isolation needs uid=0; non-root goes rootless via NEWUSER)",
-        syscalls::effective_uid()
+        uid
     );
     0
 }

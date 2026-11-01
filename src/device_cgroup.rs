@@ -9,6 +9,7 @@ use crate::error::ZResult;
 use crate::mounts::{DeviceKind, DeviceMount, DEVICE_NODES};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const ACCESS_MKNOD: u32 = 1;
 const ACCESS_READ: u32 = 2;
@@ -53,6 +54,32 @@ struct DeviceRule {
 pub fn attach(cgroup: &Path, devices: &[DeviceMount]) -> ZResult<()> {
     let program = build_program(&policy(devices));
     crate::syscalls::attach_cgroup_device_program(cgroup, &program)
+}
+
+/// Verify that this host can create a Zerun cgroup and attach the mandatory
+/// rootful device policy.
+///
+/// `zerun doctor` uses a short-lived empty cgroup so the probe exercises the
+/// same load/attach path as a real run without restricting the caller. The
+/// nonce avoids stale collisions while the atomic leaf creation still rejects
+/// concurrent collisions rather than sharing another cgroup.
+pub fn probe() -> ZResult<()> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let id = format!("d0c70{:x}{nonce:x}", std::process::id());
+    let cgroup = crate::cgroup::CgroupV2::create(&id, &crate::cgroup::ResourceLimits::default())?;
+    let path = cgroup.path().to_path_buf();
+    attach(&path, &[])?;
+    drop(cgroup);
+    if path.exists() {
+        return Err(crate::zerr!(
+            "device policy probe left temporary cgroup {} behind",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn policy(devices: &[DeviceMount]) -> Vec<DeviceRule> {

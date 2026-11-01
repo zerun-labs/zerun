@@ -127,6 +127,10 @@ cargo build --release
 ./target/release/zerun doctor
 ```
 
+`doctor` also creates a short-lived empty cgroup and attaches the same device
+BPF policy used by rootful workloads, so it reports whether the mandatory
+device boundary is actually available on the host.
+
 Static musl build (for minimal edge root filesystems):
 
 ```bash
