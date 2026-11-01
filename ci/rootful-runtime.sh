@@ -353,11 +353,11 @@ fi
 # and resource limits.
 restart_id=$("${zerun[@]}" run -dt --rootfs "$rootfs" --no-overlay --net none \
   --ulimit nofile=64:96 --init -- /bin/sh -c \
-  'if [ -t 0 ] && [ -t 1 ] && [ -t 2 ]; then tty=yes; else tty=no; fi; printf "restart-ok nofile=%s:%s tty=%s\\n" "$(ulimit -Sn)" "$(ulimit -Hn)" "$tty"; sleep 30')
+  'if [ -t 0 ] && [ -t 1 ] && [ -t 2 ]; then tty=yes; else tty=no; fi; geometry=$(/bin/busybox stty -a 2>/dev/null | /bin/busybox grep -o "rows [0-9]*; columns [0-9]*"); printf "restart-ok nofile=%s:%s tty=%s geometry=%s\\n" "$(ulimit -Sn)" "$(ulimit -Hn)" "$tty" "$geometry"; sleep 30')
 cleanup_ids+=("$restart_id")
 for attempt in $(seq 1 50); do
   restart_logs=$("${zerun[@]}" logs "$restart_id" 2>/dev/null || true)
-  if (( $(grep -c 'restart-ok nofile=64:96 tty=yes' <<<"$restart_logs" || true) >= 1 )); then
+  if (( $(grep -c 'restart-ok nofile=64:96 tty=yes geometry=rows 24; columns 80' <<<"$restart_logs" || true) >= 1 )); then
     break
   fi
   if (( attempt == 50 )); then
@@ -369,7 +369,7 @@ done
 "${zerun[@]}" restart --time 1 "$restart_id" >/dev/null
 for attempt in $(seq 1 50); do
   restart_logs=$("${zerun[@]}" logs "$restart_id" 2>/dev/null || true)
-  if (( $(grep -c 'restart-ok nofile=64:96 tty=yes' <<<"$restart_logs" || true) >= 2 )); then
+  if (( $(grep -c 'restart-ok nofile=64:96 tty=yes geometry=rows 24; columns 80' <<<"$restart_logs" || true) >= 2 )); then
     break
   fi
   if (( attempt == 50 )); then

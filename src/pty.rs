@@ -11,6 +11,14 @@ use crate::syscalls;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+/// Sane geometry for PTYs that have no host terminal to mirror.
+///
+/// Linux creates a fresh PTY with a zero-sized window. Terminal-aware
+/// programs commonly derive their layout from that value, and a detached
+/// `run -dt` has no caller terminal to copy at attach time.
+const DEFAULT_PTY_ROWS: u16 = 24;
+const DEFAULT_PTY_COLS: u16 = 80;
+
 /// Owns the parent-side ends of a PTY during spawn/setup.
 pub(crate) struct PtyPair {
     master: Option<RawFd>,
@@ -21,11 +29,20 @@ pub(crate) struct PtyPair {
 impl PtyPair {
     pub(crate) fn open() -> ZResult<Self> {
         let (master, slave) = syscalls::open_pty()?;
-        Ok(Self {
+        let pair = Self {
             master: Some(master),
             slave,
             child_owns_slave: false,
-        })
+        };
+        let size = libc::winsize {
+            ws_row: DEFAULT_PTY_ROWS,
+            ws_col: DEFAULT_PTY_COLS,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // Drop the whole pair on failure so neither descriptor leaks.
+        syscalls::set_terminal_window_size(master, &size)?;
+        Ok(pair)
     }
 
     pub(crate) fn master(&self) -> RawFd {
@@ -113,16 +130,14 @@ fn install_resize_handler(master: RawFd) {
 /// raw mode. Output-only mode leaves stdin alone, matching `run -t` without
 /// `-i`; the pump stops when the container closes its PTY.
 pub fn attach(master: RawFd, interactive: bool) -> ZResult<std::thread::JoinHandle<()>> {
-    let guard = if interactive {
-        match RawTerminalGuard::attach(master, interactive) {
-            Ok(g) => Some(g),
-            Err(e) => {
-                eprintln!("zerun: warning: failed to attach host terminal: {e}");
-                None
-            }
+    // Output-only sessions still mirror window geometry and react to resize;
+    // only raw input mode depends on `interactive`.
+    let guard = match RawTerminalGuard::attach(master, interactive) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("zerun: warning: failed to attach host terminal: {e}");
+            None
         }
-    } else {
-        None
     };
 
     std::thread::Builder::new()
@@ -190,5 +205,18 @@ fn pump(master: RawFd, interactive: bool) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_pty_has_a_sane_default_window_size() {
+        let pair = PtyPair::open().expect("open PTY");
+        let size = syscalls::terminal_window_size(pair.master()).expect("read PTY size");
+        assert_eq!(size.ws_row, DEFAULT_PTY_ROWS);
+        assert_eq!(size.ws_col, DEFAULT_PTY_COLS);
     }
 }

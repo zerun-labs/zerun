@@ -385,9 +385,11 @@ disappears when the container exits. If the host crashes (or the reaper is kille
 next `ps`/`rm` reconciles the stale record and reclaims host-side resources.
 
 `-dt` allocates a PTY for a detached workload, so terminal-aware services retain
-line-buffered output and `TERM` defaults. `logs` and `attach` receive the PTY stream;
-detached stdin is not connected, so `-i` remains a foreground-only option. The TTY choice
-is part of the saved launch arguments and survives `start`/`restart`.
+line-buffered output and `TERM` defaults. Detached PTYs start at a conventional 24x80
+geometry; output-only foreground PTYs mirror and follow the caller terminal's resize
+events when stdin is a terminal. `logs` and `attach` receive the PTY stream; detached
+stdin is not connected, so `-i` remains a foreground-only option. The TTY choice is part
+of the saved launch arguments and survives `start`/`restart`.
 
 `--restart=on-failure[:MAX]` retries non-zero exits (an omitted or zero maximum is
 unlimited), `always` retries every exit, and `unless-stopped` retries every exit until a
