@@ -7536,7 +7536,7 @@ RUN OPTIONS:\n  \
   --health-timeout D       per-probe timeout before SIGKILL (default 30s)\n  \
   --health-retries N       consecutive failures before unhealthy (default 3)\n  \
   --health-start-period D  initialization window excluded from retry counting\n  \
-  --health-start-interval D  probe delay while status is starting\n  \
+  --health-start-interval D  probe delay during the start period (default 5s)\n  \
   --no-healthcheck         disable an image-declared HEALTHCHECK\n  \
   --restart POLICY        detached restart policy (no|on-failure[:max]|always|unless-stopped)\n  \
   --net, --network none|host|bridge\n  \

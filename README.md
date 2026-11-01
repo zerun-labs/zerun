@@ -244,7 +244,7 @@ Run options (current subset):
 --health-start-period D
                      initialization window whose failures do not consume retries
 --health-start-interval D
-                     check interval while status is still starting
+                     check interval during the start period (default 5s)
 --no-healthcheck     disable an image-declared HEALTHCHECK
 --restart POLICY     detached restart policy: no, on-failure[:MAX], always, or
                      unless-stopped (requires -d; incompatible with --rm)

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 pub const DEFAULT_INTERVAL_NS: u64 = 30_000_000_000;
 pub const DEFAULT_TIMEOUT_NS: u64 = 30_000_000_000;
+pub const DEFAULT_START_INTERVAL_NS: u64 = 5_000_000_000;
 pub const DEFAULT_RETRIES: u32 = 3;
 pub const DEFAULT_START_PERIOD_NS: u64 = 0;
 
@@ -116,12 +117,17 @@ impl Healthcheck {
         }
     }
 
-    fn delay_for(&self, health: Option<&HealthState>) -> Duration {
+    fn in_start_period(&self, elapsed: Duration) -> bool {
+        self.start_period_ns > 0 && elapsed < Duration::from_nanos(self.start_period_ns)
+    }
+
+    fn delay_for(&self, health: Option<&HealthState>, in_start_period: bool) -> Duration {
         let ns = match health.map(|health| health.status) {
-            Some(HealthStatus::Starting) | None => {
-                self.start_interval_ns.unwrap_or(self.interval_ns)
+            Some(HealthStatus::Starting) | None if in_start_period => {
+                self.start_interval_ns.unwrap_or(DEFAULT_START_INTERVAL_NS)
             }
             Some(HealthStatus::Healthy | HealthStatus::Unhealthy) => self.interval_ns,
+            _ => self.interval_ns,
         };
         Duration::from_nanos(ns.max(1))
     }
@@ -551,7 +557,10 @@ fn run_monitor(
             std::thread::sleep(MONITOR_POLL_INTERVAL);
             continue;
         }
-        let delay = check.delay_for(state.health.as_ref());
+        let delay = check.delay_for(
+            state.health.as_ref(),
+            check.in_start_period(started.elapsed()),
+        );
         std::thread::sleep(delay);
 
         // Reload after sleeping: stop/pause/rename may have changed the record
@@ -570,8 +579,7 @@ fn run_monitor(
         let Some(check) = state.healthcheck.as_ref() else {
             return 0;
         };
-        let in_start_period = check.start_period_ns > 0
-            && started.elapsed() < Duration::from_nanos(check.start_period_ns);
+        let in_start_period = check.in_start_period(started.elapsed());
         let probe_started = state::now_rfc3339_nanos();
         let result = probe(&state, check);
         let probe_finished = state::now_rfc3339_nanos();
@@ -808,6 +816,47 @@ mod tests {
         assert_eq!(
             apply_probe_result(Some(&first_failure), false, false, 2),
             (HealthStatus::Unhealthy, 2)
+        );
+    }
+
+    #[test]
+    fn start_interval_applies_only_during_the_start_period() {
+        let starting = HealthState::starting();
+        let healthy = HealthState {
+            status: HealthStatus::Healthy,
+            failing_streak: 0,
+            log: Vec::new(),
+        };
+        let mut check = Healthcheck::new(vec!["CMD".to_string(), "true".to_string()]).unwrap();
+        check.interval_ns = 30_000_000_000;
+        check.start_period_ns = 10_000_000_000;
+        check.start_interval_ns = Some(500_000_000);
+
+        assert!(check.in_start_period(Duration::from_secs(9)));
+        assert!(!check.in_start_period(Duration::from_secs(10)));
+        assert_eq!(
+            check.delay_for(Some(&starting), true),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            check.delay_for(Some(&starting), false),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            check.delay_for(Some(&healthy), true),
+            Duration::from_secs(30)
+        );
+
+        check.start_interval_ns = None;
+        assert_eq!(
+            check.delay_for(Some(&starting), true),
+            Duration::from_secs(5)
+        );
+
+        check.start_period_ns = 0;
+        assert_eq!(
+            check.delay_for(Some(&starting), check.in_start_period(Duration::ZERO)),
+            Duration::from_secs(30)
         );
     }
 
