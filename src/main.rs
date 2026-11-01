@@ -2013,6 +2013,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
                 lower,
                 anonymous_volumes,
                 image_volumes: image_volume_targets,
+                exposed_ports: a.exposed_ports.iter().map(ToString::to_string).collect(),
                 resume,
                 report_id,
                 image_rootfs_lease,
@@ -2297,6 +2298,9 @@ struct DetachedInfo {
     anonymous_volumes: Vec<String>,
     /// Original image `VOLUME` targets retained for commit metadata.
     image_volumes: Vec<String>,
+    /// Normalized image/CLI exposed-port declarations retained for inspection
+    /// and `ps`; publishing itself uses the concrete `RunSpec::ports` list.
+    exposed_ports: Vec<String>,
     resume: Option<ContainerState>,
     report_id: bool,
     image_rootfs_lease: Option<image::store::ImageRootfsLease>,
@@ -2443,6 +2447,7 @@ fn run_detached(
         ports: Vec::new(),
         port_protocols: None,
         port_ips: None,
+        exposed_ports: Vec::new(),
         ip: None,
         cmd: Vec::new(),
         env: Vec::new(),
@@ -2506,6 +2511,9 @@ fn run_detached(
     } else {
         Some(spec.ports.iter().map(|p| p.host_ip.to_string()).collect())
     };
+    if !resuming {
+        st.exposed_ports = info.exposed_ports.clone();
+    }
     st.name = info.name;
     st.cmd = spec.argv.clone();
     st.env = env;
@@ -4448,6 +4456,7 @@ fn ps_row(st: &ContainerState) -> Vec<String> {
             &st.ports,
             st.port_ips.as_deref(),
             st.port_protocols.as_deref(),
+            &st.exposed_ports,
         ),
         st.name.clone().unwrap_or_default(),
     ]
@@ -4493,8 +4502,9 @@ fn ports_label(
     ports: &[(u16, u16)],
     ips: Option<&[String]>,
     protocols: Option<&[String]>,
+    exposed: &[String],
 ) -> String {
-    ports
+    let mut labels: Vec<String> = ports
         .iter()
         .enumerate()
         .map(|(i, (h, c))| {
@@ -4507,8 +4517,30 @@ fn ports_label(
                 .unwrap_or("tcp");
             format!("{}:{h}->{c}/{protocol}", network::host_ip_label(ip))
         })
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect();
+    let mut seen: BTreeSet<(u16, String)> = ports
+        .iter()
+        .enumerate()
+        .map(|(i, (_, container))| {
+            let protocol = protocols
+                .and_then(|values| values.get(i).map(String::as_str))
+                .unwrap_or("tcp")
+                .to_ascii_lowercase();
+            (*container, protocol)
+        })
+        .collect();
+    for value in exposed {
+        let Ok(ports) = network::parse_expose(value) else {
+            continue;
+        };
+        for port in ports {
+            let protocol = port.protocol.label().to_string();
+            if seen.insert((port.port, protocol.clone())) {
+                labels.push(format!("{}/{protocol}", port.port));
+            }
+        }
+    }
+    labels.join(", ")
 }
 
 fn cmd_wait(args: &[String]) -> i32 {
@@ -8948,14 +8980,31 @@ mod tests {
             ports_label(
                 &ports,
                 ips.as_deref(),
-                Some(&["udp".to_string(), "tcp".to_string()])
+                Some(&["udp".to_string(), "tcp".to_string()]),
+                &[]
             ),
             "127.0.0.1:53->53/udp, [::1]:8080->80/tcp"
         );
         assert_eq!(
-            ports_label(&ports, None, None),
+            ports_label(&ports, None, None, &[]),
             "0.0.0.0:53->53/tcp, 0.0.0.0:8080->80/tcp"
         );
+        let exposed = [
+            "53/udp".to_string(),
+            "80/tcp".to_string(),
+            "443/tcp".to_string(),
+            "443/tcp".to_string(),
+        ];
+        assert_eq!(
+            ports_label(
+                &ports,
+                ips.as_deref(),
+                Some(&["udp".to_string(), "tcp".to_string()]),
+                &exposed
+            ),
+            "127.0.0.1:53->53/udp, [::1]:8080->80/tcp, 443/tcp"
+        );
+        assert_eq!(ports_label(&[], None, None, &exposed[2..]), "443/tcp");
     }
 
     #[test]

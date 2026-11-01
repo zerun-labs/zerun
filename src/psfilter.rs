@@ -174,6 +174,7 @@ mod tests {
             ports: vec![],
             port_protocols: None,
             port_ips: None,
+            exposed_ports: vec![],
             ip: None,
             cmd: vec!["sh".to_string()],
             env: vec![],

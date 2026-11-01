@@ -1128,6 +1128,7 @@ mod attach_tests {
             ports: Vec::new(),
             port_protocols: None,
             port_ips: None,
+            exposed_ports: Vec::new(),
             ip: None,
             cmd: vec!["/bin/sh".to_string()],
             env: Vec::new(),

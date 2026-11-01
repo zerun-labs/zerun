@@ -457,6 +457,10 @@ pub struct ContainerState {
     /// Host bind address for each port. Older records bind 0.0.0.0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port_ips: Option<Vec<String>>,
+    /// Normalized image `EXPOSE` and `--expose` declarations (`PORT/PROTOCOL`).
+    /// Older records have no exposed-port metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exposed_ports: Vec<String>,
     /// Bridge IP when net == bridge.
     pub ip: Option<Ipv4Addr>,
     /// Command the container runs.
@@ -837,6 +841,7 @@ mod tests {
             ports: Vec::new(),
             port_protocols: None,
             port_ips: None,
+            exposed_ports: Vec::new(),
             ip: None,
             cmd: Vec::new(),
             env: Vec::new(),
@@ -893,6 +898,7 @@ mod tests {
         assert_eq!(state.ulimits, None);
         assert_eq!(state.group_add, None);
         assert!(state.sysctls.is_empty());
+        assert!(state.exposed_ports.is_empty());
         assert_eq!(state.namespaces, NamespaceModes::default());
     }
 
@@ -989,6 +995,7 @@ mod tests {
             ports: vec![],
             port_protocols: None,
             port_ips: None,
+            exposed_ports: vec![],
             ip: None,
             cmd: vec![],
             env: vec![],
@@ -1092,6 +1099,7 @@ mod tests {
             ports: vec![],
             port_protocols: None,
             port_ips: None,
+            exposed_ports: vec![],
             ip: None,
             cmd: vec!["sh".to_string()],
             env: vec![],

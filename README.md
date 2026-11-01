@@ -509,7 +509,9 @@ reaper; neither recreates a container after a host reboot. `--restart` requires 
 cannot be combined with `--rm`, and is rejected by `generate-service` because systemd owns
 service restart semantics.
 `-p` can bind a specific host address (`127.0.0.1:18080:80` or `[::1]:18080:80`);
-`zerun port` and `ps` display the selected bind address. Repeatable
+`zerun port` and `ps` display the selected bind address. Image `EXPOSE` and `--expose`
+declarations are persisted in the container state, shown by `inspect`, and listed as
+unpublished `PORT/PROTOCOL` entries in `ps`; restarting a container retains them. Repeatable
 `--add-host NAME:IP` entries are written to the container `/etc/hosts`; the special
 `host-gateway` value resolves to the bridge gateway (`10.88.0.1`) in bridge mode.
 `logs` hides capture-time timestamps by default; `-t/--timestamps` shows them.

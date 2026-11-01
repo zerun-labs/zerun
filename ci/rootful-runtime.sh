@@ -998,7 +998,7 @@ wait_for_http_body "$range_port_end" zerun-range-b-ok
 # `-P` turns CLI-exposed ports into concrete random mappings before launch.
 # Resolve the selected host port through `zerun port` and verify real traffic.
 publish_all_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net bridge \
-  --expose 8080 -P --init -- /bin/httpd -f -p 8080 -h /srv)
+  --expose 8080,9090 -P --init -- /bin/httpd -f -p 8080 -h /srv)
 cleanup_ids+=("$publish_all_id")
 publish_all_output=$("${zerun[@]}" port "$publish_all_id")
 publish_all_port=$(sed -n 's|^8080/tcp -> .*:\([0-9][0-9]*\)$|\1|p' <<<"$publish_all_output")
@@ -1007,6 +1007,16 @@ publish_all_port=$(sed -n 's|^8080/tcp -> .*:\([0-9][0-9]*\)$|\1|p' <<<"$publish
   exit 1
 }
 wait_for_http_body "$publish_all_port" zerun-port-ok
+publish_all_inspect=$("${zerun[@]}" inspect "$publish_all_id")
+grep -F '"exposed_ports"' <<<"$publish_all_inspect" >/dev/null
+grep -F '"8080/tcp"' <<<"$publish_all_inspect" >/dev/null
+grep -F '"9090/tcp"' <<<"$publish_all_inspect" >/dev/null
+grep -F '9090/tcp' <<<"$("${zerun[@]}" ps)" >/dev/null
+"${zerun[@]}" stop --time 2 "$publish_all_id" >/dev/null
+"${zerun[@]}" start "$publish_all_id" >/dev/null
+wait_for_http_body "$publish_all_port" zerun-port-ok
+publish_all_inspect=$("${zerun[@]}" inspect "$publish_all_id")
+grep -F '"9090/tcp"' <<<"$publish_all_inspect" >/dev/null
 "${zerun[@]}" stop --time 2 "$publish_all_id" >/dev/null
 "${zerun[@]}" rm "$publish_all_id" >/dev/null
 
