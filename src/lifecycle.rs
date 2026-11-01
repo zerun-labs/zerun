@@ -102,9 +102,10 @@ pub fn run_detached(
     log: LogTarget<'_>,
 ) -> i32 {
     let id = spec.id.clone();
-    // Replace inherited stdio with a timestamping collector before clone so
-    // the container's real stdout/stderr are the collector's write ends. The
-    // collector and attach hub remain installed across automatic restarts.
+    // Replace inherited stdio with a timestamping collector before launching
+    // the namespace supervisor so the container's real stdout/stderr are the
+    // collector's write ends. The collector and attach hub remain installed
+    // across automatic restarts.
     let mut captured_log = match CapturedLog::install(log.path, log.previous_fd, log.options) {
         Ok(log) => log,
         Err(e) => {
@@ -170,9 +171,9 @@ pub fn run_detached(
             Err(error) => {
                 // Setup failed before the child could exec (cgroup create,
                 // bridge allocation...). The error pipe path inside
-                // namespace.rs prints its own details for post-clone failures;
-                // this is the pre-clone kind. The retry loop resets `code` to
-                // one before every attempt.
+                // namespace.rs prints its own details after the supervisor
+                // starts; this is the pre-launch kind. The retry loop resets
+                // `code` to one before every attempt.
                 start_error = Some(error.to_string());
                 eprintln!("zerun: {error}");
             }
@@ -355,7 +356,7 @@ impl CapturedLog {
         let (read_fd, write_fd) = crate::syscalls::pipe2_cloexec()?;
 
         // Detached stdin has no terminal. stdout/stderr become the pipe read by
-        // the collector; the container inherits these write ends through clone.
+        // the collector; the container inherits these write ends through fork.
         // The original log File is no longer needed because the collector owns
         // its own append-mode handle.
         crate::syscalls::redirect_stdin_devnull()?;

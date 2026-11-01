@@ -222,7 +222,7 @@ pub fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(target: P, link: Q) -> ZResult<()
 ///
 /// The master gets CLOEXEC so a container child cannot accidentally inherit the
 /// host side across `execve`. The caller must dup2 the slave onto container
-/// stdio and close its own slave descriptor after clone.
+/// stdio and close its own slave descriptor after the worker fork.
 pub fn open_pty() -> ZResult<(RawFd, RawFd)> {
     let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
     if master < 0 {
@@ -352,6 +352,24 @@ pub fn reset_signal_handler(sig: c_int) -> ZResult<()> {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        if libc::sigaction(sig, &sa, std::ptr::null_mut()) != 0 {
+            return Err(last_err("sigaction"));
+        }
+    }
+    Ok(())
+}
+
+/// Ignore a signal in a forked supervisor process.
+///
+/// The namespaced-child supervisor must survive terminal/job-control signals
+/// that are also delivered to the runtime parent and workload. The parent
+/// forwards the configured stop signal to the workload explicitly.
+pub fn ignore_signal(sig: c_int) -> ZResult<()> {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = libc::SIG_IGN;
         libc::sigemptyset(&mut sa.sa_mask);
         sa.sa_flags = 0;
         if libc::sigaction(sig, &sa, std::ptr::null_mut()) != 0 {
@@ -550,6 +568,43 @@ pub fn fork_process() -> ZResult<libc::pid_t> {
         return Err(last_err("fork"));
     }
     Ok(pid)
+}
+
+/// Create new namespaces for this process without changing its PID-namespace
+/// membership. A subsequent fork enters the requested PID namespace; all other
+/// namespace types apply to the caller immediately and are inherited by that
+/// child.
+pub fn unshare_namespaces(flags: c_int) -> ZResult<()> {
+    if unsafe { libc::unshare(flags) } != 0 {
+        return Err(last_err("unshare"));
+    }
+    Ok(())
+}
+
+/// Close every file descriptor greater than or equal to `first`.
+///
+/// The long-lived namespaced-child supervisor uses this after its worker fork
+/// so lifecycle locks and pipes inherited from a multithreaded parent do not
+/// stay open until the workload exits.
+pub fn close_fds_from(first: RawFd) -> ZResult<()> {
+    if first < 0 {
+        return Err(crate::zerr!("invalid close_range start fd {first}"));
+    }
+    if unsafe { libc::syscall(libc::SYS_close_range, first, u32::MAX, 0) } == 0 {
+        return Ok(());
+    }
+    // Fall back for old kernels, architecture-specific syscall gaps, and
+    // seccomp policies that reject close_range(2). The supervisor depends on
+    // releasing inherited lifecycle locks even when that syscall is blocked.
+    // close(2) ignores EBADF and is bounded by the process descriptor limit.
+    let max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    let max = if max > 0 { max } else { 65_536 };
+    for fd in first..max as RawFd {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+    Ok(())
 }
 
 pub fn pipe2_cloexec() -> ZResult<(RawFd, RawFd)> {
@@ -794,93 +849,6 @@ pub fn socket_peer_connected(fd: RawFd) -> bool {
             Some(libc::EINTR) => continue,
             Some(libc::EAGAIN) => return true,
             _ => return false,
-        }
-    }
-}
-
-// ---------- clone: the only entry point into new namespaces ----------
-
-const CLONE_STACK_SIZE: usize = 8 * 1024 * 1024;
-const PAGE_SIZE: usize = 4096;
-
-/// Create a child process with the given clone flags; the child runs `child_fn`.
-///
-/// New PID/NET/etc. namespaces must be created by a new child process; the caller
-/// never enters them itself. The child stack is an anonymous mmap (lazily
-/// populated, unlike a zeroed Box array, so debug builds do not overflow the
-/// parent stack) with a PROT_NONE guard page below it. Without `CLONE_VM` the
-/// child receives a private copy-on-write view, so the parent releases its own
-/// mapping immediately after a successful clone; this matters for the
-/// long-lived detached reaper, which repeats the clone for restart attempts.
-pub fn clone_into<F>(flags: c_int, child_fn: F) -> ZResult<i32>
-where
-    F: FnOnce() -> ZResult<()> + Send + 'static,
-{
-    let arg = Box::into_raw(Box::new(child_fn)) as *mut c_void;
-    let total = CLONE_STACK_SIZE + PAGE_SIZE;
-    let base = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            total,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    if base == libc::MAP_FAILED {
-        unsafe {
-            drop(Box::from_raw(arg as *mut F));
-        }
-        return Err(last_err("mmap clone stack"));
-    }
-    // Guard page at the bottom of the mapping: a runaway child stack hits
-    // SIGSEGV instead of silently corrupting adjacent memory.
-    if unsafe { libc::mprotect(base, PAGE_SIZE, libc::PROT_NONE) } != 0 {
-        unsafe {
-            drop(Box::from_raw(arg as *mut F));
-            libc::munmap(base, total);
-        }
-        return Err(last_err("mprotect clone stack guard"));
-    }
-    let top = (base as usize + total) as *mut c_void;
-
-    let pid = unsafe { libc::clone(trampoline::<F>, top, flags, arg) };
-    if pid < 0 {
-        unsafe {
-            drop(Box::from_raw(arg as *mut F));
-            libc::munmap(base, total);
-        }
-        return Err(last_err("clone"));
-    }
-    // clone(2) without CLONE_VM gives the child a copy-on-write memory map.
-    // Keeping a CLONE_VM child on an ordinary Rust stack would be unsound, so
-    // every caller uses the copy-on-write form. Release the parent's stack and
-    // closure after the address spaces have diverged; the child owns its own
-    // copies, and a restarting reaper must not leak one closure per attempt.
-    debug_assert_eq!(flags & libc::CLONE_VM, 0);
-    if flags & libc::CLONE_VM == 0 {
-        unsafe {
-            drop(Box::from_raw(arg as *mut F));
-            libc::munmap(base, total);
-        }
-    }
-    Ok(pid)
-}
-
-extern "C" fn trampoline<F>(arg: *mut c_void) -> c_int
-where
-    F: FnOnce() -> ZResult<()> + Send,
-{
-    let f = unsafe { Box::from_raw(arg as *mut F) };
-    match f() {
-        // Success normally ends in execve and never returns here. Returning here
-        // only happens when exec failed; the error has already been reported to
-        // the parent over the error pipe. Exit code 1.
-        Ok(()) => 0,
-        Err(e) => {
-            eprintln!("zerun: child failed: {e}");
-            1
         }
     }
 }

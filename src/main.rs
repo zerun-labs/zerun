@@ -1571,7 +1571,7 @@ fn cleanup_failed_detached_start(
 
 /// `zerun run -d` / `zerun start`: fork a per-container reaper, optionally
 /// print the container id once the workload is up, and exit. Everything
-/// container-shaped (clone, wait, host-resource teardown, overlay cleanup,
+/// container-shaped (spawn, wait, host-resource teardown, overlay cleanup,
 /// state updates) happens in the reaper child (src/lifecycle.rs); it writes
 /// `0` / `1:<error>` over the started pipe so the CLI never reports success
 /// for a container that failed to start.

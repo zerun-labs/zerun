@@ -11,7 +11,7 @@ use crate::syscalls;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-/// Owns the parent-side ends of a PTY during clone/setup.
+/// Owns the parent-side ends of a PTY during spawn/setup.
 pub(crate) struct PtyPair {
     master: Option<RawFd>,
     slave: RawFd,
@@ -36,7 +36,7 @@ impl PtyPair {
         self.slave
     }
 
-    /// After a successful clone the parent must release the slave so the
+    /// After a successful worker spawn the parent must release the slave so the
     /// container's exit can close the last slave-side descriptor.
     pub(crate) fn release_slave(&mut self) {
         syscalls::close(self.slave);

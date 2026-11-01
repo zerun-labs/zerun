@@ -632,6 +632,21 @@ bridge_output=$("${zerun[@]}" run --rootfs "$rootfs" --net bridge --no-overlay -
   /bin/sh -c '/bin/busybox ip -4 addr show dev eth0 | /bin/busybox grep -q "10.88.0."; printf "bridge-ok\\n"')
 grep -Fx bridge-ok <<<"$bridge_output" >/dev/null
 
+# The detached reaper owns logging and port-proxy threads before it starts a
+# namespace child. Repeated starts guard the supervisor/worker split that keeps
+# those threads' locks from being inherited by the workload process.
+rapid_port=$(find_free_tcp_port)
+for attempt in $(seq 1 16); do
+  if ! rapid_id=$(timeout 10 "${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay \
+      --net bridge -p "$rapid_port:9" --init -- /bin/sh -c 'sleep 0.02'); then
+    echo "rapid detached bridge start $attempt failed or timed out" >&2
+    exit 1
+  fi
+  cleanup_ids+=("$rapid_id")
+  "${zerun[@]}" wait "$rapid_id" >/dev/null
+  "${zerun[@]}" rm "$rapid_id" >/dev/null
+done
+
 # Published ports use Zerun's built-in proxy. Keep the workload in a
 # detached container so the listener remains alive while curl connects.
 port=$(find_free_tcp_port)

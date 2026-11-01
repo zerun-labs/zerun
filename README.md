@@ -486,8 +486,9 @@ T0 budget ≤ 8 ms wall-clock for the isolation hot path).
 See `AGENTS.md` §2/§4. Short version:
 
 - One crate, one binary; **all raw syscalls are concentrated in `src/syscalls.rs`**.
-- Parent process clones the container, writes `cgroup.procs`, forwards signals, and waits;
-  the child mounts, pivots, hardens, and execs the workload (zero runtime residue inside).
+- The runtime forks a single-threaded namespace supervisor, which enters the requested
+  namespaces and forks the workload. The parent writes `cgroup.procs`, forwards signals, and
+  waits; the worker mounts, pivots, hardens, and execs (zero runtime residue inside).
 - Child-side failures are reported to the parent over a CLOEXEC error pipe; EOF means the
   workload successfully exec'd.
 

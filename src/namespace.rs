@@ -1,9 +1,10 @@
 //! Isolation orchestration.
 //!
-//! Parent: create cgroup -> clone the child -> write cgroup.procs -> forward
-//! signals -> wait. Child: mount/pivot -> pseudo-fs -> (bridge: net-ready sync
-//! + container-side network config) -> security hardening -> execve (or run
-//!   the built-in mini-init first).
+//! Parent: create cgroup -> fork a short-lived supervisor -> the supervisor
+//! enters the requested namespaces and forks the workload -> write cgroup.procs
+//! -> forward signals -> wait. Child: mount/pivot -> pseudo-fs -> (bridge:
+//! net-ready sync + container-side network config) -> security hardening ->
+//! execve (or run the built-in mini-init first).
 //!
 //! For `--net bridge` a second pipe synchronizes networking between parent and
 //! child: the parent builds the bridge/veth and moves the peer into the child's
@@ -223,7 +224,7 @@ where
         None
     };
 
-    // clone flags: MNT/CGROUP are always private. PID/IPC/UTS/NET are private
+    // Namespace flags: MNT/CGROUP are always private. PID/IPC/UTS/NET are private
     // unless the operator explicitly selected host sharing. Non-root
     // automatically adds NEWUSER (the kernel creates it first).
     if rootless && matches!(spec.net, NetMode::Bridge) {
@@ -232,9 +233,17 @@ where
              run rootful, or use --net none / --net host"
         ));
     }
+    let flags = namespace_flags(rootless, spec.namespaces, spec.net);
+    if matches!(spec.namespaces.pid, NamespaceMode::Host) {
+        // In a private PID namespace, killing the namespace init kills every
+        // remaining task. With --pid host there is no such kernel boundary, so
+        // make this runtime a subreaper and explicitly sweep descendants after
+        // the top-level workload exits.
+        syscalls::become_child_subreaper()?;
+    }
     // Bridge mode: claim this container's IP from the file IPAM first (a
     // concurrent run may hold our deterministic slot), then bind the `-p`
-    // userland proxies. Both happen before the clone so that IP exhaustion or
+    // userland proxies. Both happen before starting the child so that IP exhaustion or
     // a busy host port abort the run before any container work happens.
     let mut spec = spec;
     spec.bridge_ip = if matches!(spec.net, NetMode::Bridge) {
@@ -244,49 +253,66 @@ where
     };
     let _port_proxies = if let (NetMode::Bridge, Some(ip)) = (spec.net, spec.bridge_ip) {
         if !spec.ports.is_empty() {
-            Some(crate::network::bind_port_proxies(ip, &spec.ports)?)
+            match crate::network::bind_port_proxies(ip, &spec.ports) {
+                Ok(proxies) => Some(proxies),
+                Err(error) => {
+                    release_bridge_ip(&spec);
+                    return Err(error);
+                }
+            }
         } else {
             None
         }
     } else {
         None
     };
-    let flags = clone_flags(rootless, spec.namespaces, spec.net);
-    if matches!(spec.namespaces.pid, NamespaceMode::Host) {
-        // In a private PID namespace, killing the namespace init kills every
-        // remaining task. With --pid host there is no such kernel boundary, so
-        // make this runtime a subreaper and explicitly sweep descendants after
-        // the top-level workload exits.
-        syscalls::become_child_subreaper()?;
-    }
-    // The host euid/egid must be captured before clone: once the child is inside
-    // the new user namespace and before the mapping is written, geteuid() reports
-    // 65534 (nobody).
+    // The host euid/egid must be captured before entering the user namespace:
+    // until the mapping is written, geteuid() reports 65534 (nobody).
     let host_euid = crate::syscalls::effective_uid();
     let host_egid = crate::syscalls::effective_gid();
 
     let slave = pty_pair.as_ref().map_or(-1, PtyPair::slave);
     let child_spec = spec.clone();
-    let pid = syscalls::clone_into(flags, move || {
-        child_main(
-            child_spec,
-            ChildIpc {
-                err_w,
-                err_r,
-                net_sync,
-                tty_slave: slave,
-            },
-            ChildIdentity {
-                rootless,
-                host_euid,
-                host_egid,
-            },
-        )
-    })?;
+    let spawned = match spawn_namespaced_child(
+        flags,
+        child_spec,
+        ChildIpc {
+            err_w,
+            err_r,
+            net_sync,
+            tty_slave: slave,
+        },
+        ChildIdentity {
+            rootless,
+            host_euid,
+            host_egid,
+        },
+    ) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            // The supervisor failed before creating a worker. Release every
+            // parent-side descriptor and bridge reservation on this path so a
+            // long-lived detached reaper can retry without leaking resources.
+            syscalls::close(err_r);
+            syscalls::close(err_w);
+            if let Some((net_r, net_w)) = net_sync {
+                syscalls::close(net_r);
+                syscalls::close(net_w);
+            }
+            drop(pty_pair);
+            if let Some(cg) = cg {
+                cg.cleanup();
+            }
+            release_bridge_ip(&spec);
+            return Err(error);
+        }
+    };
+    let supervisor_pid = spawned.supervisor_pid;
+    let pid = spawned.worker_pid;
     if let Some(pair) = &mut pty_pair {
         pair.release_slave();
     }
-    trace::mark("parent:clone:done");
+    trace::mark("parent:spawn:done");
 
     // The parent keeps neither the write end nor the child end of the error pipe.
     syscalls::close(err_w);
@@ -337,7 +363,7 @@ where
         // which the child relays over this pipe).
         let msg = String::from_utf8_lossy(&buf[..n]);
         eprintln!("zerun: container setup failed: {msg}");
-        let _ = wait_child(pid);
+        let _ = wait_child(supervisor_pid);
         reap_host_pid_descendants(spec.namespaces);
         if let Some(net) = &host_net {
             crate::network::teardown_host_side(net);
@@ -371,7 +397,7 @@ where
         // the workload is already running at this point, so terminate it and
         // release every host-side resource before returning the error.
         let _ = syscalls::kill(pid, libc::SIGKILL);
-        let _ = wait_child(pid);
+        let _ = wait_child(supervisor_pid);
         reap_host_pid_descendants(spec.namespaces);
         if let Some(net) = &host_net {
             crate::network::teardown_host_side(net);
@@ -397,7 +423,7 @@ where
                 // The workload is already running, so a failed pump startup
                 // must follow the same cleanup path as a failed start hook.
                 let _ = syscalls::kill(pid, libc::SIGKILL);
-                let _ = wait_child(pid);
+                let _ = wait_child(supervisor_pid);
                 reap_host_pid_descendants(spec.namespaces);
                 if let Some(net) = &host_net {
                     crate::network::teardown_host_side(net);
@@ -412,7 +438,7 @@ where
     } else {
         None
     };
-    let code = match wait_child(pid) {
+    let code = match wait_child(supervisor_pid) {
         Ok(code) => code,
         Err(error) => {
             if let Some(cg) = &cg {
@@ -461,9 +487,12 @@ where
     Ok(RunExit { code, metrics })
 }
 
-/// Build the clone(2) namespace mask for one container launch.
-fn clone_flags(rootless: bool, namespaces: NamespaceModes, net: NetMode) -> libc::c_int {
-    let mut flags = libc::CLONE_NEWNS | libc::CLONE_NEWCGROUP | libc::SIGCHLD;
+/// Build the unshare(2) namespace mask for one container launch.
+///
+/// The PID namespace flag applies to the supervisor's next child: unshare(2)
+/// creates the namespace but does not move the caller into it.
+fn namespace_flags(rootless: bool, namespaces: NamespaceModes, net: NetMode) -> libc::c_int {
+    let mut flags = libc::CLONE_NEWNS | libc::CLONE_NEWCGROUP;
     if matches!(namespaces.pid, NamespaceMode::Private) {
         flags |= libc::CLONE_NEWPID;
     }
@@ -535,6 +564,189 @@ struct ChildIdentity {
     host_egid: u32,
 }
 
+struct SpawnedChild {
+    /// Intermediate process that owns the container's namespaces.
+    supervisor_pid: i32,
+    /// Workload process (PID 1 in a private PID namespace).
+    worker_pid: i32,
+}
+
+const SUPERVISOR_SIGNALS: [libc::c_int; 7] = [
+    libc::SIGINT,
+    libc::SIGTERM,
+    libc::SIGHUP,
+    libc::SIGQUIT,
+    libc::SIGTSTP,
+    libc::SIGTTIN,
+    libc::SIGTTOU,
+];
+
+/// Fork a single-threaded namespace supervisor and then the workload.
+///
+/// The runtime can be multithreaded here (detached logging and port proxies
+/// are already active). Calling clone(2) with a Rust callback in that state is
+/// unsafe because the child can inherit locks held by vanished threads. fork(2)
+/// runs libc's atfork handling, and the supervisor immediately becomes
+/// single-threaded before entering namespaces and forking the workload.
+fn spawn_namespaced_child(
+    flags: libc::c_int,
+    spec: RunSpec,
+    ipc: ChildIpc,
+    identity: ChildIdentity,
+) -> ZResult<SpawnedChild> {
+    let (status_r, status_w) = syscalls::pipe2_cloexec()?;
+    let supervisor_pid = match syscalls::fork_process() {
+        Ok(pid) => pid,
+        Err(error) => {
+            syscalls::close(status_r);
+            syscalls::close(status_w);
+            return Err(error);
+        }
+    };
+    if supervisor_pid == 0 {
+        syscalls::close(status_r);
+        supervisor_main(flags, spec, ipc, identity, status_w);
+    }
+
+    syscalls::close(status_w);
+    let status = read_supervisor_status(status_r);
+    syscalls::close(status_r);
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = syscalls::kill_if_exists(supervisor_pid, libc::SIGKILL);
+            let _ = wait_pid(supervisor_pid);
+            return Err(error);
+        }
+    };
+    match parse_supervisor_status(&status) {
+        Ok(worker_pid) => Ok(SpawnedChild {
+            supervisor_pid,
+            worker_pid,
+        }),
+        Err(error) => {
+            let _ = wait_pid(supervisor_pid);
+            Err(error)
+        }
+    }
+}
+
+/// Body of the intermediate process. This function never returns.
+fn supervisor_main(
+    flags: libc::c_int,
+    spec: RunSpec,
+    ipc: ChildIpc,
+    identity: ChildIdentity,
+    status_w: RawFd,
+) -> ! {
+    for signal in SUPERVISOR_SIGNALS {
+        if let Err(error) = syscalls::ignore_signal(signal) {
+            supervisor_fail(status_w, &error);
+        }
+    }
+    if let Err(error) = syscalls::unshare_namespaces(flags) {
+        supervisor_fail(status_w, &error);
+    }
+    if identity.rootless {
+        if let Err(error) = write_self_id_mapping(identity.host_euid, identity.host_egid) {
+            supervisor_fail(status_w, &error);
+        }
+    }
+
+    let worker_pid = match syscalls::fork_process() {
+        Ok(pid) => pid,
+        Err(error) => supervisor_fail(status_w, &error),
+    };
+    if worker_pid == 0 {
+        syscalls::close(status_w);
+        // The supervisor ignores terminal signals so it can outlive the
+        // runtime parent's signal-forwarding window. The workload must not
+        // inherit those ignored dispositions across execve.
+        for signal in SUPERVISOR_SIGNALS {
+            if let Err(error) = syscalls::reset_signal_handler(signal) {
+                let msg = format!("{error}");
+                let _ = syscalls::write_all_fd(ipc.err_w, msg.as_bytes());
+                syscalls::close(ipc.err_w);
+                syscalls::exit_process(1);
+            }
+        }
+        match child_main(spec, ipc, identity) {
+            Ok(()) => syscalls::exit_process(1),
+            Err(error) => {
+                eprintln!("zerun: child failed: {error}");
+                syscalls::exit_process(1);
+            }
+        }
+    }
+
+    let status = format!("P{worker_pid}\n");
+    if let Err(error) = syscalls::write_all_fd(status_w, status.as_bytes()) {
+        eprintln!("zerun: report namespaced child: {error}");
+        let _ = syscalls::kill(worker_pid, libc::SIGKILL);
+        let _ = wait_pid(worker_pid);
+        let _ = syscalls::close_fds_from(3);
+        syscalls::exit_process(1);
+    }
+    // The supervisor must not retain lifecycle locks, log-pipe writers, image
+    // leases, or the parent's ends of setup pipes for the container lifetime.
+    let _ = syscalls::close_fds_from(3);
+    let code = wait_pid(worker_pid).unwrap_or(1);
+    syscalls::exit_process(code);
+}
+
+fn supervisor_fail(status_w: RawFd, error: &crate::error::ZError) -> ! {
+    let message = error.to_string().replace('\n', " ");
+    let status = format!("E{message}\n");
+    let _ = syscalls::write_all_fd(status_w, status.as_bytes());
+    syscalls::close(status_w);
+    let _ = syscalls::close_fds_from(3);
+    syscalls::exit_process(1)
+}
+
+fn read_supervisor_status(fd: RawFd) -> ZResult<String> {
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 512];
+    loop {
+        let n = syscalls::read_fd(fd, &mut buf)? as usize;
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buf[..n]);
+        if bytes.contains(&b'\n') {
+            break;
+        }
+        if bytes.len() > 8192 {
+            return Err(crate::zerr!("namespace supervisor status is too long"));
+        }
+    }
+    if bytes.is_empty() {
+        return Err(crate::zerr!(
+            "namespace supervisor exited before reporting a workload PID"
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| crate::zerr!("namespace supervisor wrote non-UTF-8 status"))
+}
+
+fn parse_supervisor_status(status: &str) -> ZResult<i32> {
+    let status = status.trim_end_matches(['\r', '\n']);
+    match status.as_bytes().first() {
+        Some(b'P') => {
+            let pid = status[1..]
+                .parse::<i32>()
+                .map_err(|_| crate::zerr!("invalid namespace supervisor PID: {status:?}"))?;
+            if pid <= 0 {
+                return Err(crate::zerr!("invalid namespace supervisor PID: {pid}"));
+            }
+            Ok(pid)
+        }
+        Some(b'E') => Err(crate::zerr!("{}", &status[1..])),
+        _ => Err(crate::zerr!(
+            "invalid namespace supervisor status: {status:?}"
+        )),
+    }
+}
+
 fn child_main(spec: RunSpec, ipc: ChildIpc, identity: ChildIdentity) -> ZResult<()> {
     syscalls::close(ipc.err_r);
     // The net-ready pipe is parent -> child; the child never writes it.
@@ -543,7 +755,7 @@ fn child_main(spec: RunSpec, ipc: ChildIpc, identity: ChildIdentity) -> ZResult<
         r
     });
 
-    // Report any failure to the parent over the pipe; the trampoline then exits 1.
+    // Report any failure to the parent over the pipe; the worker then exits 1.
     let result = child_stage(&spec, &identity, ipc.err_w, net_r, ipc.tty_slave);
     if let Err(e) = result {
         let msg = format!("{e}");
@@ -592,14 +804,13 @@ fn child_stage(
         syscalls::redirect_stdin_devnull()?;
     }
 
-    // 0. rootless: write the uid/gid mapping before doing any mounts.
-    if identity.rootless {
-        write_self_id_mapping(identity.host_euid, identity.host_egid)?;
-        if std::env::var_os("ZERUN_DEBUG").is_some() {
-            let st = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-            for l in st.lines().filter(|l| l.starts_with("Cap")) {
-                eprintln!("[debug] {l}");
-            }
+    // 0. rootless: the user-namespace mapping was written by the single-
+    // threaded supervisor before forking this worker, so this child already
+    // has its in-namespace credentials.
+    if identity.rootless && std::env::var_os("ZERUN_DEBUG").is_some() {
+        let st = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        for l in st.lines().filter(|l| l.starts_with("Cap")) {
+            eprintln!("[debug] {l}");
         }
     }
 
@@ -777,7 +988,7 @@ fn render_etc_hosts(
 }
 
 /// Unprivileged rootless: map uid/gid 0 inside the new user namespace to the host
-/// euid/egid (single mapping; values captured by the parent before clone).
+/// euid/egid (single mapping; values captured before unshare).
 /// setgroups must be denied before gid_map can be written.
 fn write_self_id_mapping(host_euid: u32, host_egid: u32) -> ZResult<()> {
     // Kernels that pre-deny setgroups report EPERM, and older layouts may not
@@ -869,8 +1080,8 @@ mod tests {
     use std::net::IpAddr;
 
     #[test]
-    fn clone_flags_create_private_namespaces_by_default() {
-        let flags = clone_flags(false, NamespaceModes::default(), NetMode::None);
+    fn namespace_flags_create_private_namespaces_by_default() {
+        let flags = namespace_flags(false, NamespaceModes::default(), NetMode::None);
         for namespace in [
             libc::CLONE_NEWNS,
             libc::CLONE_NEWCGROUP,
@@ -882,17 +1093,16 @@ mod tests {
             assert_ne!(flags & namespace, 0);
         }
         assert_eq!(flags & libc::CLONE_NEWUSER, 0);
-        assert_ne!(flags & libc::SIGCHLD, 0);
     }
 
     #[test]
-    fn clone_flags_honor_host_namespace_modes() {
+    fn namespace_flags_honor_host_namespace_modes() {
         let modes = NamespaceModes {
             pid: NamespaceMode::Host,
             ipc: NamespaceMode::Host,
             uts: NamespaceMode::Host,
         };
-        let flags = clone_flags(true, modes, NetMode::Host);
+        let flags = namespace_flags(true, modes, NetMode::Host);
         for namespace in [
             libc::CLONE_NEWPID,
             libc::CLONE_NEWUTS,
@@ -904,6 +1114,20 @@ mod tests {
         assert_ne!(flags & libc::CLONE_NEWNS, 0);
         assert_ne!(flags & libc::CLONE_NEWCGROUP, 0);
         assert_ne!(flags & libc::CLONE_NEWUSER, 0);
+    }
+
+    #[test]
+    fn supervisor_status_distinguishes_pid_and_setup_error() {
+        assert_eq!(parse_supervisor_status("P4242\n").unwrap(), 4242);
+        assert_eq!(
+            parse_supervisor_status("Eunshare: permission denied\n")
+                .unwrap_err()
+                .to_string(),
+            "unshare: permission denied"
+        );
+        assert!(parse_supervisor_status("P0\n").is_err());
+        assert!(parse_supervisor_status("Pnot-a-pid\n").is_err());
+        assert!(parse_supervisor_status("").is_err());
     }
 
     #[test]
