@@ -575,7 +575,9 @@ test "$stop_elapsed_ms" -ge 500
 # then import the exported tar and execute it as a local image.
 m7_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --net none --pids 32 \
   --name ci-m7 --label ci.m7=ok --init -- /bin/sh -c \
-  'printf "m7-running\\n"; printf "overlay-data\\n" >/run/m7-file; sleep 30')
+  'printf "m7-running\\n"; printf "overlay-data\\n" >/run/m7-file;
+   rm -rf /etc/opaque-test; mkdir /etc/opaque-test;
+   printf "new-opaque-entry\\n" >/etc/opaque-test/new; sleep 30')
 cleanup_ids+=("$m7_id")
 for attempt in $(seq 1 50); do
   m7_logs=$("${zerun[@]}" logs "$m7_id" 2>/dev/null || true)
@@ -645,6 +647,8 @@ grep -Fxq host-to-container "$cp_copy"
 
 diff_output=$("${zerun[@]}" diff "$m7_id")
 grep -q '/run/host-file' <<<"$diff_output"
+grep -Fxq 'D /etc/opaque-test/old' <<<"$diff_output"
+grep -Fxq 'A /etc/opaque-test/new' <<<"$diff_output"
 "${zerun[@]}" export -o "$export_tar" "$m7_id"
 if (( EUID == 0 )); then
   test -s "$export_tar"

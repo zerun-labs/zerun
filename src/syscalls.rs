@@ -241,6 +241,75 @@ pub fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(target: P, link: Q) -> ZResult<()
     Ok(())
 }
 
+/// Read an extended attribute from a path. Missing attributes and filesystems
+/// without xattr support are returned as `None`; other kernel errors stay
+/// visible to the caller.
+pub fn get_xattr<P: AsRef<Path>>(path: P, name: &str) -> ZResult<Option<Vec<u8>>> {
+    let path = path.as_ref();
+    let path_c = cpath(path)?;
+    let name = CString::new(name).map_err(|_| crate::zerr!("invalid xattr name: {name}"))?;
+    let mut value = vec![0u8; 64];
+    loop {
+        let size = unsafe {
+            libc::getxattr(
+                path_c.as_ptr(),
+                name.as_ptr(),
+                value.as_mut_ptr() as *mut c_void,
+                value.len(),
+            )
+        };
+        if size >= 0 {
+            value.truncate(size as usize);
+            return Ok(Some(value));
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ENODATA) | Some(libc::ENOTSUP) => return Ok(None),
+            // Some kernels/user-namespace combinations hide `trusted.*`
+            // attributes from an otherwise authorized caller. Treat that the
+            // same as an absent namespace and let callers try the `user.*`
+            // spelling instead.
+            Some(libc::EACCES) | Some(libc::EPERM) => return Ok(None),
+            Some(libc::ERANGE) => {
+                let next = value
+                    .len()
+                    .checked_mul(2)
+                    .ok_or_else(|| crate::zerr!("xattr value is too large"))?;
+                value.resize(next, 0);
+            }
+            _ => {
+                return Err(crate::zerr!(
+                    "getxattr {}::{}: {error}",
+                    path.display(),
+                    name.to_string_lossy()
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn set_xattr<P: AsRef<Path>>(path: P, name: &str, value: &[u8]) -> ZResult<()> {
+    let path = path.as_ref();
+    let path_c = cpath(path)?;
+    let name = CString::new(name).map_err(|_| crate::zerr!("invalid xattr name: {name}"))?;
+    let size = libc::size_t::try_from(value.len())
+        .map_err(|_| crate::zerr!("xattr value is too large"))?;
+    if unsafe {
+        libc::setxattr(
+            path_c.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr() as *const c_void,
+            size,
+            0,
+        )
+    } != 0
+    {
+        return Err(last_err("setxattr"));
+    }
+    Ok(())
+}
+
 // ---------- cgroup device policy ----------
 
 #[repr(C)]

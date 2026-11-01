@@ -34,10 +34,11 @@ command -v "$cc" >/dev/null || {
   exit 1
 }
 
-mkdir -p "$rootfs/bin" "$rootfs/etc" "$rootfs/srv"
+mkdir -p "$rootfs/bin" "$rootfs/etc/opaque-test" "$rootfs/srv"
 install -m 0755 "$busybox" "$rootfs/bin/busybox"
 printf 'testuser:x:4242:4344::/:/bin/sh\n' >"$rootfs/etc/passwd"
 printf 'testuser:x:4344:\ntestgroup:x:4343:\n' >"$rootfs/etc/group"
+printf 'old-opaque-entry\n' >"$rootfs/etc/opaque-test/old"
 for applet in sh httpd ip grep cat sleep; do
   ln -s busybox "$rootfs/bin/$applet"
 done
