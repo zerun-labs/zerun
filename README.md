@@ -322,8 +322,11 @@ zerun logout ghcr.io
 Credentials live in `~/.config/zerun/credentials.json` (or `$XDG_CONFIG_HOME/zerun/...`).
 Set `ZERUN_CREDENTIALS` to use another file. The file is written atomically with `0600`
 permissions and its parent with `0700`; passwords are validated against `/v2/` before they
-are stored. For `docker.io`, credentials are used only for the official registry endpoint
-and are never sent to configured mirrors.
+are stored. For a migration from Docker, Zerun also reads embedded Basic `auths` from
+`$DOCKER_CONFIG/config.json` or `~/.docker/config.json`; explicit `zerun login` entries win.
+External Docker credential helpers (`credsStore` / `credHelpers`) are not executed. For
+`docker.io`, credentials are used only for the official registry endpoint and are never sent
+to configured mirrors.
 
 Push a local image with the normal OCI distribution protocol. Registry challenges
 are answered with a `pull,push` Bearer scope, referenced blobs are skipped when the

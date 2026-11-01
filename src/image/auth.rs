@@ -47,6 +47,18 @@ struct StoredCredential {
     auth: String,
 }
 
+#[derive(Deserialize)]
+struct DockerCredentialFile {
+    #[serde(default)]
+    auths: BTreeMap<String, DockerStoredCredential>,
+}
+
+#[derive(Deserialize)]
+struct DockerStoredCredential {
+    #[serde(default)]
+    auth: Option<String>,
+}
+
 impl CredentialStore {
     /// Default user-level store:
     /// `$XDG_CONFIG_HOME/zerun/credentials.json` or `~/.config/zerun/...`.
@@ -153,6 +165,95 @@ impl CredentialStore {
         atomic_write_private(&self.path, &bytes)?;
         Ok(())
     }
+}
+
+/// Read embedded Basic credentials from Docker's config.json as a migration
+/// fallback. Zerun never executes Docker credential helpers or `credsStore`
+/// binaries; entries that only name a helper are skipped.
+pub fn load_docker_credentials() -> ZResult<BTreeMap<String, Credential>> {
+    let path = match std::env::var_os("DOCKER_CONFIG") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("config.json"),
+        _ => match std::env::var_os("HOME") {
+            Some(home) if !home.is_empty() => {
+                PathBuf::from(home).join(".docker").join("config.json")
+            }
+            _ => return Ok(BTreeMap::new()),
+        },
+    };
+    load_docker_credentials_from(&path)
+}
+
+fn load_docker_credentials_from(path: &Path) -> ZResult<BTreeMap<String, Credential>> {
+    const MAX_DOCKER_CONFIG_BYTES: u64 = 1024 * 1024;
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => {
+            return Err(crate::zerr!(
+                "read Docker credential metadata {}: {error}",
+                path.display()
+            ))
+        }
+    };
+    if !metadata.is_file() {
+        return Err(crate::zerr!(
+            "Docker credential path {} is not a regular file",
+            path.display()
+        ));
+    }
+    if metadata.len() > MAX_DOCKER_CONFIG_BYTES {
+        return Err(crate::zerr!(
+            "Docker credential file {} exceeds {} bytes",
+            path.display(),
+            MAX_DOCKER_CONFIG_BYTES
+        ));
+    }
+    let bytes = fs::read(path)
+        .map_err(|error| crate::zerr!("read Docker credentials {}: {error}", path.display()))?;
+    let file: DockerCredentialFile = serde_json::from_slice(&bytes)
+        .map_err(|error| crate::zerr!("parse Docker credentials {}: {error}", path.display()))?;
+    let mut out = BTreeMap::new();
+    for (registry, stored) in file.auths {
+        // Docker stores either an embedded auth blob or a reference to an
+        // external credential helper. Unsupported helper-backed entries are
+        // intentionally ignored rather than inferred from unrelated fields.
+        let Some(auth) = stored.auth.filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+        let registry = normalize_docker_registry(&registry)?;
+        let decoded = base64_decode(auth.trim())
+            .ok_or_else(|| crate::zerr!("invalid Docker auth entry for registry '{registry}'"))?;
+        let joined = String::from_utf8(decoded).map_err(|_| {
+            crate::zerr!("Docker auth entry for registry '{registry}' is not valid UTF-8")
+        })?;
+        let Some((username, password)) = joined.split_once(':') else {
+            return Err(crate::zerr!(
+                "Docker auth entry for registry '{registry}' has no username"
+            ));
+        };
+        let credential = Credential {
+            username: username.to_string(),
+            password: password.to_string(),
+        };
+        validate_credential(&credential)?;
+        out.insert(registry, credential);
+    }
+    Ok(out)
+}
+
+fn normalize_docker_registry(input: &str) -> ZResult<String> {
+    let value = input.trim().trim_end_matches('/');
+    if matches!(
+        value,
+        "https://index.docker.io/v1" | "http://index.docker.io/v1"
+    ) {
+        return Ok("docker.io".to_string());
+    }
+    let value = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .unwrap_or(value);
+    normalize_registry(value)
 }
 
 /// Normalize a user-supplied registry host for both login and image lookups.
@@ -353,6 +454,69 @@ mod tests {
         assert!(store.remove("registry.example:5000").unwrap());
         assert!(store.all().unwrap().is_empty());
         let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn loads_embedded_docker_credentials_and_skips_helpers() {
+        let path = temp_path("docker");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let docker = serde_json::json!({
+            "auths": {
+                "https://index.docker.io/v1/": {
+                    "auth": base64_encode(b"docker-user:docker-pass")
+                },
+                "https://ghcr.io": {
+                    "auth": base64_encode(b"alice:ghcr-token")
+                },
+                "helper.example": {}
+            }
+        });
+        fs::write(&path, serde_json::to_vec(&docker).unwrap()).unwrap();
+        let loaded = load_docker_credentials_from(&path).unwrap();
+        assert_eq!(
+            loaded.get("docker.io"),
+            Some(&Credential {
+                username: "docker-user".into(),
+                password: "docker-pass".into(),
+            })
+        );
+        assert_eq!(
+            loaded.get("ghcr.io"),
+            Some(&Credential {
+                username: "alice".into(),
+                password: "ghcr-token".into(),
+            })
+        );
+        assert_eq!(loaded.len(), 2);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn rejects_malformed_embedded_docker_credentials() {
+        let path = temp_path("docker-invalid");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, br#"{"auths":{"ghcr.io":{"auth":"not base64!"}}}"#).unwrap();
+        let error = load_docker_credentials_from(&path).unwrap_err().to_string();
+        assert!(error.contains("ghcr.io"));
+        assert!(!error.contains("not base64"));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn docker_registry_keys_use_runtime_normalization() {
+        assert_eq!(
+            normalize_docker_registry("https://index.docker.io/v1/").unwrap(),
+            "docker.io"
+        );
+        assert_eq!(
+            normalize_docker_registry("http://localhost:5000").unwrap(),
+            "localhost:5000"
+        );
+        assert_eq!(
+            normalize_docker_registry("REGISTRY.EXAMPLE").unwrap(),
+            "registry.example"
+        );
+        assert!(normalize_docker_registry("registry.example/path").is_err());
     }
 
     #[test]

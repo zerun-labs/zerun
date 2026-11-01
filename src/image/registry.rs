@@ -6,10 +6,13 @@
 //! inheritance. Mirror priority: env `ZERUN_REGISTRY_MIRRORS`, then the zerun
 //! config file (`/etc/zerun/config.toml`, or `ZERUN_CONFIG` / user config;
 //! `[registry] mirrors = [...]`), then `/etc/docker/daemon.json`'s
-//! `registry-mirrors`. Credentials are read from the owner-only zerun store;
-//! they are deliberately not sent to Docker Hub mirrors.
+//! `registry-mirrors`. Credentials prefer the owner-only zerun store and may
+//! fall back to embedded Basic auth from Docker's config.json; they are
+//! deliberately not sent to Docker Hub mirrors.
 use crate::error::ZResult;
-use crate::image::auth::{normalize_registry, Credential, CredentialStore};
+use crate::image::auth::{
+    load_docker_credentials, normalize_registry, Credential, CredentialStore,
+};
 use crate::image::limits::{read_limited, MAX_ERROR_BODY_BYTES, MAX_TOKEN_RESPONSE_BYTES};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -590,13 +593,21 @@ impl Default for RegistryClient {
 }
 
 fn load_credentials() -> BTreeMap<String, Credential> {
-    match CredentialStore::open().and_then(|store| store.all()) {
+    // Embedded Docker auth is a migration fallback. The owner-only Zerun
+    // store wins per registry, so an explicit `zerun login` always overrides
+    // a credential inherited from Docker.
+    let mut credentials = match load_docker_credentials() {
         Ok(credentials) => credentials,
         Err(e) => {
-            eprintln!("zerun: warning: ignoring registry credentials: {e}");
+            eprintln!("zerun: warning: ignoring Docker credentials: {e}");
             BTreeMap::new()
         }
+    };
+    match CredentialStore::open().and_then(|store| store.all()) {
+        Ok(stored) => credentials.extend(stored),
+        Err(e) => eprintln!("zerun: warning: ignoring registry credentials: {e}"),
     }
+    credentials
 }
 
 /// Parse `Bearer realm="...",service="...",scope="..."` (quote-aware).
