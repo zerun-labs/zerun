@@ -3130,6 +3130,20 @@ fn cmd_commit(args: &[String]) -> i32 {
     if st.status == state::Status::Running {
         eprintln!("zerun: warning: committing a running container; filesystem changes in progress may be inconsistent");
     }
+    let exposed_ports = match normalize_exposed_port_metadata(&st.exposed_ports) {
+        Ok(ports) => ports,
+        Err(error) => {
+            eprintln!("zerun commit: {error}");
+            return 1;
+        }
+    };
+    let stop_signal = match signal::validate(st.stop_signal) {
+        Ok(signal) => signal::name(signal),
+        Err(error) => {
+            eprintln!("zerun commit: invalid persisted stop signal: {error}");
+            return 1;
+        }
+    };
 
     // Reconstruct from the host-side lower rootfs and overlay upper. A live
     // container's merged view lives in its own mount namespace (and includes
@@ -3186,6 +3200,8 @@ fn cmd_commit(args: &[String]) -> i32 {
         user: st.user.clone(),
         labels: st.labels.clone(),
         volumes: st.image_volumes.clone(),
+        exposed_ports,
+        stop_signal: Some(stop_signal),
         healthcheck: st.healthcheck.clone(),
         comment: message,
         author,
@@ -3472,6 +3488,19 @@ fn image_exposed_ports(
         ports.extend(parsed);
     }
     Ok(ports)
+}
+
+/// Validate and normalize exposed-port metadata loaded from a container state
+/// record before carrying it into a committed image config.
+fn normalize_exposed_port_metadata(values: &[String]) -> Result<Vec<String>, String> {
+    let mut ports = BTreeSet::new();
+    for value in values {
+        let parsed = network::parse_expose(value).map_err(|error| {
+            format!("container state has invalid exposed port '{value}': {error}")
+        })?;
+        ports.extend(parsed);
+    }
+    Ok(ports.iter().map(ToString::to_string).collect())
 }
 
 /// Combine image Entrypoint/Cmd with CLI arguments (docker semantics):
@@ -8908,6 +8937,21 @@ mod tests {
         let error = image_exposed_ports(&bad).unwrap_err();
         assert!(error.contains("ExposedPorts"));
         assert!(error.contains("http/tcp"));
+    }
+
+    #[test]
+    fn normalizes_persisted_exposed_port_metadata() {
+        assert_eq!(
+            normalize_exposed_port_metadata(&[
+                "8001/tcp".to_string(),
+                "53/udp".to_string(),
+                "8000-8001/tcp".to_string(),
+                "53/udp".to_string(),
+            ])
+            .unwrap(),
+            vec!["53/udp", "8000/tcp", "8001/tcp"]
+        );
+        assert!(normalize_exposed_port_metadata(&["invalid".to_string()]).is_err());
     }
 
     #[test]

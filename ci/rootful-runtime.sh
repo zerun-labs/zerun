@@ -728,7 +728,7 @@ cleanup_paths+=("$label_file")
 printf 'ci.label-file=loaded\nci.override=file\n' >"$label_file"
 m7_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --net none --pids 32 \
   --name ci-m7 --label ci.m7=ok --label-file "$label_file" \
-  --label ci.override=cli --init -- /bin/sh -c \
+  --label ci.override=cli --expose 8080/tcp --stop-signal SIGKILL --init -- /bin/sh -c \
   'printf "m7-running\\n"; printf "overlay-data\\n" >/run/m7-file;
    rm -rf /etc/opaque-test; mkdir /etc/opaque-test;
    printf "new-opaque-entry\\n" >/etc/opaque-test/new; sleep 30')
@@ -750,6 +750,8 @@ grep -q '"status": "running"' <<<"$inspect_output"
 grep -q '"ci.m7": "ok"' <<<"$inspect_output"
 grep -q '"ci.label-file": "loaded"' <<<"$inspect_output"
 grep -q '"ci.override": "cli"' <<<"$inspect_output"
+grep -q '"8080/tcp"' <<<"$inspect_output"
+grep -q '"stop_signal": 9' <<<"$inspect_output"
 stats_output=$("${zerun[@]}" stats "$m7_id")
 grep -q 'ci-m7' <<<"$stats_output"
 top_output=$("${zerun[@]}" top "$m7_id")
@@ -818,6 +820,15 @@ live_commit_digest=$("${zerun[@]}" commit -m ci-m7-live "$m7_id" ci-commit-live:
 grep -Eq '^sha256:[0-9a-f]{64}$' <<<"$live_commit_digest"
 live_commit_output=$("${zerun[@]}" run --net none ci-commit-live:test /bin/sh -c 'cat /run/m7-file')
 grep -Fxq overlay-data <<<"$live_commit_output"
+live_commit_meta_id=$("${zerun[@]}" run -d --net none --init ci-commit-live:test -- \
+  /bin/sh -c 'sleep 30')
+cleanup_ids+=("$live_commit_meta_id")
+live_commit_meta=$("${zerun[@]}" inspect "$live_commit_meta_id")
+grep -q '"8080/tcp"' <<<"$live_commit_meta"
+grep -q '"stop_signal": 9' <<<"$live_commit_meta"
+"${zerun[@]}" stop --time 1 "$live_commit_meta_id" >/dev/null
+"${zerun[@]}" wait "$live_commit_meta_id" >/dev/null
+"${zerun[@]}" rm "$live_commit_meta_id" >/dev/null
 "${zerun[@]}" kill --signal TERM "$m7_id" >/dev/null
 "${zerun[@]}" wait "$m7_id" >/dev/null
 commit_digest=$("${zerun[@]}" commit -m ci-m7 "$m7_id" ci-commit:test)

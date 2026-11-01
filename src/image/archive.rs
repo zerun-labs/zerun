@@ -600,6 +600,8 @@ mod tests {
                 user: None,
                 labels: BTreeMap::new(),
                 volumes: Vec::new(),
+                exposed_ports: Vec::new(),
+                stop_signal: None,
                 healthcheck: None,
                 comment: Some("archive round-trip".to_string()),
                 author: None,

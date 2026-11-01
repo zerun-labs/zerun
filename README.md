@@ -554,8 +554,9 @@ connections arrive so the reaper's descriptor and memory use stay bounded.
 without `-i`, the command receives `/dev/null` as stdin.
 `commit` produces a single-layer OCI image from the container's host-side overlay
 (changes in progress may race while it is running). Mounted volumes, tmpfs mounts,
-and pseudo-filesystems are excluded; image-declared `Volumes` are retained in the
-committed config. Exited detached containers retain their writable layer until `rm`;
+and pseudo-filesystems are excluded; image-declared `Volumes`, exposed ports, and the
+effective stop signal are retained in the committed config. Exited detached containers
+retain their writable layer until `rm`;
 `--rm` still removes it on exit.
 
 `ps` supports repeated Docker-style filters, combined with AND:

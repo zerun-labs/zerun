@@ -39,6 +39,10 @@ pub struct CommitOptions {
     pub labels: BTreeMap<String, String>,
     /// Image-declared volume paths retained as `Config.Volumes`.
     pub volumes: Vec<String>,
+    /// Normalized exposed-port declarations retained as `Config.ExposedPorts`.
+    pub exposed_ports: Vec<String>,
+    /// Canonical stop signal retained as `Config.StopSignal`.
+    pub stop_signal: Option<String>,
     /// Healthcheck inherited from the image or overridden at run time.
     pub healthcheck: Option<crate::health::Healthcheck>,
     pub comment: Option<String>,
@@ -347,6 +351,17 @@ fn build_config_json(options: &CommitOptions, diff_id: &str) -> ZResult<serde_js
             .collect();
         config["config"]["Volumes"] = serde_json::json!(volumes);
     }
+    if !options.exposed_ports.is_empty() {
+        let exposed: BTreeMap<&str, serde_json::Value> = options
+            .exposed_ports
+            .iter()
+            .map(|port| (port.as_str(), serde_json::json!({})))
+            .collect();
+        config["config"]["ExposedPorts"] = serde_json::json!(exposed);
+    }
+    if let Some(stop_signal) = &options.stop_signal {
+        config["config"]["StopSignal"] = serde_json::Value::String(stop_signal.clone());
+    }
     if let Some(check) = &options.healthcheck {
         let image = check
             .to_image()
@@ -437,6 +452,8 @@ mod tests {
             user: Some("1000:1000".to_string()),
             labels: BTreeMap::from([("tier".to_string(), "prod".to_string())]),
             volumes: vec!["/var/lib/app".to_string()],
+            exposed_ports: vec!["53/udp".to_string(), "8080/tcp".to_string()],
+            stop_signal: Some("SIGUSR1".to_string()),
             healthcheck: Some(
                 crate::health::Healthcheck::new(vec![
                     "CMD-SHELL".to_string(),
@@ -465,6 +482,9 @@ mod tests {
         assert_eq!(config["config"]["User"], "1000:1000");
         assert_eq!(config["config"]["Labels"]["tier"], "prod");
         assert!(config["config"]["Volumes"]["/var/lib/app"].is_object());
+        assert!(config["config"]["ExposedPorts"]["53/udp"].is_object());
+        assert!(config["config"]["ExposedPorts"]["8080/tcp"].is_object());
+        assert_eq!(config["config"]["StopSignal"], "SIGUSR1");
         assert_eq!(config["config"]["Healthcheck"]["Test"][0], "CMD-SHELL");
         assert_eq!(
             config["config"]["Healthcheck"]["Interval"],
