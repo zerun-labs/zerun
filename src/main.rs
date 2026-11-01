@@ -534,7 +534,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--publish" | "-p" => {
                 let v = next_value(args, &mut i, s)?;
-                a.ports.push(parse_publish(&v)?);
+                a.ports.extend(parse_publish(&v)?);
             }
             "--expose" => {
                 let value = next_value(args, &mut i, "--expose")?;
@@ -910,64 +910,86 @@ fn append_dns_options(target: &mut Vec<String>, raw: &str) -> Result<(), String>
 }
 
 /// Parse `-p`/`--publish` values. Supported forms:
-///   HOST[:CONTAINER][/tcp|/udp]
-///   ADDRESS:HOST[:CONTAINER][/tcp|/udp]
-/// IPv6 addresses are bracketed (`[::1]:8080:80`).
-fn parse_publish(v: &str) -> Result<network::PublishedPort, String> {
+///   HOST[-HOST_END][:CONTAINER[-CONTAINER_END]][/tcp|/udp]
+///   ADDRESS:HOST[-HOST_END][:CONTAINER[-CONTAINER_END]][/tcp|/udp]
+/// IPv6 addresses are bracketed (`[::1]:8080-8081:80-81`). Host and container
+/// ranges must contain the same number of ports and are paired in order.
+fn parse_publish(v: &str) -> Result<Vec<network::PublishedPort>, String> {
     use std::net::IpAddr;
 
-    fn parse_port(s: &str) -> Result<u16, String> {
+    fn parse_port(s: &str, raw: &str) -> Result<u16, String> {
         s.parse::<u16>()
-            .map_err(|_| format!("invalid port '{s}' (expected 1-65535)"))
-            .and_then(|p| {
-                if p == 0 {
-                    Err(format!("invalid port '{s}' (expected 1-65535)"))
-                } else {
-                    Ok(p)
-                }
-            })
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| format!("-p: invalid port in '{raw}' (expected 1-65535)"))
     }
 
-    let (v, protocol) = if let Some(v) = v.strip_suffix("/udp") {
-        (v, network::PortProtocol::Udp)
-    } else if let Some(v) = v.strip_suffix("/tcp") {
-        (v, network::PortProtocol::Tcp)
-    } else {
-        (v, network::PortProtocol::Tcp)
+    fn parse_range(s: &str, raw: &str) -> Result<(u16, u16), String> {
+        let (start, end) = match s.split_once('-') {
+            Some((start, end)) => (parse_port(start, raw)?, parse_port(end, raw)?),
+            None => {
+                let port = parse_port(s, raw)?;
+                (port, port)
+            }
+        };
+        if start > end {
+            return Err(format!(
+                "-p: invalid port range in '{raw}': start must not exceed end"
+            ));
+        }
+        Ok((start, end))
+    }
+
+    let (value, protocol) = match v.split_once('/') {
+        Some((value, protocol)) if protocol.eq_ignore_ascii_case("tcp") => {
+            (value, network::PortProtocol::Tcp)
+        }
+        Some((value, protocol)) if protocol.eq_ignore_ascii_case("udp") => {
+            (value, network::PortProtocol::Udp)
+        }
+        Some((_, protocol)) => {
+            return Err(format!(
+                "-p: invalid protocol '{protocol}' in '{v}' (expected tcp or udp)"
+            ))
+        }
+        None => (v, network::PortProtocol::Tcp),
     };
-    if v.is_empty() {
-        return Err(format!("-p: invalid port publish '{v}'"));
+    if value.is_empty() {
+        return Err(format!("-p: invalid port publish '{value}'"));
     }
 
-    let (host_ip, rest) = if let Some(rest) = v.strip_prefix('[') {
+    let (host_ip, rest) = if let Some(rest) = value.strip_prefix('[') {
         let close = rest
             .find(']')
-            .ok_or_else(|| format!("-p: missing ']' in IPv6 publish '{v}'"))?;
+            .ok_or_else(|| format!("-p: missing ']' in IPv6 publish '{value}'"))?;
         let ip: IpAddr = rest[..close]
             .parse()
-            .map_err(|_| format!("-p: invalid host address in '{v}'"))?;
+            .map_err(|_| format!("-p: invalid host address in '{value}'"))?;
         let rest = rest[close + 1..]
             .strip_prefix(':')
-            .ok_or_else(|| format!("-p: invalid port publish '{v}'"))?;
+            .ok_or_else(|| format!("-p: invalid port publish '{value}'"))?;
         (ip, rest)
     } else {
-        match v.matches(':').count() {
-            0 => (std::net::Ipv4Addr::UNSPECIFIED.into(), v),
+        match value.matches(':').count() {
+            0 => (std::net::Ipv4Addr::UNSPECIFIED.into(), value),
             1 => {
-                let (first, second) = v.split_once(':').expect("one colon was counted");
+                let (first, second) = value.split_once(':').expect("one colon was counted");
                 match first.parse::<IpAddr>() {
                     Ok(ip) => (ip, second),
-                    Err(_) => (std::net::Ipv4Addr::UNSPECIFIED.into(), v),
+                    Err(_) => (std::net::Ipv4Addr::UNSPECIFIED.into(), value),
                 }
             }
             2 => {
-                let ip: IpAddr = v
+                let ip: IpAddr = value
                     .split(':')
                     .next()
                     .expect("two colons were counted")
                     .parse()
-                    .map_err(|_| format!("-p: invalid host address in '{v}'"))?;
-                (ip, &v[v.find(':').expect("two colons were counted") + 1..])
+                    .map_err(|_| format!("-p: invalid host address in '{value}'"))?;
+                (
+                    ip,
+                    &value[value.find(':').expect("two colons were counted") + 1..],
+                )
             }
             _ => return Err(
                 "-p: bracket IPv6 addresses ('[::1]:HOST:CONTAINER'); use ADDRESS:HOST:CONTAINER"
@@ -976,19 +998,28 @@ fn parse_publish(v: &str) -> Result<network::PublishedPort, String> {
         }
     };
 
-    let (host, container) = match rest.split_once(':') {
-        Some((host, container)) => (parse_port(host)?, parse_port(container)?),
+    let (host_range, container_range) = match rest.split_once(':') {
+        Some((host, container)) => (parse_range(host, v)?, parse_range(container, v)?),
         None => {
-            let host = parse_port(rest)?;
-            (host, host)
+            let range = parse_range(rest, v)?;
+            (range, range)
         }
     };
-    Ok(network::PublishedPort {
-        host_ip,
-        host,
-        container,
-        protocol,
-    })
+    let host_count = u32::from(host_range.1) - u32::from(host_range.0) + 1;
+    let container_count = u32::from(container_range.1) - u32::from(container_range.0) + 1;
+    if host_count != container_count {
+        return Err(format!(
+            "-p: host and container port ranges must have the same length in '{v}'"
+        ));
+    }
+    Ok((0..host_count)
+        .map(|offset| network::PublishedPort {
+            host_ip,
+            host: host_range.0 + offset as u16,
+            container: container_range.0 + offset as u16,
+            protocol,
+        })
+        .collect())
 }
 
 fn next_value(args: &[String], i: &mut usize, opt: &str) -> Result<String, String> {
@@ -7656,8 +7687,8 @@ RUN OPTIONS:\n  \
                       rootful default; rootless default is none)\n  \
   -i, --interactive      keep stdin attached (foreground runs)\n  \
   -t, --tty              allocate a PTY for foreground or detached output\n  \
-  -p, --publish [ADDR:]HOST[:CONTAINER][/proto]\n  \
-                                      publish a TCP/UDP port (requires --net bridge)\n  \
+  -p, --publish [ADDR:]HOST[-END][:CONTAINER[-END]][/proto]\n  \
+                                      publish TCP/UDP port ranges (requires --net bridge)\n  \
   --expose PORT[-PORT][/proto]       expose container ports without publishing them\n  \
   -P, --publish-all                 publish every image/--expose port to a random host port\n  \
   -v, --volume HOST|NAME:CONTAINER[:ro]\n  \
@@ -8849,16 +8880,16 @@ mod tests {
 
     #[test]
     fn parses_bound_publish_addresses() {
-        let tcp = parse_publish("127.0.0.1:8080:80").unwrap();
+        let tcp = parse_publish("127.0.0.1:8080:80").unwrap()[0];
         assert_eq!(tcp.host_ip, std::net::IpAddr::from([127, 0, 0, 1]));
         assert_eq!(tcp.host, 8080);
         assert_eq!(tcp.container, 80);
 
-        let short_tcp = parse_publish("127.0.0.1:8080").unwrap();
+        let short_tcp = parse_publish("127.0.0.1:8080").unwrap()[0];
         assert_eq!(short_tcp.host, 8080);
         assert_eq!(short_tcp.container, 8080);
 
-        let udp = parse_publish("[::1]:5353:53/udp").unwrap();
+        let udp = parse_publish("[::1]:5353:53/udp").unwrap()[0];
         assert_eq!(
             udp.host_ip,
             std::net::IpAddr::from([0u16, 0, 0, 0, 0, 0, 0, 1])
@@ -8869,6 +8900,41 @@ mod tests {
 
         assert!(parse_publish("not-an-address:8080:80").is_err());
         assert!(parse_publish("::1:8080:80").is_err());
+    }
+
+    #[test]
+    fn expands_published_port_ranges() {
+        let same_range = parse_publish("8000-8002/udp").unwrap();
+        assert_eq!(
+            same_range
+                .iter()
+                .map(|port| (port.host, port.container, port.protocol))
+                .collect::<Vec<_>>(),
+            vec![
+                (8000, 8000, network::PortProtocol::Udp),
+                (8001, 8001, network::PortProtocol::Udp),
+                (8002, 8002, network::PortProtocol::Udp),
+            ]
+        );
+
+        let translated = parse_publish("127.0.0.1:9000-9001:80-81/tcp").unwrap();
+        assert_eq!(translated.len(), 2);
+        assert_eq!((translated[0].host, translated[0].container), (9000, 80));
+        assert_eq!((translated[1].host, translated[1].container), (9001, 81));
+        assert_eq!(
+            translated[0].host_ip,
+            std::net::IpAddr::from([127, 0, 0, 1])
+        );
+
+        for invalid in [
+            "9000-9001:80",
+            "9000:80-81",
+            "9000-9001:80-82",
+            "9001-9000:80-79",
+            "80/sctp",
+        ] {
+            assert!(parse_publish(invalid).is_err(), "accepted {invalid:?}");
+        }
     }
 
     #[test]

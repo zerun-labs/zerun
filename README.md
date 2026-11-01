@@ -38,7 +38,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
 - **M4 — kernel networking (done)**: `--net bridge` (rootful) creates the `zerun0` bridge
   (10.88.0.1/24) and a per-container veth pair with container-side `eth0` and a default
   route (verified: host ↔ container reachable). Per-container egress NAT via nf_tables
-  (pure netlink, shared `zerun-nat` subnet rule), `-p [ADDR:]HOST[:CONTAINER][/tcp|/udp]` publishing through a built-in userland
+  (pure netlink, shared `zerun-nat` subnet rule), `-p [ADDR:]HOST[-END][:CONTAINER[-END]][/tcp|/udp]` publishing through a built-in userland
   proxy (Docker's docker-proxy in-binary), image `EXPOSE` plus `--expose` and
   `-P`/`--publish-all` random host-port mapping, `--dns` / host resolv.conf inheritance,
   `--dns-search` / `--dns-option` resolver controls, and repeatable
@@ -256,8 +256,9 @@ Run options (current subset):
                      host = share host net
 -i, --interactive   keep stdin attached (foreground runs; without it stdin is /dev/null)
 -t, --tty           allocate a PTY for foreground or detached output (e.g. -dt)
--p, --publish [ADDR:]HOST[:CONTAINER][/proto]
-                     publish a TCP (default) or UDP port; ADDR supports IPv4 and
+-p, --publish [ADDR:]HOST[-END][:CONTAINER[-END]][/proto]
+                     publish TCP (default) or UDP ports; equal-length host and
+                     container ranges are paired in order. ADDR supports IPv4 and
                      bracketed IPv6 bind addresses (for example 127.0.0.1 or [::1])
 --expose PORT[-PORT][/tcp|/udp]
                      expose container ports without publishing them (repeatable;
