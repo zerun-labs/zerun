@@ -274,6 +274,21 @@ volume_read=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
   -v ci-volume:/mnt/data:ro --init -- /bin/sh -c 'cat /mnt/data/marker')
 grep -Fx volume-ok <<<"$volume_read" >/dev/null
 
+# Docker-style --mount requests use the same named-volume and tmpfs paths.
+mounted_volume_write=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+  --mount type=volume,source=ci-mounted-volume,target=/mnt/mounted,readonly=false \
+  --init -- /bin/sh -c \
+  'printf "mounted-volume-ok\n" >/mnt/mounted/marker; cat /mnt/mounted/marker')
+grep -Fx mounted-volume-ok <<<"$mounted_volume_write" >/dev/null
+mounted_volume_read=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+  --mount type=volume,src=ci-mounted-volume,dst=/mnt/mounted,readonly \
+  --init -- /bin/sh -c 'cat /mnt/mounted/marker')
+grep -Fx mounted-volume-ok <<<"$mounted_volume_read" >/dev/null
+mounted_tmpfs_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+  --mount type=tmpfs,target=/mnt/scratch,tmpfs-size=1m,tmpfs-mode=0700 \
+  --init -- /bin/sh -c 'printf "mounted-tmpfs-ok\n" >/mnt/scratch/marker; cat /mnt/scratch/marker')
+grep -Fx mounted-tmpfs-ok <<<"$mounted_tmpfs_output" >/dev/null
+
 # Resource limits require an actual cgroup v2 hierarchy and exercise the
 # parent-side cgroup creation/attach path.
 cgroup_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \

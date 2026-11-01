@@ -176,6 +176,10 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--tmpfs".into());
         run_args.push(t.raw.clone());
     }
+    for v in &a.volumes {
+        run_args.push("--volume".into());
+        run_args.push(v.raw.clone());
+    }
     if let Some(v) = &a.platform {
         run_args.push("--platform".into());
         run_args.push(v.clone());
@@ -553,6 +557,21 @@ mod tests {
         let unit = render(&PathBuf::from("/usr/local/bin/zerun"), &a, true).unwrap();
         assert!(unit.contains("--cpuset-cpus 0-1"));
         assert!(unit.contains("--cpuset-mems 0"));
+    }
+
+    #[test]
+    fn renders_canonical_mount_requests() {
+        let a = args(&[
+            "--mount",
+            "type=volume,source=app-data,target=/var/lib/app,readonly",
+            "--mount",
+            "type=tmpfs,target=/scratch,tmpfs-size=16m",
+            "alpine",
+            "true",
+        ]);
+        let unit = render(Path::new("/usr/local/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains("--volume app-data:/var/lib/app:ro"));
+        assert!(unit.contains("--tmpfs /scratch:size=16777216"));
     }
 
     #[test]

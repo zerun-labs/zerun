@@ -469,6 +469,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 a.volumes
                     .push(mounts::parse_bind(&v).map_err(|e| e.to_string())?);
             }
+            "--mount" => {
+                let v = next_value(args, &mut i, "--mount")?;
+                append_run_mount(&mut a, &v)?;
+            }
             "--publish" | "-p" => {
                 let v = next_value(args, &mut i, s)?;
                 a.ports.push(parse_publish(&v)?);
@@ -569,6 +573,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 a.env_files.push(value.to_string());
                 i += 1;
             }
+            other if other.starts_with("--mount=") => {
+                append_run_mount(&mut a, &other["--mount=".len()..])?;
+                i += 1;
+            }
             other if other.starts_with("--restart=") => {
                 a.restart = Some(other["--restart=".len()..].parse()?);
                 i += 1;
@@ -659,6 +667,14 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         return Err("--hostname cannot be used with --uts host".to_string());
     }
     Ok(a)
+}
+
+fn append_run_mount(a: &mut RunArgs, value: &str) -> Result<(), String> {
+    match mounts::parse_mount(value)? {
+        mounts::MountRequest::Bind(mount) => a.volumes.push(mount),
+        mounts::MountRequest::Tmpfs(mount) => a.tmpfs.push(mount),
+    }
+    Ok(())
 }
 
 fn append_group_additions(target: &mut Vec<String>, raw: &str) -> Result<(), String> {
@@ -6898,8 +6914,11 @@ RUN OPTIONS:\n  \
   -t, --tty              allocate a PTY for foreground or detached output\n  \
   -p, --publish [ADDR:]HOST[:CONTAINER][/proto]\n  \
                                       publish a TCP/UDP port (requires --net bridge)\n  \
-  -v, --volume HOST|NAME:CONTAINER[:ro]
+  -v, --volume HOST|NAME:CONTAINER[:ro]\n  \
                                         bind-mount a host path or managed named volume\n  \
+  --mount type=bind|volume|tmpfs,src=SOURCE,dst=TARGET[,readonly]\n  \
+                                        Docker-style mount syntax; tmpfs accepts\n  \
+                                        tmpfs-size= and tmpfs-mode= options\n  \
   --dns IP            container DNS server (repeatable/comma-separated; bridge mode;\n  \
                       defaults to the host's)\n  \
   --dns-search DOMAIN resolver search domain (repeatable/comma-separated;\n  \
@@ -7609,6 +7628,52 @@ mod tests {
         assert!(launch.contains(&"--read-only".to_string()));
         assert!(launch.contains(&"/scratch:size=16m".to_string()));
         assert!(launch.contains(&"/run/shm:ro".to_string()));
+    }
+
+    #[test]
+    fn parses_and_captures_docker_style_mounts() {
+        let args: Vec<_> = [
+            "--mount",
+            "type=volume,source=app-data,target=/var/lib/app,readonly",
+            "--mount=type=tmpfs,target=/scratch,tmpfs-size=16m,tmpfs-mode=0700,readonly",
+            "alpine",
+            "true",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_run_args(&args).expect("valid --mount requests");
+        assert_eq!(a.volumes.len(), 1);
+        assert!(a.volumes[0].source.as_os_str().is_empty());
+        assert_eq!(a.volumes[0].named.as_deref(), Some("app-data"));
+        assert_eq!(a.volumes[0].target, Path::new("/var/lib/app"));
+        assert!(a.volumes[0].readonly);
+        assert_eq!(a.tmpfs.len(), 1);
+        assert_eq!(a.tmpfs[0].target, Path::new("/scratch"));
+        assert_eq!(a.tmpfs[0].data, "size=16777216,mode=700");
+        assert!(a.tmpfs[0].readonly);
+
+        let launch = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--volume", "app-data:/var/lib/app:ro"]));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--tmpfs", "/scratch:ro,size=16777216,mode=700"]));
+
+        for value in [
+            "",
+            "type=bind,source=relative,target=/mnt",
+            "type=volume,source=/tmp,target=/mnt",
+            "type=tmpfs,target=/scratch,tmpfs-size=invalid",
+            "type=tmpfs,target=/scratch,unknown=true",
+        ] {
+            let args = vec![format!("--mount={value}"), "alpine".to_string()];
+            assert!(
+                parse_run_args(&args).is_err(),
+                "{value:?} should be rejected"
+            );
+        }
     }
 
     #[test]

@@ -25,7 +25,8 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
 - **M2 — storage & security (done)**: deny-by-default seccomp allowlist; per-run OverlayFS
   with disk upper and automatic cleanup; OCI whiteout materialization; safe host bind-mount
   volumes with `-v HOST:CONTAINER[:ro|rw]`, auto-created named volumes with
-  `-v NAME:CONTAINER[:ro|rw]`, optional ephemeral `--tmpfs-upper` writable layers.
+  `-v NAME:CONTAINER[:ro|rw]`, Docker-style `--mount type=bind|volume|tmpfs,...` requests,
+  optional ephemeral `--tmpfs-upper` writable layers.
 - **M3 — OCI image engine (done)**: `zerun login / logout / pull / push / tag / save / load / images / rmi`; Docker v2
   pull with Bearer token auth, private-registry credentials, multi-arch platform selection (`--platform`), compressed-blob and
   diff_id double verification, zstd layer decode + magic sniffing, transient request retries,
@@ -253,6 +254,9 @@ Run options (current subset):
 -v, --volume HOST|NAME:CONTAINER[:ro]
                      bind-mount an existing host path, or auto-create/use a managed
                      named volume under the data root
+--mount type=bind|volume|tmpfs,src=SOURCE,dst=TARGET[,readonly]
+                     Docker-style mount syntax; `type=tmpfs` accepts tmpfs-size= and
+                     tmpfs-mode= instead of src= (repeatable)
 --no-overlay        pivot directly into the rootfs (no writable upper layer)
 --tmpfs-upper       keep the overlay writable layer in tmpfs (not committable)
 --read-only         remount the container root read-only before exec
@@ -326,6 +330,9 @@ continue to bind existing host files or directories. Names are preserved by
 ```bash
 sudo zerun run --rm -v app-data:/var/lib/app alpine /bin/sh -c \
   'echo persisted >/var/lib/app/state && cat /var/lib/app/state'
+# The equivalent Docker-style spelling:
+sudo zerun run --rm --mount type=volume,src=app-data,dst=/var/lib/app \
+  alpine /bin/sh -c 'cat /var/lib/app/state'
 sudo zerun system df   # Volumes shows the managed storage
 ```
 

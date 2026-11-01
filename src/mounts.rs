@@ -12,6 +12,7 @@ use libc::{
     MNT_DETACH, MS_BIND, MS_NODEV, MS_NOEXEC, MS_NOSUID, MS_PRIVATE, MS_RDONLY, MS_REC,
     MS_RELATIME, MS_REMOUNT, MS_STRICTATIME,
 };
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
@@ -167,6 +168,167 @@ pub struct TmpfsMount {
     pub readonly: bool,
     /// The original `--tmpfs` argument.
     pub raw: String,
+}
+
+/// A parsed Docker-style `--mount` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountRequest {
+    Bind(BindMount),
+    Tmpfs(TmpfsMount),
+}
+
+/// Parse Docker's CSV-style `--mount` syntax for bind mounts, named volumes,
+/// and tmpfs mounts. The result is normalized into the same internal types as
+/// `-v` and `--tmpfs`, so restart metadata and generated services retain one
+/// canonical representation.
+///
+/// Commas delimit fields and are therefore not supported inside paths. Bind
+/// and volume sources are also rejected when they contain `:` because the
+/// persisted `-v` form would be ambiguous.
+pub fn parse_mount(value: &str) -> Result<MountRequest, String> {
+    let mut fields = BTreeMap::new();
+    for field in value.split(',') {
+        if field.is_empty() {
+            return Err(format!("--mount: empty field in '{value}'"));
+        }
+        let (raw_key, raw_value) = field.split_once('=').unwrap_or((field, ""));
+        let (key, value) = match (raw_key, raw_value) {
+            ("type", value) => ("type", value),
+            ("source" | "src", value) => ("source", value),
+            ("target" | "destination" | "dst", value) => ("target", value),
+            ("readonly", "") => ("readonly", "true"),
+            ("readonly", value) => ("readonly", value),
+            ("ro", "") => ("readonly", "true"),
+            ("rw", "") => ("readonly", "false"),
+            ("ro" | "rw", _) => {
+                return Err(format!(
+                    "--mount: option '{raw_key}' does not accept a value"
+                ))
+            }
+            ("tmpfs-size", value) => ("tmpfs-size", value),
+            ("tmpfs-mode", value) => ("tmpfs-mode", value),
+            (other, _) => return Err(format!("--mount: unsupported option '{other}'")),
+        };
+        if fields.insert(key, value).is_some() {
+            return Err(format!("--mount: duplicate option '{key}'"));
+        }
+    }
+
+    let mount_type = fields
+        .remove("type")
+        .ok_or_else(|| "--mount: type is required (bind|volume|tmpfs)".to_string())?;
+    if mount_type.is_empty() {
+        return Err("--mount: type cannot be empty".to_string());
+    }
+
+    let readonly = match fields.remove("readonly") {
+        Some("true") => true,
+        Some("false") => false,
+        Some(value) => {
+            return Err(format!(
+                "--mount: readonly expects true or false, got '{value}'"
+            ))
+        }
+        None => false,
+    };
+
+    match mount_type {
+        "bind" | "volume" => {
+            if fields.contains_key("tmpfs-size") || fields.contains_key("tmpfs-mode") {
+                return Err(format!(
+                    "--mount: tmpfs options are invalid for type={mount_type}"
+                ));
+            }
+            let source = fields
+                .remove("source")
+                .filter(|source| !source.is_empty())
+                .ok_or_else(|| format!("--mount: type={mount_type} requires source"))?;
+            let target = fields
+                .remove("target")
+                .filter(|target| !target.is_empty())
+                .ok_or_else(|| format!("--mount: type={mount_type} requires target"))?;
+            reject_remaining_mount_fields(&fields)?;
+            let source_is_absolute = Path::new(source).is_absolute();
+            match mount_type {
+                "bind" if !source_is_absolute => {
+                    return Err("--mount: type=bind source must be an absolute host path".into())
+                }
+                "volume" if source_is_absolute => {
+                    return Err(
+                        "--mount: type=volume source must be a volume name, not a path".into(),
+                    )
+                }
+                _ => {}
+            }
+            if source.contains(':') || source.contains(',') {
+                return Err(
+                    "--mount: source containing ':' or ',' cannot be persisted as -v".to_string(),
+                );
+            }
+            if target.contains(':') || target.contains(',') {
+                return Err("--mount: target containing ':' or ',' is not supported".to_string());
+            }
+            let mode = if readonly { "ro" } else { "rw" };
+            let canonical = format!("{source}:{target}:{mode}");
+            let mut mount = parse_bind(&canonical).map_err(|error| format!("--mount: {error}"))?;
+            mount.raw = canonical;
+            Ok(MountRequest::Bind(mount))
+        }
+        "tmpfs" => {
+            if fields.remove("source").is_some() {
+                return Err("--mount: type=tmpfs does not accept source".to_string());
+            }
+            let target = fields
+                .remove("target")
+                .filter(|target| !target.is_empty())
+                .ok_or_else(|| "--mount: type=tmpfs requires target".to_string())?;
+            let size = fields.remove("tmpfs-size");
+            let mode = fields.remove("tmpfs-mode");
+            reject_remaining_mount_fields(&fields)?;
+            if target.contains(':') || target.contains(',') {
+                return Err("--mount: target containing ':' or ',' is not supported".to_string());
+            }
+            let mut canonical = target.to_string();
+            let mut options = Vec::new();
+            if readonly {
+                options.push("ro".to_string());
+            }
+            if let Some(size) = size {
+                let bytes = crate::units::parse_size(size)
+                    .map_err(|_| format!("--mount: invalid tmpfs-size '{size}'"))?;
+                options.push(format!("size={bytes}"));
+            }
+            if let Some(mode) = mode {
+                let parsed =
+                    u32::from_str_radix(mode.trim_start_matches("0o"), 8).map_err(|_| {
+                        format!("--mount: invalid tmpfs-mode '{mode}' (octal expected)")
+                    })?;
+                if parsed > 0o7777 {
+                    return Err(format!("--mount: invalid tmpfs-mode '{mode}' (max 7777)"));
+                }
+                options.push(format!("mode={parsed:o}"));
+            }
+            if !options.is_empty() {
+                canonical.push(':');
+                canonical.push_str(&options.join(","));
+            }
+            let mut mount = parse_tmpfs(&canonical).map_err(|error| format!("--mount: {error}"))?;
+            mount.raw = canonical;
+            Ok(MountRequest::Tmpfs(mount))
+        }
+        other => Err(format!(
+            "--mount: unsupported type '{other}' (bind|volume|tmpfs)"
+        )),
+    }
+}
+
+fn reject_remaining_mount_fields(fields: &BTreeMap<&str, &str>) -> Result<(), String> {
+    match fields.keys().next() {
+        Some(key) => Err(format!(
+            "--mount: option '{key}' is invalid for this mount type"
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Parse Docker-style `--tmpfs PATH[:opts]`. Options are comma-separated
@@ -876,5 +1038,75 @@ mod bind_tests {
         assert!(parse_tmpfs("/x:mode=8888").is_err());
         assert!(parse_tmpfs("/x:nosuid").is_err());
         assert!(parse_tmpfs("/x:size=1m:extra").is_err());
+    }
+
+    #[test]
+    fn parse_mount_accepts_bind_volume_and_tmpfs_requests() {
+        let root = temp_path("parse-mount");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let host = std::fs::canonicalize(root.join("src")).unwrap();
+
+        let bind = parse_mount(&format!(
+            "type=bind,source={},target=/mnt/data,readonly",
+            host.display()
+        ))
+        .unwrap();
+        let MountRequest::Bind(bind) = bind else {
+            panic!("expected a bind mount");
+        };
+        assert_eq!(bind.source, host);
+        assert_eq!(bind.target, PathBuf::from("/mnt/data"));
+        assert!(bind.named.is_none());
+        assert!(bind.readonly);
+        assert_eq!(bind.raw, format!("{}:/mnt/data:ro", host.display()));
+
+        let volume = parse_mount("type=volume,src=app-data,dst=/var/lib/app,rw").unwrap();
+        let MountRequest::Bind(volume) = volume else {
+            panic!("expected a volume mount");
+        };
+        assert!(volume.source.as_os_str().is_empty());
+        assert_eq!(volume.named.as_deref(), Some("app-data"));
+        assert_eq!(volume.target, PathBuf::from("/var/lib/app"));
+        assert!(!volume.readonly);
+        assert_eq!(volume.raw, "app-data:/var/lib/app:rw");
+
+        let tmpfs =
+            parse_mount("type=tmpfs,destination=/scratch,tmpfs-size=16m,tmpfs-mode=0700,readonly")
+                .unwrap();
+        let MountRequest::Tmpfs(tmpfs) = tmpfs else {
+            panic!("expected a tmpfs mount");
+        };
+        assert_eq!(tmpfs.target, PathBuf::from("/scratch"));
+        assert_eq!(tmpfs.data, "size=16777216,mode=700");
+        assert!(tmpfs.readonly);
+        assert_eq!(tmpfs.raw, "/scratch:ro,size=16777216,mode=700");
+
+        fsutil::remove_dir_all_quiet(&root);
+    }
+
+    #[test]
+    fn parse_mount_rejects_ambiguous_or_invalid_requests() {
+        for value in [
+            "",
+            "source=/tmp,target=/mnt",
+            "type=bind,source=/tmp",
+            "type=bind,source=relative,target=/mnt",
+            "type=bind,source=/tmp,target=relative",
+            "type=bind,source=/tmp,target=/../mnt",
+            "type=bind,source=/tmp,target=/mnt,tmpfs-size=1m",
+            "type=bind,source=/tmp,target=/mnt,readonly=1",
+            "type=bind,source=/tmp,target=/mnt,ro=false",
+            "type=volume,source=/tmp,target=/mnt",
+            "type=volume,source=app-data",
+            "type=tmpfs,source=app-data,target=/scratch",
+            "type=tmpfs,target=/scratch,tmpfs-size=bad",
+            "type=tmpfs,target=/scratch,tmpfs-mode=8888",
+            "type=tmpfs,target=/scratch,unknown=true",
+            "type=bind,type=volume,source=app-data,target=/mnt",
+            "type=bind,source=/tmp,target=/mnt,",
+            "type=overlay,source=/tmp,target=/mnt",
+        ] {
+            assert!(parse_mount(value).is_err(), "{value:?} should be rejected");
+        }
     }
 }
