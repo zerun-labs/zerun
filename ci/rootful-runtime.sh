@@ -96,6 +96,21 @@ printf '%s\n' "$foreground_output"
 test "$foreground_status" -eq 17
 grep -Fx foreground-ok <<<"$foreground_output" >/dev/null
 
+# Namespaced sysctls must be applied after the private network and loopback are
+# ready, while /proc/sys remains writable during setup and read-only afterward.
+sysctl_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+  --cap-add NET_ADMIN --sysctl net.ipv4.ip_forward=1 --sysctl net.ipv4.conf.lo.forwarding=1 -- \
+  /bin/sh -c 'cat /proc/sys/net/ipv4/ip_forward; cat /proc/sys/net/ipv4/conf/lo/forwarding; \
+    if (printf 0 > /proc/sys/net/ipv4/ip_forward) 2>/dev/null; then echo writable; else echo readonly; fi')
+test "$sysctl_output" = $'1\n1\nreadonly'
+set +e
+host_sysctl_output=$("${zerun[@]}" run --rootfs "$rootfs" --net host --no-overlay \
+  --sysctl net.ipv4.ip_forward=1 -- /bin/true 2>&1)
+host_sysctl_status=$?
+set -e
+test "$host_sysctl_status" -eq 2
+grep -F 'requires a private network namespace' <<<"$host_sysctl_output" >/dev/null
+
 # A failed direct exec must stay on the error pipe until execve succeeds or
 # reports an error. Closing it before exec makes the parent mistake a dead
 # workload for a successful start.

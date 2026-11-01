@@ -20,7 +20,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
 - **M1 — isolation executor (done)**: namespace isolation (PID/MNT/UTS/IPC/NET/USER),
   corrected `pivot_root(".", ".")` sequence, container pseudo-filesystems, minimal `/dev`,
   masked/readonly paths, capability dropping, cgroups v2 (memory/cpu/pids/io), per-process
-  rlimits, optional
+  rlimits, namespaced `--sysctl` settings, optional
   built-in mini-init, and a reproducible benchmark harness.
 - **M2 — storage & security (done)**: deny-by-default seccomp allowlist; per-run OverlayFS
   with disk upper and automatic cleanup; OCI whiteout materialization; safe host bind-mount
@@ -253,6 +253,9 @@ Run options (current subset):
                     defaults to the host's)
 --dns-option OPTION resolver option such as ndots:2 (repeatable/comma-separated;
                     defaults to the host's)
+--sysctl KEY=VALUE  apply a namespaced kernel setting (repeatable; net.*,
+                    kernel.shm*, kernel.msg*, kernel.sem*, fs.mqueue.*,
+                    kernel.domainname)
 --init               run built-in mini-init (reap orphans, forward signals)
 --seccomp default|unconfined   seccomp policy (default: deny-by-default allowlist)
 --cap-add CAP|ALL              add capabilities to the default set (repeatable/comma-separated)
@@ -306,6 +309,14 @@ runs as root or another user. Names are resolved against the container's `/etc/g
 after `pivot_root`; numeric gids need no group file. Rootless containers deny `setgroups`
 and map only gid 0, so group additions fail explicitly. Detached restart/exec and generated
 service units retain the same launch policy.
+
+`--sysctl` accepts only settings scoped to a private container namespace.
+Network and IPC families are rejected with `--net host` or `--ipc host`, and
+`kernel.domainname` is rejected with `--uts host`, so a container option cannot
+silently mutate the host. Values are applied after bridge/loopback setup (which
+allows per-interface keys such as `net.ipv4.conf.eth0.*`) and before `/proc/sys`
+is remounted read-only for the workload. Detached restart and generated service
+units preserve the same settings.
 
 `ZERUN_REGISTRY_MIRRORS` (comma-separated), a zerun config file
 (`/etc/zerun/config.toml` with `[registry] mirrors = [...]`, overridable via

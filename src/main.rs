@@ -37,6 +37,7 @@ mod signal;
 mod state;
 mod store;
 mod syscalls;
+mod sysctl;
 mod trace;
 mod units;
 mod workload;
@@ -211,6 +212,8 @@ struct RunArgs {
     dns_options: Vec<String>,
     /// `--add-host NAME:ADDRESS` entries written to the container `/etc/hosts`.
     add_hosts: Vec<network::HostAlias>,
+    /// Namespaced kernel settings (`--sysctl KEY=VALUE`).
+    sysctls: BTreeMap<String, String>,
     labels: BTreeMap<String, String>,
     argv: Vec<String>,
     /// `-i/--interactive`: keep stdin attached (foreground runs).
@@ -529,6 +532,11 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 let v = next_value(args, &mut i, "--add-host")?;
                 a.add_hosts.push(network::HostAlias::parse(&v)?);
             }
+            "--sysctl" => {
+                let value = next_value(args, &mut i, "--sysctl")?;
+                let (key, value) = sysctl::parse(&value)?;
+                a.sysctls.insert(key, value);
+            }
             "--label" => {
                 let (k, v) = parse_label(&next_value(args, &mut i, "--label")?)?;
                 a.labels.insert(k, v);
@@ -587,6 +595,11 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             other if other.starts_with("--mount=") => {
                 append_run_mount(&mut a, &other["--mount=".len()..])?;
+                i += 1;
+            }
+            other if other.starts_with("--sysctl=") => {
+                let (key, value) = sysctl::parse(&other["--sysctl=".len()..])?;
+                a.sysctls.insert(key, value);
                 i += 1;
             }
             other if other.starts_with("--shm-size=") => {
@@ -1142,6 +1155,10 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
     if a.pids.is_none() {
         a.pids = default_pids_limit(euid);
     }
+    if let Err(error) = sysctl::validate_for_namespaces(&a.sysctls, a.namespaces, a.net) {
+        eprintln!("zerun run: {error}");
+        return 2;
+    }
     if let Err(error) = mounts::validate_device_permissions(euid != 0, &a.devices) {
         eprintln!("zerun run: {error}");
         return 2;
@@ -1568,6 +1585,10 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         Some(values) => values.clone(),
         None => a.group_add.clone(),
     };
+    let sysctls = resume
+        .as_ref()
+        .map(|st| st.sysctls.clone())
+        .unwrap_or_else(|| a.sysctls.clone());
 
     drop(image_store_lease);
     let container_fs = if let Some(st) = &resume {
@@ -1668,6 +1689,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         capabilities,
         ulimits,
         group_add,
+        sysctls,
         tty: a.tty,
         // A detached reaper has no caller stdin to pump. Keep the PTY itself
         // (so the workload sees a terminal) but never poll the collector's
@@ -2145,6 +2167,7 @@ fn run_detached(
         cwd: None,
         user: None,
         group_add: None,
+        sysctls: BTreeMap::new(),
         stop_signal: signal::DEFAULT_STOP_SIGNAL,
         stop_timeout: state::DEFAULT_STOP_TIMEOUT_SECS,
         restart_policy: restart::RestartPolicy::No,
@@ -2216,6 +2239,7 @@ fn run_detached(
         st.image_volumes = info.image_volumes.clone();
     }
     st.group_add = (!spec.group_add.is_empty()).then(|| spec.group_add.clone());
+    st.sysctls = spec.sysctls.clone();
     st.labels = info.labels;
     st.log = log_path.display().to_string();
     st.log_max_size = Some(info.log.max_size);
@@ -2540,6 +2564,9 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     }
     for v in &a.add_hosts {
         args.extend(["--add-host".to_string(), v.render()]);
+    }
+    for (key, value) in &a.sysctls {
+        args.extend(["--sysctl".to_string(), format!("{key}={value}")]);
     }
     for (k, v) in &a.labels {
         args.extend(["--label".to_string(), format!("{k}={v}")]);
@@ -7355,6 +7382,9 @@ RUN OPTIONS:\n  \
   --dns-option OPTION resolver option such as ndots:2 (repeatable/comma-separated;\n  \
                       defaults to the host's)\n  \
   --add-host HOST:IP  add an /etc/hosts entry (repeatable; IP or host-gateway)\n  \
+  --sysctl KEY=VALUE  apply a namespaced kernel setting (repeatable; net.*,\n  \
+                      kernel.shm*, kernel.msg*, kernel.sem*, fs.mqueue.*,\n  \
+                      kernel.domainname)\n  \
   --init              run the built-in mini-init (reap orphans + forward signals)\n  \
   --seccomp default|unconfined\n  \
   --cap-add CAP|ALL    add capability to the default set (repeatable/comma-separated)\n  \
@@ -7844,6 +7874,44 @@ mod tests {
             .expect("invalid capability")
             .contains("unknown capability"));
         assert!(parse_run_args(&["--cap-add=".to_string(), "alpine".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parses_and_captures_namespaced_sysctls() {
+        let args: Vec<_> = [
+            "--net",
+            "none",
+            "--sysctl",
+            "net.ipv4.ip_forward=1",
+            "--sysctl=kernel.domainname=example.test",
+            "alpine",
+            "true",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_run_args(&args).expect("valid sysctls");
+        assert_eq!(
+            a.sysctls.get("net.ipv4.ip_forward").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            a.sysctls.get("kernel.domainname").map(String::as_str),
+            Some("example.test")
+        );
+        let launch = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--sysctl", "kernel.domainname=example.test"]));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--sysctl", "net.ipv4.ip_forward=1"]));
+
+        let malformed: Vec<_> = ["--sysctl", "vm.swappiness=1", "alpine"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(parse_run_args(&malformed).is_err());
     }
 
     #[test]

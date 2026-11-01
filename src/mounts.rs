@@ -719,7 +719,6 @@ pub fn setup_rootfs(cfg: &RootfsConfig) -> ZResult<()> {
         cfg.devices,
         cfg.requested_device_sources,
     )?;
-    apply_masked_and_readonly(cfg.rootless)?;
 
     if cfg.set_hostname {
         if let Some(h) = cfg.hostname {
@@ -1219,7 +1218,11 @@ fn open_device_source(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
-fn apply_masked_and_readonly(rootless: bool) -> ZResult<()> {
+/// Mask sensitive procfs/sysfs paths and make kernel-control trees read-only.
+///
+/// The child calls this after applying `--sysctl` values, so requested settings
+/// remain writable during setup while the workload sees the hardened layout.
+pub fn lockdown_paths(rootless: bool) -> ZResult<()> {
     for p in MASKED_PATHS {
         let path = Path::new(p);
         if !path.exists() {
@@ -1242,13 +1245,25 @@ fn apply_masked_and_readonly(rootless: bool) -> ZResult<()> {
         require_or_warn(rootless, result, &format!("mask {p}"))?;
     }
     for p in READONLY_PATHS {
-        if Path::new(p).exists() {
-            require_or_warn(
-                rootless,
-                syscalls::mount(Some(p), p, None, MS_BIND | MS_REC | MS_RDONLY, None),
-                &format!("readonly {p}"),
-            )?;
+        if !Path::new(p).exists() {
+            continue;
         }
+        // A bind mount initially accepts MS_RDONLY but still reports `rw` in
+        // `/proc/mounts`; a second remount of the bind is required to enforce
+        // the flag. Do not remount the original mount if that bind failed.
+        match syscalls::mount(Some(p), p, None, MS_BIND | MS_REC, None) {
+            Ok(()) => {}
+            Err(error) if rootless => {
+                eprintln!(
+                    "zerun: warn: mount readonly {p} denied ({error}); rootless continues degraded"
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+        let remount = syscalls::mount(None, p, None, MS_BIND | MS_REMOUNT | MS_RDONLY, None)
+            .or_else(|_| syscalls::mount(None, p, None, MS_REMOUNT | MS_RDONLY, None));
+        require_or_warn(rootless, remount, &format!("readonly {p}"))?;
     }
     Ok(())
 }

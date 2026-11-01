@@ -435,6 +435,10 @@ pub struct ContainerState {
     /// None = legacy record with only the primary group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_add: Option<Vec<String>>,
+    /// Namespaced kernel settings applied at container start. Empty for older
+    /// records and for containers that did not request `--sysctl`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sysctls: BTreeMap<String, String>,
     /// Signal used by `stop`/`restart` before escalating to SIGKILL. Older
     /// records and the default configuration use SIGTERM.
     #[serde(default = "default_stop_signal")]
@@ -793,6 +797,7 @@ mod tests {
             cwd: None,
             user: None,
             group_add: None,
+            sysctls: BTreeMap::new(),
             stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
             stop_timeout: DEFAULT_STOP_TIMEOUT_SECS,
             restart_policy: crate::restart::RestartPolicy::No,
@@ -827,6 +832,7 @@ mod tests {
         value.as_object_mut().unwrap().remove("reaper_start_time");
         value.as_object_mut().unwrap().remove("ulimits");
         value.as_object_mut().unwrap().remove("group_add");
+        value.as_object_mut().unwrap().remove("sysctls");
         value.as_object_mut().unwrap().remove("namespaces");
         let state: ContainerState = serde_json::from_value(value).unwrap();
         assert_eq!(state.stop_signal, libc::SIGTERM);
@@ -838,6 +844,7 @@ mod tests {
         assert_eq!(state.reaper_start_time, None);
         assert_eq!(state.ulimits, None);
         assert_eq!(state.group_add, None);
+        assert!(state.sysctls.is_empty());
         assert_eq!(state.namespaces, NamespaceModes::default());
     }
 
@@ -940,6 +947,7 @@ mod tests {
             cwd: None,
             user: None,
             group_add: None,
+            sysctls: BTreeMap::new(),
             stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
             stop_timeout: DEFAULT_STOP_TIMEOUT_SECS,
             restart_policy: crate::restart::RestartPolicy::No,
@@ -1040,6 +1048,7 @@ mod tests {
             cwd: None,
             user: None,
             group_add: None,
+            sysctls: BTreeMap::new(),
             stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
             stop_timeout: DEFAULT_STOP_TIMEOUT_SECS,
             restart_policy: crate::restart::RestartPolicy::No,

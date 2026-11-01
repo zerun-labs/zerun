@@ -236,6 +236,10 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--add-host".into());
         run_args.push(v.render());
     }
+    for (key, value) in &a.sysctls {
+        run_args.push("--sysctl".into());
+        run_args.push(format!("{key}={value}"));
+    }
     for (k, v) in &a.labels {
         run_args.push("--label".into());
         run_args.push(format!("{k}={v}"));
@@ -396,6 +400,7 @@ fn validate(a: &RunArgs, rootful: bool) -> Result<(), String> {
         &a.add_hosts,
         (effective_net == NetMode::Bridge).then_some(crate::network::GATEWAY_IP),
     )?;
+    crate::sysctl::validate_for_namespaces(&a.sysctls, a.namespaces, effective_net)?;
     if a.rootfs.is_some() && (!a.env.is_empty() || !a.env_files.is_empty()) {
         return Err("-e/--env and --env-file require image mode (drop --rootfs)".into());
     }
@@ -719,6 +724,33 @@ mod tests {
         generate(&a, &mut out).unwrap();
         let unit = String::from_utf8(out).unwrap();
         assert!(unit.contains("--label tier=prod"));
+    }
+
+    #[test]
+    fn renders_and_validates_namespaced_sysctls() {
+        let a = args(&[
+            "--net",
+            "none",
+            "--sysctl",
+            "net.ipv4.ip_forward=1",
+            "--sysctl",
+            "kernel.domainname=example.test",
+            "alpine",
+            "true",
+        ]);
+        let unit = render(Path::new("/usr/local/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains("--sysctl net.ipv4.ip_forward=1"));
+        assert!(unit.contains("--sysctl kernel.domainname=example.test"));
+
+        let host_net = args(&[
+            "--net",
+            "host",
+            "--sysctl",
+            "net.ipv4.ip_forward=1",
+            "alpine",
+        ]);
+        let error = render(Path::new("/usr/local/bin/zerun"), &host_net, true).unwrap_err();
+        assert!(error.contains("private network namespace"));
     }
 
     #[test]

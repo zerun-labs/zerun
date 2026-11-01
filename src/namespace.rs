@@ -30,6 +30,7 @@ use crate::security;
 use crate::state::{ContainerMetrics, IpcMode, NamespaceMode, NamespaceModes};
 use crate::syscalls;
 use crate::trace;
+use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -87,6 +88,9 @@ pub struct RunSpec {
     /// Additional supplementary groups (`--group-add`), resolved inside the
     /// container mount namespace before hardening.
     pub group_add: Vec<String>,
+    /// Namespaced kernel settings applied after network setup and before the
+    /// workload's `/proc/sys` is remounted read-only.
+    pub sysctls: BTreeMap<String, String>,
     /// Remount the container root read-only before exec (`--read-only`);
     /// separate volume/tmpfs mounts stay writable.
     pub readonly: bool,
@@ -1121,6 +1125,14 @@ fn child_stage(
             }
         }
     }
+
+    // 2a. Apply namespaced kernel settings after the network interfaces exist
+    //     (so per-interface sysctls can target eth0), then make the control
+    //     trees read-only for the workload.
+    crate::sysctl::apply(&spec.sysctls, spec.namespaces, spec.net)?;
+    trace::mark("child:sysctl:done");
+    crate::mounts::lockdown_paths(identity.rootless)?;
+    trace::mark("child:lockdown:done");
 
     // 2b. `--read-only`: remount the root read-only after every setup write
     //     (/etc/hosts, tmpfs mounts) but *before* the capability drop, which
