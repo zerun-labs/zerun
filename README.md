@@ -99,7 +99,8 @@ ci/rootful-runtime.sh target/debug/zerun "$rootfs" "$data" "$runtime"
   `CAP_NET_RAW`/`CAP_SYS_ADMIN` removed, masked `/proc`/`/sys` paths, a deny-by-default
   seccomp allowlist, and a deny-by-default cgroup v2 device allowlist on rootful runs
   (capabilities can be tuned with `--cap-add`/`--cap-drop`; seccomp can be opted out with
-  `--seccomp unconfined`, while `--device` extends the device allowlist).
+  `--seccomp unconfined` or `--security-opt seccomp=unconfined`, while `--device`
+  extends the device allowlist).
 - **Docker-compatible top 20% CLI**: `run / ps / wait / start / pause / unpause / stop / restart / rm / prune / logs / exec / inspect /
   port / rename / top / diff / cp / export / import / events / update / attach / kill / pull / push / tag / save / load /
   login / logout / images / rmi / commit / generate-service / system df / doctor`.
@@ -279,6 +280,10 @@ Run options (current subset):
                     kernel.domainname)
 --init               run built-in mini-init (reap orphans, forward signals)
 --seccomp default|unconfined   seccomp policy (default: deny-by-default allowlist)
+--security-opt seccomp=default|unconfined
+                     Docker-compatible seccomp switch (repeatable)
+--security-opt no-new-privileges
+                     accepted because Zerun always enables no_new_privs
 --cap-add CAP|ALL              add capabilities to the default set (repeatable/comma-separated)
 --cap-drop CAP|ALL             remove capabilities from the default set (applied before adds)
 --platform os/arch[/variant]   pull/run a specific platform

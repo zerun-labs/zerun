@@ -271,6 +271,39 @@ impl PullPolicy {
     }
 }
 
+fn parse_seccomp_mode(flag: &str, value: &str) -> Result<SeccompMode, String> {
+    match value {
+        "unconfined" => Ok(SeccompMode::Unconfined),
+        "default" => Ok(SeccompMode::Default),
+        other => Err(format!(
+            "invalid {flag} value '{other}' (default|unconfined)"
+        )),
+    }
+}
+
+/// Translate the Docker-compatible security options Zerun can enforce.
+///
+/// `no_new_privs` is a non-negotiable runtime invariant rather than a switch,
+/// so accepting its Docker spelling is safe but disabling it is not. A custom
+/// seccomp profile would require a complete profile loader; map the built-in
+/// modes instead of pretending an unsupported file was applied.
+fn apply_security_opt(value: &str, seccomp: &mut SeccompMode) -> Result<(), String> {
+    if let Some(mode) = value.strip_prefix("seccomp=") {
+        *seccomp = parse_seccomp_mode("--security-opt seccomp", mode)?;
+        return Ok(());
+    }
+    match value {
+        "no-new-privileges" | "no-new-privileges=true" | "no-new-privileges:true" => Ok(()),
+        "no-new-privileges=false" | "no-new-privileges:false" => Err(
+            "--security-opt cannot disable no-new-privileges; Zerun always enables it".to_string(),
+        ),
+        other => Err(format!(
+            "unsupported --security-opt '{other}' \
+             (supported: seccomp=default|unconfined, no-new-privileges)"
+        )),
+    }
+}
+
 /// Parse a combined short `run` flag such as `-dt`, `-dit`, or `-dP`.
 ///
 /// Docker commonly combines boolean run flags in one token. Every other short
@@ -445,11 +478,11 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--seccomp" => {
                 let v = next_value(args, &mut i, "--seccomp")?;
-                a.seccomp = match v.as_str() {
-                    "unconfined" => SeccompMode::Unconfined,
-                    "default" => SeccompMode::Default,
-                    other => return Err(format!("invalid --seccomp value '{other}'")),
-                };
+                a.seccomp = parse_seccomp_mode("--seccomp", &v)?;
+            }
+            "--security-opt" => {
+                let v = next_value(args, &mut i, "--security-opt")?;
+                apply_security_opt(&v, &mut a.seccomp)?;
             }
             "--cap-add" => {
                 let v = next_value(args, &mut i, "--cap-add")?;
@@ -675,6 +708,14 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             other if other.starts_with("--health-retries=") => {
                 let value = &other["--health-retries=".len()..];
                 a.health.retries = Some(parse_health_retries(value)?);
+                i += 1;
+            }
+            other if other.starts_with("--seccomp=") => {
+                a.seccomp = parse_seccomp_mode("--seccomp", &other["--seccomp=".len()..])?;
+                i += 1;
+            }
+            other if other.starts_with("--security-opt=") => {
+                apply_security_opt(&other["--security-opt=".len()..], &mut a.seccomp)?;
                 i += 1;
             }
             other if other.starts_with("--stop-signal=") => {
@@ -7770,6 +7811,8 @@ RUN OPTIONS:\n  \
                       kernel.domainname)\n  \
   --init              run the built-in mini-init (reap orphans + forward signals)\n  \
   --seccomp default|unconfined\n  \
+  --security-opt seccomp=default|unconfined|no-new-privileges\n  \
+                      Docker-compatible security option (repeatable)\n  \
   --cap-add CAP|ALL    add capability to the default set (repeatable/comma-separated)\n  \
   --cap-drop CAP|ALL   remove capability from the default set (repeatable; before adds)\n  \
   --platform os/arch[/variant]  pull/run a specific platform\n  \
@@ -8218,6 +8261,45 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert!(parse_run_args(&args).is_err());
+    }
+
+    #[test]
+    fn accepts_supported_security_options_and_keeps_security_defaults() {
+        let args: Vec<_> = [
+            "--security-opt",
+            "no-new-privileges",
+            "--security-opt=seccomp=unconfined",
+            "alpine",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_run_args(&args).expect("security options");
+        assert_eq!(a.seccomp, SeccompMode::Unconfined);
+        assert!(detached_launch_args(&a, Path::new("/tmp/rootfs"))
+            .windows(2)
+            .any(|pair| pair == ["--seccomp", "unconfined"]));
+
+        let restore_default = [
+            "--security-opt=seccomp=unconfined",
+            "--seccomp=default",
+            "alpine",
+        ]
+        .map(String::from);
+        assert_eq!(
+            parse_run_args(&restore_default).unwrap().seccomp,
+            SeccompMode::Default
+        );
+
+        for value in [
+            "seccomp=/tmp/profile.json",
+            "seccomp=disabled",
+            "no-new-privileges=false",
+            "label=disable",
+        ] {
+            let args = ["--security-opt", value, "alpine"].map(String::from);
+            assert!(parse_run_args(&args).is_err(), "{value} should be rejected");
+        }
     }
 
     #[test]
