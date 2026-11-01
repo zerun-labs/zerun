@@ -660,8 +660,12 @@ grep -F '"exit_code": 124' <<<"$health_timeout_inspect" >/dev/null
 # M7 lifecycle and storage commands operate on a live writable container.
 # Keep this workload alive while inspect/stats/top/cp/diff/export/commit run,
 # then import the exported tar and execute it as a local image.
+label_file="/tmp/zerun-labels-${BASHPID}"
+cleanup_paths+=("$label_file")
+printf 'ci.label-file=loaded\nci.override=file\n' >"$label_file"
 m7_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --net none --pids 32 \
-  --name ci-m7 --label ci.m7=ok --init -- /bin/sh -c \
+  --name ci-m7 --label ci.m7=ok --label-file "$label_file" \
+  --label ci.override=cli --init -- /bin/sh -c \
   'printf "m7-running\\n"; printf "overlay-data\\n" >/run/m7-file;
    rm -rf /etc/opaque-test; mkdir /etc/opaque-test;
    printf "new-opaque-entry\\n" >/etc/opaque-test/new; sleep 30')
@@ -681,6 +685,8 @@ done
 inspect_output=$("${zerun[@]}" inspect "$m7_id")
 grep -q '"status": "running"' <<<"$inspect_output"
 grep -q '"ci.m7": "ok"' <<<"$inspect_output"
+grep -q '"ci.label-file": "loaded"' <<<"$inspect_output"
+grep -q '"ci.override": "cli"' <<<"$inspect_output"
 stats_output=$("${zerun[@]}" stats "$m7_id")
 grep -q 'ci-m7' <<<"$stats_output"
 top_output=$("${zerun[@]}" top "$m7_id")

@@ -16,6 +16,7 @@ mod execc;
 mod fsutil;
 mod health;
 mod image;
+mod labels;
 mod lifecycle;
 mod logs;
 mod mini_init;
@@ -572,8 +573,17 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 a.sysctls.insert(key, value);
             }
             "--label" => {
-                let (k, v) = parse_label(&next_value(args, &mut i, "--label")?)?;
+                let (k, v) = labels::parse_cli(&next_value(args, &mut i, "--label")?)?;
                 a.labels.insert(k, v);
+            }
+            "--label-file" => {
+                let path = next_value(args, &mut i, "--label-file")?;
+                if path.is_empty() {
+                    return Err("--label-file path cannot be empty".to_string());
+                }
+                for (key, value) in labels::load_file(std::path::Path::new(&path))? {
+                    a.labels.insert(key, value);
+                }
             }
             "--detach" | "-d" => {
                 a.detach = true;
@@ -658,6 +668,21 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                     return Err("--env-file path cannot be empty".to_string());
                 }
                 a.env_files.push(value.to_string());
+                i += 1;
+            }
+            other if other.starts_with("--label=") => {
+                let (key, value) = labels::parse_cli(&other["--label=".len()..])?;
+                a.labels.insert(key, value);
+                i += 1;
+            }
+            other if other.starts_with("--label-file=") => {
+                let path = &other["--label-file=".len()..];
+                if path.is_empty() {
+                    return Err("--label-file path cannot be empty".to_string());
+                }
+                for (key, value) in labels::load_file(std::path::Path::new(path))? {
+                    a.labels.insert(key, value);
+                }
                 i += 1;
             }
             other if other.starts_with("--mount=") => {
@@ -3292,16 +3317,6 @@ fn build_image_env(
         env.push(("TERM".to_string(), "xterm".to_string()));
     }
     Ok(env)
-}
-
-fn parse_label(raw: &str) -> Result<(String, String), String> {
-    let Some((key, value)) = raw.split_once('=') else {
-        return Err(format!("invalid --label '{raw}' (expected KEY=VALUE)"));
-    };
-    if key.is_empty() {
-        return Err(format!("invalid --label '{raw}' (empty KEY)"));
-    }
-    Ok((key.to_string(), value.to_string()))
 }
 
 fn upsert_env(env: &mut Vec<(String, String)>, key: String, value: String) {
@@ -7574,6 +7589,8 @@ RUN OPTIONS:\n  \
   -e, --env NAME[=VALUE]  set a container environment variable (image mode)\n  \
   --env-file FILE     load NAME=VALUE lines from a file (repeatable; image mode;\n  \
                       later files win, then -e overrides)\n  \
+  --label KEY[=VALUE]  add container metadata (repeatable; overrides image labels)\n  \
+  --label-file FILE    load KEY=VALUE labels from a file (repeatable; later wins)\n  \
   --log-max-size SIZE  detached console.log rotation size (default: 10m; 0 disables)\n  \
   --log-max-file N     retained detached log files including active (default: 3; max: 1024)\n  \
   --shm-size SIZE     private /dev/shm size (default: 64m)\n  \
@@ -8738,6 +8755,8 @@ mod tests {
             "tier=dev",
             "--label",
             "only=",
+            "--label",
+            "bare",
             "alpine",
         ]
         .iter()
@@ -8746,8 +8765,40 @@ mod tests {
         let a = parse_run_args(&args).expect("valid labels");
         assert_eq!(a.labels.get("tier").map(String::as_str), Some("dev"));
         assert_eq!(a.labels.get("only").map(String::as_str), Some(""));
-        assert!(parse_label("novalue").is_err());
-        assert!(parse_label("=value").is_err());
+        assert_eq!(a.labels.get("bare").map(String::as_str), Some(""));
+        assert!(labels::parse_cli("=value").is_err());
+        assert!(labels::parse_cli("white space=value").is_err());
+    }
+
+    #[test]
+    fn parses_label_files_in_option_order() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-label-args-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("labels");
+        std::fs::write(&path, "tier=file\nfrom-file=yes\nbare\n").unwrap();
+
+        let args = vec![
+            "--label".to_string(),
+            "tier=before".to_string(),
+            format!("--label-file={}", path.display()),
+            "--label=tier=after".to_string(),
+            "alpine".to_string(),
+        ];
+        let parsed = parse_run_args(&args).unwrap();
+        assert_eq!(parsed.labels.get("tier").map(String::as_str), Some("after"));
+        assert_eq!(
+            parsed.labels.get("from-file").map(String::as_str),
+            Some("yes")
+        );
+        assert!(!parsed.labels.contains_key("bare"));
+
+        assert!(parse_run_args(&["--label-file=".to_string(), "alpine".to_string()]).is_err());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

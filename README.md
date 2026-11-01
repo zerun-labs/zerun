@@ -279,7 +279,8 @@ Run options (current subset):
 --env-file FILE                load NAME=VALUE lines (repeatable; image mode)
 --log-max-size SIZE            rotate detached console.log at SIZE (default 10m; 0 disables)
 --log-max-file N               retain N detached log files including active (default 3; max 1024)
---label KEY=VALUE             add container metadata (repeatable; overrides image labels)
+--label KEY[=VALUE]           add container metadata (repeatable; overrides image labels)
+--label-file FILE             load KEY=VALUE labels from a file (repeatable)
 -v, --volume HOST|NAME:CONTAINER[:ro]
                      bind-mount an existing host path, or auto-create/use a managed
                      named volume under the data root
@@ -472,6 +473,11 @@ resets to `starting` for every automatic restart attempt, and `commit` preserves
 check in the new image config. Timings use Go/Docker duration syntax such as `500ms`, `30s`,
 or `1m30s`. Monitoring is intentionally scoped to detached containers, where durable state
 exists for other commands to inspect.
+
+Container labels can be supplied directly or from line-oriented files. A bare `--label key`
+sets an empty value; `--label-file` ignores blank lines, comments, and lines without `=`, and
+later files or explicit `--label` options override earlier keys. Label files are limited to
+1 MiB and must be UTF-8, with values preserved literally after the first `=`.
 
 `--restart=on-failure[:MAX]` retries non-zero exits (an omitted or zero maximum is
 unlimited), `always` retries every exit, and `unless-stopped` retries every exit until a
