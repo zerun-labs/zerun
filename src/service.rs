@@ -419,6 +419,13 @@ fn validate(a: &RunArgs, rootful: bool) -> Result<(), String> {
                 .into(),
         );
     }
+    if a.cidfile.is_some() {
+        return Err(
+            "--cidfile cannot be used with generate-service; a repeated unit start would \
+             encounter the previous container-id file"
+                .into(),
+        );
+    }
     if a.rootfs.is_none() && a.image.is_none() {
         return Err("an IMAGE (or --rootfs DIR for legacy mode) is required".into());
     }
@@ -841,6 +848,13 @@ mod tests {
         let a = args(&["--log-max-size", "1m", "--name", "web", "alpine"]);
         let err = render(Path::new("/bin/zerun"), &a, true).unwrap_err();
         assert!(err.contains("journald"));
+    }
+
+    #[test]
+    fn rejects_cidfile_for_services() {
+        let a = args(&["--cidfile", "/tmp/web.cid", "--name", "web", "alpine"]);
+        let error = render(Path::new("/bin/zerun"), &a, true).unwrap_err();
+        assert!(error.contains("--cidfile cannot be used"), "{error}");
     }
 
     #[test]

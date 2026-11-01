@@ -8,6 +8,7 @@
 //!   zerun login / logout / pull / images / rmi   image lifecycle (M3)
 //!   zerun doctor                          environment diagnostics
 mod cgroup;
+mod cidfile;
 mod containerdiff;
 mod device_cgroup;
 mod error;
@@ -140,6 +141,8 @@ fn main() {
 struct RunArgs {
     rootfs: Option<String>,
     image: Option<String>,
+    /// `--cidfile FILE`: write the new container id without overwriting.
+    cidfile: Option<String>,
     memory: Option<String>,
     memory_reservation: Option<String>,
     /// Docker-style total memory+swap; -1/unlimited.
@@ -598,6 +601,13 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 }
                 a.name = Some(v);
             }
+            "--cidfile" => {
+                let v = next_value(args, &mut i, "--cidfile")?;
+                if v.is_empty() {
+                    return Err("--cidfile path cannot be empty".to_string());
+                }
+                a.cidfile = Some(v);
+            }
             "--rm" => {
                 a.rm = true;
                 i += 1;
@@ -683,6 +693,14 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 for (key, value) in labels::load_file(std::path::Path::new(path))? {
                     a.labels.insert(key, value);
                 }
+                i += 1;
+            }
+            other if other.starts_with("--cidfile=") => {
+                let path = &other["--cidfile=".len()..];
+                if path.is_empty() {
+                    return Err("--cidfile path cannot be empty".to_string());
+                }
+                a.cidfile = Some(path.to_string());
                 i += 1;
             }
             other if other.starts_with("--mount=") => {
@@ -1463,6 +1481,24 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         })
         .expect("new runs reserve an id and resumed runs have one");
 
+    // A resumed container keeps its original id and cidfile. Recreating the
+    // client-side receipt would either overwrite an operator file or make
+    // `start`/`restart` fail just because the original run succeeded.
+    let mut cidfile_guard = if resume.is_none() {
+        match a.cidfile.as_deref() {
+            Some(path) => match cidfile::CidFile::create(Path::new(path), &id) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    eprintln!("zerun run: {error}");
+                    return 2;
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+
     // A host UTS namespace cannot be renamed without host privileges (and
     // `--hostname` is rejected with it). Use the live host name for the
     // container's HOSTNAME default and /etc/hosts identity instead of the id.
@@ -1886,7 +1922,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
             Some(guard) => guard.into_names(),
             None => anonymous_volumes,
         };
-        return run_detached(
+        let code = run_detached(
             &store,
             spec,
             container_fs,
@@ -1915,15 +1951,28 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
             },
             id_reservation,
         );
+        if code == 0 {
+            if let Some(guard) = cidfile_guard.take() {
+                guard.keep();
+            }
+        }
+        return code;
     }
 
     // Foreground: this CLI is the parent and waits for the container.
-    let result = namespace::run_container(spec);
+    let result = namespace::run_container_with_report(spec, |_| Ok(()));
     if let Some(fs) = container_fs {
         store.cleanup_container_fs(&fs);
     }
     match result {
-        Ok(code) => code,
+        Ok(exit) => {
+            if exit.started {
+                if let Some(guard) = cidfile_guard.take() {
+                    guard.keep();
+                }
+            }
+            exit.code
+        }
         Err(e) => {
             eprintln!("zerun: {e}");
             1
@@ -2559,6 +2608,9 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     }
     if let Some(name) = &a.name {
         args.extend(["--name".to_string(), name.clone()]);
+    }
+    if let Some(path) = &a.cidfile {
+        args.extend(["--cidfile".to_string(), path.clone()]);
     }
     if let Some(v) = &a.memory {
         args.extend(["--memory".to_string(), v.clone()]);
@@ -7537,6 +7589,7 @@ RUN OPTIONS:\n  \
   --device-write-iops DEV:COUNT  cgroup v2 io.max write IOPS (repeatable)\n  \
   --ulimit TYPE=SOFT[:HARD]      per-process rlimit (repeatable; -1 = unlimited)\n  \
   -h, --hostname H    container hostname (new UTS namespace)\n  \
+  --cidfile FILE      write the container id to FILE without overwriting it\n  \
   --pid private|host  private PID namespace (default) or share host PID (sensitive)\n  \
   --ipc private|none|host\n  \
                       private IPC+shm (default), private IPC without /dev/shm, or\n  \
@@ -8768,6 +8821,31 @@ mod tests {
         assert_eq!(a.labels.get("bare").map(String::as_str), Some(""));
         assert!(labels::parse_cli("=value").is_err());
         assert!(labels::parse_cli("white space=value").is_err());
+    }
+
+    #[test]
+    fn parses_and_persists_cidfile() {
+        let args: Vec<_> = ["--cidfile", "/tmp/web.cid", "alpine"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let a = parse_run_args(&args).expect("valid cidfile");
+        assert_eq!(a.cidfile.as_deref(), Some("/tmp/web.cid"));
+        let launch = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--cidfile", "/tmp/web.cid"]));
+
+        let inline: Vec<_> = ["--cidfile=/tmp/other.cid", "alpine"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            parse_run_args(&inline).unwrap().cidfile.as_deref(),
+            Some("/tmp/other.cid")
+        );
+        assert!(parse_run_args(&["--cidfile=".to_string()]).is_err());
+        assert!(parse_run_args(&["--cidfile".to_string()]).is_err());
     }
 
     #[test]

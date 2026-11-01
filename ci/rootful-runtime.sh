@@ -96,6 +96,40 @@ printf '%s\n' "$foreground_output"
 test "$foreground_status" -eq 17
 grep -Fx foreground-ok <<<"$foreground_output" >/dev/null
 
+# The Docker-compatible cidfile is an exclusive receipt: a successful startup
+# leaves the container id behind, while a duplicate path is rejected without
+# overwriting the original receipt.
+cidfile=$(mktemp)
+remove_cleanup_path "$cidfile"
+cleanup_paths+=("$cidfile")
+"${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay --cidfile "$cidfile" -- /bin/sh -c true
+cid_value=$(cat "$cidfile")
+[[ $cid_value =~ ^[0-9a-f]{12}$ ]] || {
+  echo "cidfile contains an invalid container id: $cid_value" >&2
+  exit 1
+}
+set +e
+cidfile_conflict=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+  --cidfile "$cidfile" -- /bin/sh -c true 2>&1)
+cidfile_conflict_status=$?
+set -e
+test "$cidfile_conflict_status" -eq 2
+grep -F 'container ID file' <<<"$cidfile_conflict" >/dev/null
+test "$(cat "$cidfile")" = "$cid_value"
+
+# A failed workload launch must remove only the receipt created by that
+# attempt, so scripts do not treat a dead container as a successful start.
+failed_cidfile=$(mktemp)
+remove_cleanup_path "$failed_cidfile"
+cleanup_paths+=("$failed_cidfile")
+set +e
+"${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+  --cidfile "$failed_cidfile" -- /definitely-missing-zerun-command >/dev/null 2>&1
+failed_cidfile_status=$?
+set -e
+test "$failed_cidfile_status" -eq 1
+test ! -e "$failed_cidfile"
+
 # Namespaced sysctls must be applied after the private network and loopback are
 # ready, while /proc/sys remains writable during setup and read-only afterward.
 sysctl_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \

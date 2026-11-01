@@ -157,18 +157,17 @@ pub struct StartedInfo {
 /// Result of the parent's full run path.
 pub struct RunExit {
     pub code: i32,
+    /// True once the child crossed the error-pipe boundary and exec'd the
+    /// workload. A false value with `code == 1` denotes a setup failure rather
+    /// than a workload that exited unsuccessfully.
+    pub started: bool,
     /// Metrics captured just before the cgroup is cleaned up. `None` when no
     /// cgroup was created or the control files were unavailable.
     pub metrics: Option<ContainerMetrics>,
 }
 
-/// Full run path without a lifecycle hook. Returns the workload exit code.
-pub fn run_container(spec: RunSpec) -> ZResult<i32> {
-    Ok(run_container_with_report(spec, |_| Ok(()))?.code)
-}
-
 /// Full run path, returning both the exit code and final cgroup metrics. This
-/// is the implementation used by `run_container` and the detached lifecycle
+/// is the implementation used by foreground `run` and the detached lifecycle
 /// reaper. The callback runs after the workload has entered its final exec
 /// path; a callback failure therefore aborts the workload and performs the
 /// same host-side cleanup as any other setup failure.
@@ -530,6 +529,7 @@ where
         );
         return Ok(RunExit {
             code: 1,
+            started: false,
             metrics: None,
         });
     }
@@ -628,7 +628,11 @@ where
         let _ = handle.join();
     }
     trace::mark("parent:end");
-    Ok(RunExit { code, metrics })
+    Ok(RunExit {
+        code,
+        started: true,
+        metrics,
+    })
 }
 
 /// Build the unshare(2) namespace mask for one container launch.

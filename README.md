@@ -201,6 +201,7 @@ Run options (current subset):
 ```
 -d, --detach         run in the background (print id once started; see M5 section)
 --name NAME          name the container (ps/stop/rm/logs/exec accept it)
+--cidfile FILE       write the new container id to FILE (must not already exist)
 --rm                 remove state + writable layer automatically on exit
 -m, --memory 64M     cgroup v2 memory.max (K/M/G suffixes)
 --memory-reservation 64M
@@ -478,6 +479,14 @@ Container labels can be supplied directly or from line-oriented files. A bare `-
 sets an empty value; `--label-file` ignores blank lines, comments, and lines without `=`, and
 later files or explicit `--label` options override earlier keys. Label files are limited to
 1 MiB and must be UTF-8, with values preserved literally after the first `=`.
+
+`--cidfile FILE` writes the new container id without a trailing newline and refuses to
+overwrite an existing path, matching Docker's script-facing behavior. The file is created
+with Docker's `0644` default (subject to the process umask) and remains after the container
+starts or exits; failed validation or startup removes only the file created by that attempt.
+`start` and `restart` reuse the original id without touching the cidfile. Service units reject
+`--cidfile` because a systemd restart would otherwise encounter the receipt from the previous
+run.
 
 `--restart=on-failure[:MAX]` retries non-zero exits (an omitted or zero maximum is
 unlimited), `always` retries every exit, and `unless-stopped` retries every exit until a
