@@ -34,7 +34,7 @@ command -v "$cc" >/dev/null || {
   exit 1
 }
 
-mkdir -p "$rootfs/bin" "$rootfs/etc/opaque-test" "$rootfs/srv"
+mkdir -p "$rootfs/bin" "$rootfs/etc/opaque-test" "$rootfs/srv/range-a" "$rootfs/srv/range-b"
 install -m 0755 "$busybox" "$rootfs/bin/busybox"
 printf 'testuser:x:4242:4344::/:/bin/sh\n' >"$rootfs/etc/passwd"
 printf 'testuser:x:4344:\ntestgroup:x:4343:\n' >"$rootfs/etc/group"
@@ -43,6 +43,8 @@ for applet in sh httpd ip grep cat sleep; do
   ln -s busybox "$rootfs/bin/$applet"
 done
 printf 'zerun-port-ok\n' >"$rootfs/srv/index.html"
+printf 'zerun-range-a-ok\n' >"$rootfs/srv/range-a/index.html"
+printf 'zerun-range-b-ok\n' >"$rootfs/srv/range-b/index.html"
 
 "$cc" -static -O2 -Wall -Wextra -x c -o "$rootfs/bin/udp-echo" - <<'C_EOF'
 #include <arpa/inet.h>

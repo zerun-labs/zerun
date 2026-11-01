@@ -69,7 +69,9 @@ cgroups v2, detached lifecycle controls (`pause`/`unpause`/`update`/`rename`/`at
 concurrent name uniqueness across creation and rename,
 `inspect`/`stats`/`top`, `system df`, `cp`, `diff`, `export`/`import`, live and retained-overlay
 `commit`,
-bounded `events` replay, bridge/veth networking, and TCP/UDP published-port proxies. A separate
+bounded `events` replay, bridge/veth networking, TCP/UDP published-port proxies, translated
+published-port ranges, `--expose`/`-P` traffic, and service rendering that retains port
+bindings. A separate
 rootless smoke job creates a dedicated unprivileged runner account and verifies
 user-namespace execution; static GNU and musl builds plus ARM64, ARMv7, and RISC-V64
 cross-builds are checked as well. Tagged releases are gated on both debug and release-profile

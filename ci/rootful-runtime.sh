@@ -70,17 +70,46 @@ grep -F 'readiness      : OK' <<<"$doctor_output" >/dev/null
 # has 18080 available. The check is intentionally only a race-avoidance hint:
 # Zerun still binds the published port before cloning the container, so its
 # own bind remains the authoritative conflict check.
-find_free_tcp_port() {
+find_free_tcp_port_range() {
+  local count=$1
   local candidate=$((18080 + (BASHPID % 1000)))
-  local attempt
+  local attempt offset free
+  [[ $count =~ ^[1-9][0-9]*$ ]] || {
+    echo "invalid free-port range size: $count" >&2
+    return 1
+  }
   for attempt in $(seq 1 1000); do
-    if ! (echo >/dev/tcp/127.0.0.1/"$candidate") 2>/dev/null; then
+    free=1
+    for ((offset = 0; offset < count; offset++)); do
+      if (echo >/dev/tcp/127.0.0.1/$((candidate + offset))) 2>/dev/null; then
+        free=0
+        break
+      fi
+    done
+    if (( free )); then
       printf '%s\n' "$candidate"
       return 0
     fi
     candidate=$((candidate + 1))
   done
   echo "could not find a free TCP port for the published-port check" >&2
+  return 1
+}
+
+find_free_tcp_port() {
+  find_free_tcp_port_range 1
+}
+
+wait_for_http_body() {
+  local port=$1 expected=$2 attempt
+  for attempt in $(seq 1 50); do
+    if curl --fail --silent --show-error "http://127.0.0.1:$port/" | \
+        grep -Fxq "$expected"; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "HTTP response '$expected' did not become ready on port $port" >&2
   return 1
 }
 
@@ -942,22 +971,55 @@ cleanup_ids+=("$container_id")
 port_output=$("${zerun[@]}" port "$container_id")
 grep -Eq "^8080/tcp -> .+:$port$" <<<"$port_output"
 
-for attempt in $(seq 1 50); do
-  if curl --fail --silent --show-error "http://127.0.0.1:$port/" | \
-      grep -Fxq zerun-port-ok; then
-    break
-  fi
-  if (( attempt == 50 )); then
-    echo "published port did not become ready" >&2
-    exit 1
-  fi
-  sleep 0.2
-done
+wait_for_http_body "$port" zerun-port-ok
 
 "${zerun[@]}" kill --signal TERM "$container_id" >/dev/null
 wait_status=$("${zerun[@]}" wait "$container_id")
 test "$wait_status" -ne 0
 "${zerun[@]}" rm "$container_id" >/dev/null
+
+# Published ranges are expanded to concrete host/container pairs. Separate
+# document roots prove that traffic for each translated host port reaches the
+# intended container port rather than both reaching the same listener.
+range_port=$(find_free_tcp_port_range 2)
+range_port_end=$((range_port + 1))
+range_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net bridge \
+  -p "$range_port-$range_port_end:8080-8081" --init -- /bin/sh -c \
+  '/bin/httpd -f -p 8080 -h /srv/range-a & /bin/httpd -f -p 8081 -h /srv/range-b & wait')
+cleanup_ids+=("$range_id")
+range_output=$("${zerun[@]}" port "$range_id")
+grep -Eq "^8080/tcp -> .+:$range_port$" <<<"$range_output"
+grep -Eq "^8081/tcp -> .+:$range_port_end$" <<<"$range_output"
+wait_for_http_body "$range_port" zerun-range-a-ok
+wait_for_http_body "$range_port_end" zerun-range-b-ok
+"${zerun[@]}" stop --time 2 "$range_id" >/dev/null
+"${zerun[@]}" rm "$range_id" >/dev/null
+
+# `-P` turns CLI-exposed ports into concrete random mappings before launch.
+# Resolve the selected host port through `zerun port` and verify real traffic.
+publish_all_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net bridge \
+  --expose 8080 -P --init -- /bin/httpd -f -p 8080 -h /srv)
+cleanup_ids+=("$publish_all_id")
+publish_all_output=$("${zerun[@]}" port "$publish_all_id")
+publish_all_port=$(sed -n 's|^8080/tcp -> .*:\([0-9][0-9]*\)$|\1|p' <<<"$publish_all_output")
+[[ $publish_all_port =~ ^[0-9]+$ ]] || {
+  echo "publish-all did not record a concrete 8080/tcp mapping: $publish_all_output" >&2
+  exit 1
+}
+wait_for_http_body "$publish_all_port" zerun-port-ok
+"${zerun[@]}" stop --time 2 "$publish_all_id" >/dev/null
+"${zerun[@]}" rm "$publish_all_id" >/dev/null
+
+# Service generation must retain the exact bind address, protocol, exposed
+# ports and publish-all intent rather than reducing mappings to ports alone.
+service_udp_port=$(find_free_tcp_port)
+service_unit=$("${zerun[@]}" generate-service --rootfs "$rootfs" --net bridge \
+  -p "127.0.0.1:$port:8080" -p "127.0.0.1:$service_udp_port:8081/udp" \
+  --expose 9090 -P -- /bin/true)
+grep -F -- "--publish 127.0.0.1:$port:8080" <<<"$service_unit" >/dev/null
+grep -F -- "--publish 127.0.0.1:$service_udp_port:8081/udp" <<<"$service_unit" >/dev/null
+grep -F -- "--expose 9090/tcp" <<<"$service_unit" >/dev/null
+grep -F -- "--publish-all" <<<"$service_unit" >/dev/null
 
 # UDP publishing uses the same in-binary proxy, but replies must retain the
 # published host port as their source. The CI fixture includes a tiny static
