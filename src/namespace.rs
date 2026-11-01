@@ -29,7 +29,7 @@ use crate::security;
 use crate::state::{ContainerMetrics, NamespaceMode, NamespaceModes};
 use crate::syscalls;
 use crate::trace;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
@@ -189,7 +189,7 @@ where
     // exec workers and other processes that did not descend from the workload.
     let needs_lifecycle_cgroup =
         spec.lifecycle_cgroup || matches!(spec.namespaces.pid, NamespaceMode::Host);
-    let cg = if has_limits {
+    let mut cg = if has_limits {
         Some(CgroupV2::create(&spec.id, &spec.limits)?)
     } else if needs_lifecycle_cgroup {
         match CgroupV2::create(&spec.id, &spec.limits) {
@@ -310,6 +310,7 @@ where
     };
     let supervisor_pid = spawned.supervisor_pid;
     let pid = spawned.worker_pid;
+    let worker_pidfd = spawned.worker_pidfd;
     if let Some(pair) = &mut pty_pair {
         pair.release_slave();
     }
@@ -328,15 +329,7 @@ where
     if let Some(cgroup) = &cg {
         if let Err(error) = cgroup.attach(pid) {
             start_gate.close_write();
-            let _ = syscalls::kill(pid, libc::SIGKILL);
-            let _ = wait_child(supervisor_pid);
-            if let Err(cleanup_error) = cgroup.kill_all() {
-                eprintln!("zerun: warning: terminate cgroup after attach failure: {cleanup_error}");
-            }
-            if let Some(cg) = cg {
-                cg.cleanup();
-            }
-            release_bridge_ip(&spec);
+            abort_started_attempt(&spec, supervisor_pid, worker_pidfd.as_ref(), None, &mut cg);
             return Err(error);
         }
     }
@@ -375,45 +368,46 @@ where
     let start_result = syscalls::write_all_fd(start_gate.write_fd(), &[1]);
     start_gate.close_write();
     if let Err(error) = start_result {
-        let _ = syscalls::kill(pid, libc::SIGKILL);
-        let _ = wait_child(supervisor_pid);
-        reap_host_pid_descendants(spec.namespaces);
-        if let Some(net) = &host_net {
-            crate::network::teardown_host_side(net);
-        }
-        if let Some(cg) = &cg {
-            if let Err(cleanup_error) = cg.kill_all() {
-                eprintln!(
-                    "zerun: warning: terminate cgroup after start-gate failure: {cleanup_error}"
-                );
-            }
-        }
-        if let Some(cg) = cg {
-            cg.cleanup();
-        }
-        release_bridge_ip(&spec);
+        abort_started_attempt(
+            &spec,
+            supervisor_pid,
+            worker_pidfd.as_ref(),
+            host_net.as_ref(),
+            &mut cg,
+        );
         return Err(error);
     }
 
     // Block on the error pipe: EOF means the child successfully exec'd
     // (CLOEXEC closes the write end).
     let mut buf = [0u8; 2048];
-    let n = read_all(err_pipe.read_fd(), &mut buf)?;
+    let n = match read_all(err_pipe.read_fd(), &mut buf) {
+        Ok(n) => n,
+        Err(error) => {
+            err_pipe.close_read();
+            abort_started_attempt(
+                &spec,
+                supervisor_pid,
+                worker_pidfd.as_ref(),
+                host_net.as_ref(),
+                &mut cg,
+            );
+            return Err(error);
+        }
+    };
     err_pipe.close_read();
     if n > 0 {
         // The child failed before exec (this also reports bridge setup failures,
         // which the child relays over this pipe).
         let msg = String::from_utf8_lossy(&buf[..n]);
         eprintln!("zerun: container setup failed: {msg}");
-        let _ = wait_child(supervisor_pid);
-        reap_host_pid_descendants(spec.namespaces);
-        if let Some(net) = &host_net {
-            crate::network::teardown_host_side(net);
-        }
-        if let Some(cg) = cg {
-            cg.cleanup();
-        }
-        release_bridge_ip(&spec);
+        abort_started_attempt(
+            &spec,
+            supervisor_pid,
+            worker_pidfd.as_ref(),
+            host_net.as_ref(),
+            &mut cg,
+        );
         return Ok(RunExit {
             code: 1,
             metrics: None,
@@ -438,16 +432,13 @@ where
         // not let a failed state write turn into a falsely successful `run -d`:
         // the workload is already running at this point, so terminate it and
         // release every host-side resource before returning the error.
-        let _ = syscalls::kill(pid, libc::SIGKILL);
-        let _ = wait_child(supervisor_pid);
-        reap_host_pid_descendants(spec.namespaces);
-        if let Some(net) = &host_net {
-            crate::network::teardown_host_side(net);
-        }
-        if let Some(cg) = cg {
-            cg.cleanup();
-        }
-        release_bridge_ip(&spec);
+        abort_started_attempt(
+            &spec,
+            supervisor_pid,
+            worker_pidfd.as_ref(),
+            host_net.as_ref(),
+            &mut cg,
+        );
         return Err(error);
     }
 
@@ -464,16 +455,13 @@ where
                 syscalls::close(master);
                 // The workload is already running, so a failed pump startup
                 // must follow the same cleanup path as a failed start hook.
-                let _ = syscalls::kill(pid, libc::SIGKILL);
-                let _ = wait_child(supervisor_pid);
-                reap_host_pid_descendants(spec.namespaces);
-                if let Some(net) = &host_net {
-                    crate::network::teardown_host_side(net);
-                }
-                if let Some(cg) = cg {
-                    cg.cleanup();
-                }
-                release_bridge_ip(&spec);
+                abort_started_attempt(
+                    &spec,
+                    supervisor_pid,
+                    worker_pidfd.as_ref(),
+                    host_net.as_ref(),
+                    &mut cg,
+                );
                 return Err(error);
             }
         }
@@ -483,19 +471,13 @@ where
     let code = match wait_child(supervisor_pid) {
         Ok(code) => code,
         Err(error) => {
-            if let Some(cg) = &cg {
-                if let Err(kill_error) = cg.kill_all() {
-                    eprintln!("zerun: warning: terminate cgroup after wait failure: {kill_error}");
-                }
-            }
-            reap_host_pid_descendants(spec.namespaces);
-            if let Some(net) = &host_net {
-                crate::network::teardown_host_side(net);
-            }
-            if let Some(cg) = cg {
-                cg.cleanup();
-            }
-            release_bridge_ip(&spec);
+            abort_started_attempt(
+                &spec,
+                supervisor_pid,
+                worker_pidfd.as_ref(),
+                host_net.as_ref(),
+                &mut cg,
+            );
             return Err(error);
         }
     };
@@ -586,6 +568,43 @@ fn reap_host_pid_descendants(namespaces: NamespaceModes) {
     }
 }
 
+/// Terminate a launched attempt and reclaim every host-side resource that is
+/// not already owned by an RAII type.
+///
+/// This is used both before exec (worker parked or setup failed) and after a
+/// start hook/PTY failure. Killing the whole cgroup is essential once the
+/// workload has run because `exec` workers and `--pid host` descendants may not
+/// be in the supervisor's direct process tree. The cgroup is removed only after
+/// the supervisor has been reaped, and the bridge IP is released last.
+fn abort_started_attempt(
+    spec: &RunSpec,
+    supervisor_pid: i32,
+    worker_pidfd: Option<&OwnedFd>,
+    host_net: Option<&crate::network::HostNet>,
+    cg: &mut Option<CgroupV2>,
+) {
+    if let Some(pidfd) = worker_pidfd {
+        if let Err(error) = syscalls::pidfd_send_signal_if_exists(pidfd.as_raw_fd(), libc::SIGKILL)
+        {
+            eprintln!("zerun: warning: terminate container worker: {error}");
+        }
+    }
+    if let Some(cgroup) = cg.as_ref() {
+        if let Err(error) = cgroup.kill_all() {
+            eprintln!("zerun: warning: terminate container processes: {error}");
+        }
+    }
+    let _ = wait_child(supervisor_pid);
+    reap_host_pid_descendants(spec.namespaces);
+    if let Some(net) = host_net {
+        crate::network::teardown_host_side(net);
+    }
+    if let Some(cgroup) = cg.take() {
+        cgroup.cleanup();
+    }
+    release_bridge_ip(spec);
+}
+
 /// Best-effort release of a bridge IP back to the file IPAM.
 fn release_bridge_ip(spec: &RunSpec) {
     if matches!(spec.net, NetMode::Bridge) {
@@ -615,6 +634,9 @@ struct SpawnedChild {
     supervisor_pid: i32,
     /// Workload process (PID 1 in a private PID namespace).
     worker_pid: i32,
+    /// Stable handle for aborting the worker after the supervisor may have
+    /// reaped it. `None` when the worker exited before its PID could be pinned.
+    worker_pidfd: Option<OwnedFd>,
 }
 
 const SUPERVISOR_SIGNALS: [libc::c_int; 7] = [
@@ -666,10 +688,21 @@ fn spawn_namespaced_child(
         }
     };
     match parse_supervisor_status(&status) {
-        Ok(worker_pid) => Ok(SpawnedChild {
-            supervisor_pid,
-            worker_pid,
-        }),
+        Ok(worker_pid) => {
+            let worker_pidfd = match syscalls::pidfd_open_if_exists(worker_pid) {
+                Ok(pidfd) => pidfd,
+                Err(error) => {
+                    let _ = syscalls::kill_if_exists(supervisor_pid, libc::SIGKILL);
+                    let _ = wait_pid(supervisor_pid);
+                    return Err(error);
+                }
+            };
+            Ok(SpawnedChild {
+                supervisor_pid,
+                worker_pid,
+                worker_pidfd,
+            })
+        }
         Err(error) => {
             let _ = wait_pid(supervisor_pid);
             Err(error)

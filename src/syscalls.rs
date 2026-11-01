@@ -780,9 +780,37 @@ pub fn pidfd_open(pid: libc::pid_t) -> ZResult<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
 }
 
+/// Open a stable process handle when the target may already have exited.
+///
+/// Launch cleanup runs concurrently with a short-lived worker. `ESRCH` means
+/// the worker is gone and there is no process identity left to pin.
+pub fn pidfd_open_if_exists(pid: libc::pid_t) -> ZResult<Option<OwnedFd>> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd >= 0 {
+        return Ok(Some(unsafe { OwnedFd::from_raw_fd(fd as RawFd) }));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(None);
+    }
+    Err(error.into())
+}
+
 /// Send a signal through a pidfd, avoiding PID-reuse races between checking
 /// liveness and delivering a lifecycle signal.
 pub fn pidfd_send_signal(pidfd: RawFd, signal: c_int) -> ZResult<()> {
+    send_signal_to_pidfd(pidfd, signal, false)
+}
+
+/// Send a signal through a pidfd when the target may already have exited.
+///
+/// `ESRCH` is a successful outcome for launch and process-tree cleanup because
+/// the pinned process is already gone.
+pub fn pidfd_send_signal_if_exists(pidfd: RawFd, signal: c_int) -> ZResult<()> {
+    send_signal_to_pidfd(pidfd, signal, true)
+}
+
+fn send_signal_to_pidfd(pidfd: RawFd, signal: c_int, ignore_esrch: bool) -> ZResult<()> {
     let rc = unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
@@ -793,7 +821,11 @@ pub fn pidfd_send_signal(pidfd: RawFd, signal: c_int) -> ZResult<()> {
         )
     };
     if rc < 0 {
-        return Err(last_err("pidfd_send_signal"));
+        let error = std::io::Error::last_os_error();
+        if ignore_esrch && error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(error.into());
     }
     Ok(())
 }
@@ -982,6 +1014,13 @@ mod tests {
         let pid = std::process::id() as libc::pid_t;
         let pidfd = pidfd_open(pid).expect("pidfd_open should be available on supported Linux");
         pidfd_send_signal(pidfd.as_raw_fd(), 0).expect("pidfd signal 0 should probe the process");
+    }
+
+    #[test]
+    fn pidfd_open_if_exists_distinguishes_missing_processes() {
+        assert!(pidfd_open_if_exists(i32::MAX)
+            .expect("a missing process is not a pidfd error")
+            .is_none());
     }
 
     #[test]

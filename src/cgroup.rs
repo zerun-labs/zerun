@@ -228,19 +228,18 @@ impl CgroupV2 {
     }
 
     /// Write the parked workload PID into cgroup.procs immediately after the
-    /// supervisor forks it. The worker may already have exited: ESRCH/ENOENT is
-    /// normal for callers on non-launch paths.
+    /// supervisor forks it. The worker may already have exited, in which case
+    /// `ESRCH` is harmless; a missing cgroup is a launch failure because the
+    /// worker must not run without the limits this handle represents.
     pub fn attach(&self, pid: i32) -> ZResult<()> {
         match fs::write(self.path.join("cgroup.procs"), pid.to_string()) {
             Ok(_) => Ok(()),
-            Err(e) => match e.raw_os_error() {
-                Some(libc::ESRCH) | Some(libc::ENOENT) => Ok(()),
-                _ => Err(crate::zerr!(
-                    "write {} = {} failed: {e}",
-                    self.path.join("cgroup.procs").display(),
-                    pid
-                )),
-            },
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+            Err(e) => Err(crate::zerr!(
+                "write {} = {} failed: {e}",
+                self.path.join("cgroup.procs").display(),
+                pid
+            )),
         }
     }
 
