@@ -14,6 +14,7 @@ mod error;
 mod events;
 mod execc;
 mod fsutil;
+mod health;
 mod image;
 mod lifecycle;
 mod logs;
@@ -168,6 +169,8 @@ struct RunArgs {
     stop_signal: Option<i32>,
     /// Grace period used by `stop`/`restart` before SIGKILL.
     stop_timeout: Option<u64>,
+    /// Docker-compatible detached healthcheck overrides.
+    health: health::CliOptions,
     /// Detached automatic restart policy (`--restart`).
     restart: Option<restart::RestartPolicy>,
     net: NetMode,
@@ -373,6 +376,37 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 let v = next_value(args, &mut i, "--stop-timeout")?;
                 a.stop_timeout = Some(parse_seconds(&v, "--stop-timeout")?);
             }
+            "--health-cmd" => {
+                let value = next_value(args, &mut i, "--health-cmd")?;
+                validate_health_command(&value)?;
+                a.health.cmd = Some(value);
+            }
+            "--health-interval" => {
+                let value = next_value(args, &mut i, "--health-interval")?;
+                a.health.interval_ns = Some(parse_health_duration("--health-interval", &value)?);
+            }
+            "--health-timeout" => {
+                let value = next_value(args, &mut i, "--health-timeout")?;
+                a.health.timeout_ns = Some(parse_health_duration("--health-timeout", &value)?);
+            }
+            "--health-start-period" => {
+                let value = next_value(args, &mut i, "--health-start-period")?;
+                a.health.start_period_ns =
+                    Some(parse_health_duration("--health-start-period", &value)?);
+            }
+            "--health-start-interval" => {
+                let value = next_value(args, &mut i, "--health-start-interval")?;
+                a.health.start_interval_ns =
+                    Some(parse_health_duration("--health-start-interval", &value)?);
+            }
+            "--health-retries" => {
+                let value = next_value(args, &mut i, "--health-retries")?;
+                a.health.retries = Some(parse_health_retries(&value)?);
+            }
+            "--no-healthcheck" => {
+                a.health.disabled = true;
+                i += 1;
+            }
             "--restart" => {
                 let v = next_value(args, &mut i, "--restart")?;
                 a.restart = Some(v.parse()?);
@@ -572,6 +606,39 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             other if other.starts_with("--pull=") => {
                 a.pull = PullPolicy::parse(&other["--pull=".len()..])?;
+                i += 1;
+            }
+            other if other.starts_with("--health-cmd=") => {
+                let value = &other["--health-cmd=".len()..];
+                validate_health_command(value)?;
+                a.health.cmd = Some(value.to_string());
+                i += 1;
+            }
+            other if other.starts_with("--health-interval=") => {
+                let value = &other["--health-interval=".len()..];
+                a.health.interval_ns = Some(parse_health_duration("--health-interval", value)?);
+                i += 1;
+            }
+            other if other.starts_with("--health-timeout=") => {
+                let value = &other["--health-timeout=".len()..];
+                a.health.timeout_ns = Some(parse_health_duration("--health-timeout", value)?);
+                i += 1;
+            }
+            other if other.starts_with("--health-start-period=") => {
+                let value = &other["--health-start-period=".len()..];
+                a.health.start_period_ns =
+                    Some(parse_health_duration("--health-start-period", value)?);
+                i += 1;
+            }
+            other if other.starts_with("--health-start-interval=") => {
+                let value = &other["--health-start-interval=".len()..];
+                a.health.start_interval_ns =
+                    Some(parse_health_duration("--health-start-interval", value)?);
+                i += 1;
+            }
+            other if other.starts_with("--health-retries=") => {
+                let value = &other["--health-retries=".len()..];
+                a.health.retries = Some(parse_health_retries(value)?);
                 i += 1;
             }
             other if other.starts_with("--stop-signal=") => {
@@ -870,6 +937,31 @@ fn parse_seconds(value: &str, option: &str) -> Result<u64, String> {
     value
         .parse::<u64>()
         .map_err(|_| format!("{option}: invalid seconds value '{value}'"))
+}
+
+fn parse_health_duration(option: &str, value: &str) -> Result<u64, String> {
+    health::parse_duration_ns(value)
+        .map_err(|error| format!("{option}: invalid duration '{value}': {error}"))
+}
+
+fn parse_health_retries(value: &str) -> Result<u32, String> {
+    let retries = value
+        .parse::<u32>()
+        .map_err(|_| format!("--health-retries: invalid positive integer '{value}'"))?;
+    if retries == 0 {
+        return Err("--health-retries must be greater than zero".to_string());
+    }
+    Ok(retries)
+}
+
+fn validate_health_command(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("--health-cmd cannot be empty (use --no-healthcheck to disable)".to_string());
+    }
+    if value.contains('\0') {
+        return Err("--health-cmd cannot contain a NUL byte".to_string());
+    }
+    Ok(())
 }
 
 fn parse_pids_limit(option: &str, value: &str) -> Result<i64, String> {
@@ -1224,6 +1316,10 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         eprintln!("zerun run: --restart requires -d/--detach");
         return 2;
     }
+    if (a.health.has_settings() || a.health.disabled) && !a.detach {
+        eprintln!("zerun run: healthcheck options require -d/--detach");
+        return 2;
+    }
     if a.restart.is_some() && a.rm {
         eprintln!("zerun run: --restart cannot be combined with --rm");
         return 2;
@@ -1366,182 +1462,223 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         .as_ref()
         .map(|st| st.anonymous_volumes.clone())
         .unwrap_or_default();
-    let (rootfs, env, cwd, user, stop_signal, stop_timeout, argv, labels, capabilities, seccomp) =
-        if let Some(st) = &resume {
-            if st.tmpfs_upper {
-                eprintln!(
+    let (
+        rootfs,
+        env,
+        cwd,
+        user,
+        stop_signal,
+        stop_timeout,
+        argv,
+        labels,
+        capabilities,
+        seccomp,
+        healthcheck,
+    ) = if let Some(st) = &resume {
+        if st.tmpfs_upper {
+            eprintln!(
                 "zerun start: container {} used --tmpfs-upper; its writable layer was ephemeral",
                 display_name(st)
             );
+            return 1;
+        }
+        let lower = match resumable_lower_rootfs(&store, st) {
+            Ok(lower) => lower,
+            Err(e) => {
+                eprintln!("zerun start: {e}");
                 return 1;
             }
-            let lower = match resumable_lower_rootfs(&store, st) {
-                Ok(lower) => lower,
-                Err(e) => {
-                    eprintln!("zerun start: {e}");
-                    return 1;
-                }
-            };
-            let env = match state_environment(st) {
-                Ok(env) => env,
-                Err(e) => {
-                    eprintln!("zerun start: {e}");
-                    return 1;
-                }
-            };
-            let capabilities = match st.capabilities.as_deref() {
-                Some(names) => match security::CapabilitySet::from_names(names) {
-                    Ok(caps) => caps,
-                    Err(e) => {
-                        eprintln!("zerun start: {e}");
-                        return 1;
-                    }
-                },
-                None => capabilities,
-            };
-            let seccomp = st.seccomp.unwrap_or(a.seccomp);
-            let stop_signal = match signal::validate(st.stop_signal) {
-                Ok(signal) => signal,
-                Err(e) => {
-                    eprintln!("zerun start: invalid persisted stop signal: {e}");
-                    return 1;
-                }
-            };
-            let stop_timeout = st.stop_timeout;
-            (
-                lower,
-                env,
-                st.cwd.clone(),
-                st.user.clone(),
-                stop_signal,
-                stop_timeout,
-                st.cmd.clone(),
-                st.labels.clone(),
-                capabilities,
-                seccomp,
-            )
-        } else if let Some(rootfs_str) = &a.rootfs {
-            let rootfs = PathBuf::from(rootfs_str);
-            if !rootfs.is_dir() {
-                eprintln!(
-                    "zerun: rootfs directory does not exist: {}",
-                    rootfs.display()
-                );
-                return 2;
-            }
-            let mut argv = a.argv.clone();
-            if argv.is_empty() {
-                argv = vec!["/bin/sh".to_string()];
-            }
-            (
-                rootfs,
-                None,
-                a.workdir.clone(),
-                None,
-                a.stop_signal.unwrap_or(signal::DEFAULT_STOP_SIGNAL),
-                a.stop_timeout.unwrap_or(state::DEFAULT_STOP_TIMEOUT_SECS),
-                argv,
-                a.labels.clone(),
-                capabilities,
-                a.seccomp,
-            )
-        } else {
-            let image = a.image.as_deref().expect("image required");
-            let reference = match Reference::parse(image) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("zerun run: invalid image reference '{image}': {e}");
-                    return 2;
-                }
-            };
-            match resolve_run_image(
-                &store,
-                &reference,
-                a.platform.as_deref(),
-                a.pull,
-                image_store_lease
-                    .as_ref()
-                    .expect("image runs hold an image-store lease"),
-            ) {
-                Ok((rootfs, cfg)) => {
-                    let imgstore = match image::store::ImageStore::open(&store) {
-                        Ok(store) => store,
-                        Err(error) => {
-                            eprintln!("zerun: {error}");
-                            return 1;
-                        }
-                    };
-                    image_rootfs_lease = match imgstore.lock_rootfs_path(
-                        image_store_lease
-                            .as_ref()
-                            .expect("image runs hold an image-store lease"),
-                        &rootfs,
-                    ) {
-                        Ok(lease) => Some(lease),
-                        Err(error) => {
-                            eprintln!("zerun: {error}");
-                            return 1;
-                        }
-                    };
-                    image_volume_targets = cfg.config.volumes.keys().cloned().collect();
-                    let env = match build_image_env(
-                        &cfg.config.env,
-                        &env_file_overrides,
-                        &a.env,
-                        effective_hostname.as_deref(),
-                        &id,
-                        a.tty,
-                    ) {
-                        Ok(env) => env,
-                        Err(e) => {
-                            eprintln!("zerun run: {e}");
-                            return 1;
-                        }
-                    };
-                    let argv = resolve_image_argv(&cfg, a.entrypoint.as_deref(), &a.argv);
-                    let mut labels = cfg.config.labels.clone();
-                    labels.extend(a.labels.clone());
-                    let cwd = a.workdir.clone().or_else(|| {
-                        (!cfg.config.working_dir.is_empty()).then(|| cfg.config.working_dir.clone())
-                    });
-                    let rootless = syscalls::effective_uid() != 0;
-                    let image_user = if cfg.config.user.is_empty() {
-                        None
-                    } else {
-                        Some(cfg.config.user.as_str())
-                    };
-                    let (user, user_warning) =
-                        resolve_image_user(a.user.as_deref(), image_user, rootless);
-                    if let Some(w) = &user_warning {
-                        eprintln!("{w}");
-                    }
-                    let stop_signal =
-                        match resolve_stop_signal(a.stop_signal, &cfg.config.stop_signal) {
-                            Ok(signal) => signal,
-                            Err(e) => {
-                                eprintln!("zerun run: {e}");
-                                return 1;
-                            }
-                        };
-                    (
-                        rootfs,
-                        Some(env),
-                        cwd,
-                        user,
-                        stop_signal,
-                        a.stop_timeout.unwrap_or(state::DEFAULT_STOP_TIMEOUT_SECS),
-                        argv,
-                        labels,
-                        capabilities,
-                        a.seccomp,
-                    )
-                }
-                Err(e) => {
-                    eprintln!("zerun: {e}");
-                    return 1;
-                }
+        };
+        let env = match state_environment(st) {
+            Ok(env) => env,
+            Err(e) => {
+                eprintln!("zerun start: {e}");
+                return 1;
             }
         };
+        let capabilities = match st.capabilities.as_deref() {
+            Some(names) => match security::CapabilitySet::from_names(names) {
+                Ok(caps) => caps,
+                Err(e) => {
+                    eprintln!("zerun start: {e}");
+                    return 1;
+                }
+            },
+            None => capabilities,
+        };
+        let seccomp = st.seccomp.unwrap_or(a.seccomp);
+        let stop_signal = match signal::validate(st.stop_signal) {
+            Ok(signal) => signal,
+            Err(e) => {
+                eprintln!("zerun start: invalid persisted stop signal: {e}");
+                return 1;
+            }
+        };
+        let stop_timeout = st.stop_timeout;
+        (
+            lower,
+            env,
+            st.cwd.clone(),
+            st.user.clone(),
+            stop_signal,
+            stop_timeout,
+            st.cmd.clone(),
+            st.labels.clone(),
+            capabilities,
+            seccomp,
+            st.healthcheck.clone(),
+        )
+    } else if let Some(rootfs_str) = &a.rootfs {
+        let rootfs = PathBuf::from(rootfs_str);
+        if !rootfs.is_dir() {
+            eprintln!(
+                "zerun: rootfs directory does not exist: {}",
+                rootfs.display()
+            );
+            return 2;
+        }
+        let mut argv = a.argv.clone();
+        if argv.is_empty() {
+            argv = vec!["/bin/sh".to_string()];
+        }
+        let healthcheck = match health::resolve(None, &a.health) {
+            Ok(check) => check,
+            Err(error) => {
+                eprintln!("zerun run: {error}");
+                return 2;
+            }
+        };
+        (
+            rootfs,
+            None,
+            a.workdir.clone(),
+            None,
+            a.stop_signal.unwrap_or(signal::DEFAULT_STOP_SIGNAL),
+            a.stop_timeout.unwrap_or(state::DEFAULT_STOP_TIMEOUT_SECS),
+            argv,
+            a.labels.clone(),
+            capabilities,
+            a.seccomp,
+            healthcheck,
+        )
+    } else {
+        let image = a.image.as_deref().expect("image required");
+        let reference = match Reference::parse(image) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("zerun run: invalid image reference '{image}': {e}");
+                return 2;
+            }
+        };
+        match resolve_run_image(
+            &store,
+            &reference,
+            a.platform.as_deref(),
+            a.pull,
+            image_store_lease
+                .as_ref()
+                .expect("image runs hold an image-store lease"),
+        ) {
+            Ok((rootfs, cfg)) => {
+                let imgstore = match image::store::ImageStore::open(&store) {
+                    Ok(store) => store,
+                    Err(error) => {
+                        eprintln!("zerun: {error}");
+                        return 1;
+                    }
+                };
+                image_rootfs_lease = match imgstore.lock_rootfs_path(
+                    image_store_lease
+                        .as_ref()
+                        .expect("image runs hold an image-store lease"),
+                    &rootfs,
+                ) {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        eprintln!("zerun: {error}");
+                        return 1;
+                    }
+                };
+                image_volume_targets = cfg.config.volumes.keys().cloned().collect();
+                let env = match build_image_env(
+                    &cfg.config.env,
+                    &env_file_overrides,
+                    &a.env,
+                    effective_hostname.as_deref(),
+                    &id,
+                    a.tty,
+                ) {
+                    Ok(env) => env,
+                    Err(e) => {
+                        eprintln!("zerun run: {e}");
+                        return 1;
+                    }
+                };
+                let argv = resolve_image_argv(&cfg, a.entrypoint.as_deref(), &a.argv);
+                let mut labels = cfg.config.labels.clone();
+                labels.extend(a.labels.clone());
+                let cwd = a.workdir.clone().or_else(|| {
+                    (!cfg.config.working_dir.is_empty()).then(|| cfg.config.working_dir.clone())
+                });
+                let rootless = syscalls::effective_uid() != 0;
+                let image_user = if cfg.config.user.is_empty() {
+                    None
+                } else {
+                    Some(cfg.config.user.as_str())
+                };
+                let (user, user_warning) =
+                    resolve_image_user(a.user.as_deref(), image_user, rootless);
+                if let Some(w) = &user_warning {
+                    eprintln!("{w}");
+                }
+                let stop_signal = match resolve_stop_signal(a.stop_signal, &cfg.config.stop_signal)
+                {
+                    Ok(signal) => signal,
+                    Err(e) => {
+                        eprintln!("zerun run: {e}");
+                        return 1;
+                    }
+                };
+                let image_health = match cfg.config.healthcheck.as_ref() {
+                    Some(raw) => match health::from_image(raw) {
+                        Ok(check) => check,
+                        Err(error) => {
+                            eprintln!("zerun run: image config Healthcheck: {error}");
+                            return 1;
+                        }
+                    },
+                    None => None,
+                };
+                let healthcheck = match health::resolve(image_health, &a.health) {
+                    Ok(check) => check,
+                    Err(error) => {
+                        eprintln!("zerun run: {error}");
+                        return 2;
+                    }
+                };
+                if healthcheck.is_some() && !a.detach {
+                    eprintln!("zerun: warning: image HEALTHCHECK requires -d/--detach; ignoring");
+                }
+                (
+                    rootfs,
+                    Some(env),
+                    cwd,
+                    user,
+                    stop_signal,
+                    a.stop_timeout.unwrap_or(state::DEFAULT_STOP_TIMEOUT_SECS),
+                    argv,
+                    labels,
+                    capabilities,
+                    a.seccomp,
+                    healthcheck,
+                )
+            }
+            Err(e) => {
+                eprintln!("zerun: {e}");
+                return 1;
+            }
+        }
+    };
 
     let mut anonymous_volume_guard = None;
     if resume.is_none() && !image_volume_targets.is_empty() {
@@ -1734,6 +1871,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
                 launch_args,
                 stop_signal,
                 stop_timeout,
+                healthcheck,
                 restart_policy,
                 name: if resume.is_some() {
                     resume.as_ref().and_then(|st| st.name.clone())
@@ -2003,6 +2141,8 @@ struct DetachedInfo {
     stop_signal: i32,
     /// Grace period between `stop_signal` and the SIGKILL fallback.
     stop_timeout: u64,
+    /// Persisted healthcheck selected from the image or run flags.
+    healthcheck: Option<health::Healthcheck>,
     /// Automatic restart behavior used by the detached reaper.
     restart_policy: restart::RestartPolicy,
     name: Option<String>,
@@ -2173,6 +2313,8 @@ fn run_detached(
         restart_policy: restart::RestartPolicy::No,
         restart_count: 0,
         restart_pending: false,
+        healthcheck: None,
+        health: None,
         capabilities: None,
         seccomp: None,
         ulimits: None,
@@ -2229,6 +2371,8 @@ fn run_detached(
     st.user = spec.user.clone();
     st.stop_signal = info.stop_signal;
     st.stop_timeout = info.stop_timeout;
+    st.healthcheck = info.healthcheck;
+    st.health = None;
     st.restart_policy = info.restart_policy;
     st.restart_count = 0;
     st.capabilities = Some(spec.capabilities.names());
@@ -2480,6 +2624,27 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     }
     if let Some(v) = a.stop_timeout {
         args.extend(["--stop-timeout".to_string(), v.to_string()]);
+    }
+    if let Some(v) = &a.health.cmd {
+        args.extend(["--health-cmd".to_string(), v.clone()]);
+    }
+    if let Some(v) = a.health.interval_ns {
+        args.extend(["--health-interval".to_string(), format!("{v}ns")]);
+    }
+    if let Some(v) = a.health.timeout_ns {
+        args.extend(["--health-timeout".to_string(), format!("{v}ns")]);
+    }
+    if let Some(v) = a.health.start_period_ns {
+        args.extend(["--health-start-period".to_string(), format!("{v}ns")]);
+    }
+    if let Some(v) = a.health.start_interval_ns {
+        args.extend(["--health-start-interval".to_string(), format!("{v}ns")]);
+    }
+    if let Some(v) = a.health.retries {
+        args.extend(["--health-retries".to_string(), v.to_string()]);
+    }
+    if a.health.disabled {
+        args.push("--no-healthcheck".to_string());
     }
     if let Some(policy) = a.restart.filter(|policy| policy.is_enabled()) {
         args.extend(["--restart".to_string(), policy.to_string()]);
@@ -2878,6 +3043,7 @@ fn cmd_commit(args: &[String]) -> i32 {
         user: st.user.clone(),
         labels: st.labels.clone(),
         volumes: st.image_volumes.clone(),
+        healthcheck: st.healthcheck.clone(),
         comment: message,
         author,
     };
@@ -4163,7 +4329,12 @@ fn ps_status(st: &ContainerState) -> String {
             if st.paused {
                 format!("{status} (Paused)")
             } else {
-                status
+                match st.health.as_ref().map(|health| health.status) {
+                    Some(state::HealthStatus::Healthy) => format!("{status} (healthy)"),
+                    Some(state::HealthStatus::Unhealthy) => format!("{status} (unhealthy)"),
+                    Some(state::HealthStatus::Starting) => format!("{status} (health: starting)"),
+                    None => status,
+                }
             }
         }
         state::Status::Exited => {
@@ -7360,6 +7531,13 @@ RUN OPTIONS:\n  \
   --group-add NAME|GID     add a supplementary group (repeatable/comma-separated)\n  \
   --stop-signal SIGNAL     stop/restart signal (image StopSignal; default SIGTERM)\n  \
   --stop-timeout S         seconds before stop/restart sends SIGKILL (default 10)\n  \
+  --health-cmd CMD         detached liveness probe (shell form; image HEALTHCHECK inherited)\n  \
+  --health-interval D      delay between probes (Docker duration syntax; default 30s)\n  \
+  --health-timeout D       per-probe timeout before SIGKILL (default 30s)\n  \
+  --health-retries N       consecutive failures before unhealthy (default 3)\n  \
+  --health-start-period D  initialization window excluded from retry counting\n  \
+  --health-start-interval D  probe delay while status is starting\n  \
+  --no-healthcheck         disable an image-declared HEALTHCHECK\n  \
   --restart POLICY        detached restart policy (no|on-failure[:max]|always|unless-stopped)\n  \
   --net, --network none|host|bridge\n  \
                       none = fresh netns + loopback; host = share host net;\n  \
@@ -8925,6 +9103,57 @@ mod tests {
                 .contains("bridge|host|none")
         );
         assert!(parse_run_args(&["--pids-limit=all".to_string(), "alpine".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parses_and_captures_healthcheck_options() {
+        let args: Vec<_> = [
+            "-d",
+            "--health-cmd",
+            "test -f /ready",
+            "--health-interval=500ms",
+            "--health-timeout",
+            "2s",
+            "--health-start-period",
+            "1m",
+            "--health-start-interval=100ms",
+            "--health-retries",
+            "4",
+            "alpine",
+            "sleep",
+            "30",
+        ]
+        .iter()
+        .map(|value| value.to_string())
+        .collect();
+        let a = parse_run_args(&args).expect("valid health options");
+        assert_eq!(a.health.cmd.as_deref(), Some("test -f /ready"));
+        assert_eq!(a.health.interval_ns, Some(500_000_000));
+        assert_eq!(a.health.timeout_ns, Some(2_000_000_000));
+        assert_eq!(a.health.start_period_ns, Some(60_000_000_000));
+        assert_eq!(a.health.start_interval_ns, Some(100_000_000));
+        assert_eq!(a.health.retries, Some(4));
+        let launch = detached_launch_args(&a, Path::new("/tmp/rootfs"));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--health-cmd", "test -f /ready"]));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--health-interval", "500000000ns"]));
+
+        let disabled: Vec<_> = ["--no-healthcheck", "alpine"]
+            .iter()
+            .map(|value| value.to_string())
+            .collect();
+        assert!(parse_run_args(&disabled).unwrap().health.disabled);
+        for invalid in [
+            vec!["--health-retries=0", "alpine"],
+            vec!["--health-interval=1d", "alpine"],
+            vec!["--health-cmd=", "alpine"],
+        ] {
+            let args: Vec<_> = invalid.into_iter().map(String::from).collect();
+            assert!(parse_run_args(&args).is_err());
+        }
     }
 
     #[test]

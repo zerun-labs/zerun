@@ -39,6 +39,8 @@ pub struct CommitOptions {
     pub labels: BTreeMap<String, String>,
     /// Image-declared volume paths retained as `Config.Volumes`.
     pub volumes: Vec<String>,
+    /// Healthcheck inherited from the image or overridden at run time.
+    pub healthcheck: Option<crate::health::Healthcheck>,
     pub comment: Option<String>,
     pub author: Option<String>,
 }
@@ -98,7 +100,7 @@ fn commit_image_in_transaction(
     let (layer_digest, layer_size) = store.install_blob_file(&layer_tmp)?;
 
     // The image config is content-addressed and also names the rootfs dir.
-    let config = build_config_json(&options, &diff_id);
+    let config = build_config_json(&options, &diff_id)?;
     let config_bytes = serde_json::to_vec_pretty(&config)
         .map_err(|e| crate::zerr!("serialize committed config: {e}"))?;
     let config_digest = format!("sha256:{}", crate::image::store::sha256_hex(&config_bytes));
@@ -310,7 +312,7 @@ impl<W: Write> Write for HashWriter<W> {
     }
 }
 
-fn build_config_json(options: &CommitOptions, diff_id: &str) -> serde_json::Value {
+fn build_config_json(options: &CommitOptions, diff_id: &str) -> ZResult<serde_json::Value> {
     let platform = host_platform();
     let created = crate::state::now_rfc3339();
     let mut config = serde_json::json!({
@@ -345,13 +347,20 @@ fn build_config_json(options: &CommitOptions, diff_id: &str) -> serde_json::Valu
             .collect();
         config["config"]["Volumes"] = serde_json::json!(volumes);
     }
+    if let Some(check) = &options.healthcheck {
+        let image = check
+            .to_image()
+            .map_err(|error| crate::zerr!("encode committed healthcheck: {error}"))?;
+        config["config"]["Healthcheck"] = serde_json::to_value(image)
+            .map_err(|error| crate::zerr!("serialize committed healthcheck: {error}"))?;
+    }
     if let Some(comment) = &options.comment {
         config["history"][0]["comment"] = serde_json::Value::String(comment.clone());
     }
     if let Some(author) = &options.author {
         config["author"] = serde_json::Value::String(author.clone());
     }
-    config
+    Ok(config)
 }
 
 /// Make the committed image immediately runnable through the normal lookup
@@ -428,6 +437,13 @@ mod tests {
             user: Some("1000:1000".to_string()),
             labels: BTreeMap::from([("tier".to_string(), "prod".to_string())]),
             volumes: vec!["/var/lib/app".to_string()],
+            healthcheck: Some(
+                crate::health::Healthcheck::new(vec![
+                    "CMD-SHELL".to_string(),
+                    "test -f /ready".to_string(),
+                ])
+                .unwrap(),
+            ),
             comment: Some("test snapshot".to_string()),
             author: Some("TheSkyC <0x4fe6@gmail.com>".to_string()),
         };
@@ -449,6 +465,11 @@ mod tests {
         assert_eq!(config["config"]["User"], "1000:1000");
         assert_eq!(config["config"]["Labels"]["tier"], "prod");
         assert!(config["config"]["Volumes"]["/var/lib/app"].is_object());
+        assert_eq!(config["config"]["Healthcheck"]["Test"][0], "CMD-SHELL");
+        assert_eq!(
+            config["config"]["Healthcheck"]["Interval"],
+            30_000_000_000i64
+        );
         assert_eq!(config["author"], "TheSkyC <0x4fe6@gmail.com>");
         assert_eq!(config["history"][0]["comment"], "test snapshot");
 

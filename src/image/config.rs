@@ -42,6 +42,10 @@ pub struct ConfigSection {
     /// values are intentionally opaque; only the container paths matter here.
     #[serde(default, rename = "Volumes")]
     pub volumes: BTreeMap<String, serde_json::Value>,
+    /// Docker's healthcheck extension. OCI itself does not define this field,
+    /// but Docker-compatible image configs carry it under `config.Healthcheck`.
+    #[serde(default, rename = "Healthcheck")]
+    pub healthcheck: Option<crate::health::ImageHealthcheck>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -75,7 +79,12 @@ mod tests {
                     "StopSignal": "SIGQUIT",
                     "Cmd": ["/bin/sh"],
                     "Labels": {"org.opencontainers.image.title": "nginx"},
-                    "Volumes": {"/var/lib/app": {}, "/cache": {}}
+                    "Volumes": {"/var/lib/app": {}, "/cache": {}},
+                    "Healthcheck": {
+                        "Test": ["CMD-SHELL", "wget -qO- http://127.0.0.1/"],
+                        "Interval": 5000000000,
+                        "Retries": 4
+                    }
                 },
                 "rootfs": {
                     "type": "layers",
@@ -97,6 +106,17 @@ mod tests {
             Some("nginx")
         );
         assert_eq!(cfg.config.cmd, vec!["/bin/sh"]);
+        let health = cfg.config.healthcheck.as_ref().expect("healthcheck");
+        assert_eq!(
+            health.test.as_deref(),
+            Some(
+                ["CMD-SHELL", "wget -qO- http://127.0.0.1/"]
+                    .map(String::from)
+                    .as_slice()
+            )
+        );
+        assert_eq!(health.interval, Some(5_000_000_000));
+        assert_eq!(health.retries, Some(4));
         assert_eq!(
             cfg.config
                 .volumes

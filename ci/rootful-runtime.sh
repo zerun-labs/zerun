@@ -570,6 +570,93 @@ test "$stop_timeout_code" -eq 137
 test "$stop_elapsed_ms" -ge 500
 "${zerun[@]}" rm "$stop_timeout_id" >/dev/null
 
+# Detached healthchecks run through the same namespace/security path as
+# `exec`, persist bounded probe history, and expose Docker-style status/filter
+# transitions without a resident daemon.
+health_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
+  --name ci-health --health-cmd 'test ! -e /unhealthy' \
+  --health-interval 100ms --health-timeout 1s --health-retries 2 -- \
+  /bin/sh -c 'while :; do sleep 1; done')
+cleanup_ids+=("$health_id")
+cleanup_paths+=("$rootfs/unhealthy")
+health_ready=false
+for attempt in $(seq 1 100); do
+  if "${zerun[@]}" ps --filter health=healthy -q | grep -Fxq "$health_id"; then
+    health_ready=true
+    break
+  fi
+  if (( attempt == 100 )); then
+    echo "healthy probe did not become healthy" >&2
+    "${zerun[@]}" inspect "$health_id" >&2 || true
+    exit 1
+  fi
+  sleep 0.1
+done
+test "$health_ready" = true
+"${zerun[@]}" exec "$health_id" /bin/busybox touch /unhealthy
+health_unhealthy=false
+for attempt in $(seq 1 100); do
+  if "${zerun[@]}" ps --filter health=unhealthy -q | grep -Fxq "$health_id"; then
+    health_unhealthy=true
+    break
+  fi
+  if (( attempt == 100 )); then
+    echo "failing probe did not become unhealthy" >&2
+    "${zerun[@]}" inspect "$health_id" >&2 || true
+    exit 1
+  fi
+  sleep 0.1
+done
+test "$health_unhealthy" = true
+health_inspect=$("${zerun[@]}" inspect "$health_id")
+grep -F '"status": "unhealthy"' <<<"$health_inspect" >/dev/null
+grep -F '"failing_streak": 2' <<<"$health_inspect" >/dev/null
+"${zerun[@]}" exec "$health_id" /bin/busybox rm /unhealthy
+health_recovered=false
+for attempt in $(seq 1 100); do
+  if "${zerun[@]}" ps --filter health=healthy -q | grep -Fxq "$health_id"; then
+    health_recovered=true
+    break
+  fi
+  if (( attempt == 100 )); then
+    echo "health probe did not recover" >&2
+    "${zerun[@]}" inspect "$health_id" >&2 || true
+    exit 1
+  fi
+  sleep 0.1
+done
+test "$health_recovered" = true
+"${zerun[@]}" stop --time 1 "$health_id" >/dev/null
+"${zerun[@]}" wait "$health_id" >/dev/null
+"${zerun[@]}" rm "$health_id" >/dev/null
+
+# A probe that exceeds its deadline is killed as a process group and reported
+# with Docker's conventional timeout exit code rather than stalling monitoring.
+health_timeout_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
+  --name ci-health-timeout --health-cmd 'sleep 5' \
+  --health-interval 100ms --health-timeout 100ms --health-retries 1 -- \
+  /bin/sh -c 'while :; do sleep 1; done')
+cleanup_ids+=("$health_timeout_id")
+health_timed_out=false
+for attempt in $(seq 1 100); do
+  if "${zerun[@]}" ps --filter health=unhealthy -q | grep -Fxq "$health_timeout_id"; then
+    health_timed_out=true
+    break
+  fi
+  if (( attempt == 100 )); then
+    echo "timed-out health probe did not become unhealthy" >&2
+    "${zerun[@]}" inspect "$health_timeout_id" >&2 || true
+    exit 1
+  fi
+  sleep 0.1
+done
+test "$health_timed_out" = true
+health_timeout_inspect=$("${zerun[@]}" inspect "$health_timeout_id")
+grep -F '"exit_code": 124' <<<"$health_timeout_inspect" >/dev/null
+"${zerun[@]}" stop --time 1 "$health_timeout_id" >/dev/null
+"${zerun[@]}" wait "$health_timeout_id" >/dev/null
+"${zerun[@]}" rm "$health_timeout_id" >/dev/null
+
 # M7 lifecycle and storage commands operate on a live writable container.
 # Keep this workload alive while inspect/stats/top/cp/diff/export/commit run,
 # then import the exported tar and execute it as a local image.

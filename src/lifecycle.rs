@@ -75,6 +75,10 @@ fn persist_started_state(
     st.finished = None;
     st.exit_code = None;
     st.metrics = None;
+    st.health = st
+        .healthcheck
+        .as_ref()
+        .map(|_| state::HealthState::starting());
     st.ip = info.ip;
     st.table = info.table.clone();
     st.veth = info.veth.clone();
@@ -123,6 +127,7 @@ pub fn run_detached(
     let mut code;
     let mut backoff = RESTART_INITIAL_DELAY;
     let mut held_restart_lock: Option<state::ContainerOperationLock> = None;
+    let mut health_monitor: Option<crate::health::Monitor> = None;
     // Keep the operation lock until log/attach cleanup has finished so a
     // `wait` that observes the final state cannot race a manual `start`.
     let mut terminal_lock: Option<state::ContainerOperationLock> = None;
@@ -153,6 +158,8 @@ pub fn run_detached(
             // The reaper owns this lock only through the next successful
             // exec. Releasing it here lets `stop`/`kill` address the new run.
             drop(start_lock.take());
+            health_monitor =
+                crate::health::Monitor::spawn(&store, &id, info.pid, info.pid_start_time)?;
             if !signaled {
                 signaled = true;
                 let _ = write_all(started_w, b"0\n");
@@ -161,6 +168,9 @@ pub fn run_detached(
             Ok(())
         });
         let attempt_elapsed = attempt_started.elapsed();
+        if let Some(monitor) = health_monitor.take() {
+            monitor.stop();
+        }
 
         let mut metrics = None;
         match result {
@@ -1130,6 +1140,8 @@ mod attach_tests {
             restart_policy: crate::restart::RestartPolicy::No,
             restart_count: 0,
             restart_pending: false,
+            healthcheck: None,
+            health: None,
             capabilities: None,
             seccomp: Some(crate::seccomp::SeccompMode::Unconfined),
             ulimits: None,

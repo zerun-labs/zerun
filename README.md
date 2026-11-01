@@ -47,7 +47,9 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   `ps [-a] [-q] [--format table|json] [--filter KEY=VALUE]`, `start`, `pause`, `unpause`, `stop`, `restart`,
   `rm`, `prune [-f] [--images]`, `logs [--since/--until/-f]`, `stats`, `exec`, `attach`, and `commit` address containers by id/name with crash reconcile
   of stale records; `run -d --restart` applies Docker-style restart policies inside the
-  per-container reaper; file-based IPAM; `--rm` for auto-removal (see AGENTS.md).
+  per-container reaper; Docker-compatible `--health-*` checks are monitored by a tiny
+  per-attempt process and exposed through `ps --filter health=...`/`inspect`; file-based
+  IPAM; `--rm` for auto-removal (see AGENTS.md).
 - **M6 — operations and distribution (done)**: `generate-service` emits declarative foreground
   systemd units; `install.sh` verifies checksums, detects architectures, supports rootless
   installation, and creates the `ze` alias; Arch and Homebrew source packaging is included.
@@ -235,6 +237,15 @@ Run options (current subset):
                      translated to this signal)
 --stop-timeout S     seconds to wait for the stop signal before SIGKILL (default 10;
                      generate-service maps this to TimeoutStopSec)
+--health-cmd CMD     detached liveness command (shell form; image HEALTHCHECK also applies)
+--health-interval D  time between checks (default 30s; Docker duration syntax)
+--health-timeout D   per-check timeout before killing its process group (default 30s)
+--health-retries N   consecutive failures before marking unhealthy (default 3)
+--health-start-period D
+                     initialization window whose failures do not consume retries
+--health-start-interval D
+                     check interval while status is still starting
+--no-healthcheck     disable an image-declared HEALTHCHECK
 --restart POLICY     detached restart policy: no, on-failure[:MAX], always, or
                      unless-stopped (requires -d; incompatible with --rm)
 --net, --network bridge|none|host
@@ -449,6 +460,18 @@ geometry; output-only foreground PTYs mirror and follow the caller terminal's re
 events when stdin is a terminal. `logs` and `attach` receive the PTY stream; detached
 stdin is not connected, so `-i` remains a foreground-only option. The TTY choice is part
 of the saved launch arguments and survives `start`/`restart`.
+
+Docker-compatible healthchecks are available for detached containers. A command from
+`--health-cmd` overrides the image `Healthcheck.Test`; timing flags override matching
+image values and `--no-healthcheck` disables the image declaration. The probe joins the
+container's namespaces and cgroup, uses its user/environment/capabilities/seccomp policy,
+captures bounded combined output, and is killed as a process group on timeout. `ps` shows
+`(health: starting)`, `(healthy)`, or `(unhealthy)`, `ps --filter health=...` selects those
+states (including `none`), and `inspect` exposes the last five probe records. Health state
+resets to `starting` for every automatic restart attempt, and `commit` preserves the effective
+check in the new image config. Timings use Go/Docker duration syntax such as `500ms`, `30s`,
+or `1m30s`. Monitoring is intentionally scoped to detached containers, where durable state
+exists for other commands to inspect.
 
 `--restart=on-failure[:MAX]` retries non-zero exits (an omitted or zero maximum is
 unlimited), `always` retries every exit, and `unless-stopped` retries every exit until a

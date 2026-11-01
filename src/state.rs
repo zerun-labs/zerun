@@ -122,6 +122,44 @@ pub enum Status {
     Exited,
 }
 
+/// Docker-compatible healthcheck state for the current workload attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HealthStatus {
+    Starting,
+    Healthy,
+    Unhealthy,
+}
+
+/// One bounded health probe result retained for `inspect` and `ps`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthLog {
+    pub start: String,
+    pub end: String,
+    pub exit_code: i32,
+    pub output: String,
+}
+
+/// Persisted health status and the latest probe history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthState {
+    pub status: HealthStatus,
+    #[serde(default)]
+    pub failing_streak: u32,
+    #[serde(default)]
+    pub log: Vec<HealthLog>,
+}
+
+impl HealthState {
+    pub fn starting() -> Self {
+        Self {
+            status: HealthStatus::Starting,
+            failing_streak: 0,
+            log: Vec::new(),
+        }
+    }
+}
+
 /// Cross-process lock covering one container's lifecycle mutations.
 ///
 /// The lock lives outside the state directory so `rm` can safely unlink the
@@ -450,6 +488,14 @@ pub struct ContainerState {
     /// Detached restart policy. Older records never restart automatically.
     #[serde(default)]
     pub restart_policy: crate::restart::RestartPolicy,
+    /// Healthcheck configuration inherited from the image or set by run
+    /// flags. None disables monitoring for this container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<crate::health::Healthcheck>,
+    /// Health state for the current (or most recent) workload attempt. Reset
+    /// to `starting` atomically when a new attempt execs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<HealthState>,
     /// Automatic restart attempts completed since the last manual start.
     #[serde(default)]
     pub restart_count: u32,
@@ -803,6 +849,8 @@ mod tests {
             restart_policy: crate::restart::RestartPolicy::No,
             restart_count: 0,
             restart_pending: false,
+            healthcheck: None,
+            health: None,
             capabilities: None,
             seccomp: None,
             ulimits: None,
@@ -953,6 +1001,8 @@ mod tests {
             restart_policy: crate::restart::RestartPolicy::No,
             restart_count: 0,
             restart_pending: false,
+            healthcheck: None,
+            health: None,
             capabilities: None,
             seccomp: None,
             ulimits: None,
@@ -1054,6 +1104,8 @@ mod tests {
             restart_policy: crate::restart::RestartPolicy::No,
             restart_count: 0,
             restart_pending: false,
+            healthcheck: None,
+            health: None,
             capabilities: Some(vec!["CAP_NET_RAW".to_string()]),
             seccomp: Some(SeccompMode::Unconfined),
             ulimits: None,

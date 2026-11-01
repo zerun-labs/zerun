@@ -594,6 +594,33 @@ pub fn ignore_signal(sig: c_int) -> ZResult<()> {
     Ok(())
 }
 
+/// Restore a signal disposition inherited across `fork(2)` to its default.
+pub fn reset_signal_default(sig: c_int) -> ZResult<()> {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        if libc::sigaction(sig, &sa, std::ptr::null_mut()) != 0 {
+            return Err(last_err("sigaction"));
+        }
+    }
+    Ok(())
+}
+
+/// Ask the kernel to deliver `signal` when this process's parent dies.
+///
+/// Health monitors are children of a detached reaper rather than part of the
+/// container cgroup. Tying their lifetime to the reaper prevents an orphaned
+/// monitor from continuing to write state after the owning lifecycle process
+/// has crashed.
+pub fn set_parent_death_signal(signal: c_int) -> ZResult<()> {
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, signal, 0, 0, 0) } != 0 {
+        return Err(last_err("prctl(PR_SET_PDEATHSIG)"));
+    }
+    Ok(())
+}
+
 pub fn poll_fds(fds: &mut [libc::pollfd], timeout: c_int) -> ZResult<usize> {
     loop {
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
@@ -785,6 +812,22 @@ pub fn fork_process() -> ZResult<libc::pid_t> {
     Ok(pid)
 }
 
+/// Parent PID as observed by the kernel (`getppid(2)`).
+pub fn parent_process_id() -> libc::pid_t {
+    unsafe { libc::getppid() }
+}
+
+/// Put this process in a new process group led by its own PID.
+///
+/// The captured health-probe path uses a separate group so timeout cleanup can
+/// terminate the probe and any ordinary descendants it spawned.
+pub fn set_process_group() -> ZResult<()> {
+    if unsafe { libc::setpgid(0, 0) } != 0 {
+        return Err(last_err("setpgid"));
+    }
+    Ok(())
+}
+
 /// Create new namespaces for this process without changing its PID-namespace
 /// membership. A subsequent fork enters the requested PID namespace; all other
 /// namespace types apply to the caller immediately and are inherited by that
@@ -869,6 +912,12 @@ impl Pipe {
 
     pub fn close_write(&mut self) {
         drop(self.write.take());
+    }
+
+    /// Move the read descriptor into a worker owner (for example a drain
+    /// thread) while leaving the write descriptor under the caller's control.
+    pub fn take_read(&mut self) -> Option<OwnedFd> {
+        self.read.take()
     }
 }
 
@@ -1069,6 +1118,18 @@ pub fn kill_if_exists(pid: libc::pid_t, signal: c_int) -> ZResult<()> {
     Err(error.into())
 }
 
+/// Signal a process group, treating an already-empty group as success.
+pub fn kill_process_group_if_exists(pgid: libc::pid_t, signal: c_int) -> ZResult<()> {
+    if unsafe { libc::kill(-pgid, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(error.into())
+}
+
 /// Best-effort signal delivery for an async signal handler.
 ///
 /// The handler must not allocate or format an error, so this intentionally
@@ -1092,6 +1153,18 @@ pub fn dup2(old: RawFd, new: RawFd) -> ZResult<()> {
 pub fn redirect_stdin_devnull() -> ZResult<()> {
     let devnull = std::fs::File::open("/dev/null")?;
     dup2(devnull.as_raw_fd(), libc::STDIN_FILENO)
+}
+
+/// Redirect all three standard streams to `/dev/null`.
+pub fn redirect_stdio_devnull() -> ZResult<()> {
+    let devnull = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")?;
+    for target in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        dup2(devnull.as_raw_fd(), target)?;
+    }
+    Ok(())
 }
 
 pub fn read_fd(fd: RawFd, buf: &mut [u8]) -> ZResult<isize> {

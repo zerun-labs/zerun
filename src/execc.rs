@@ -41,16 +41,57 @@ pub struct ExecRequest<'a> {
     pub argv: &'a [String],
 }
 
+/// Result of a non-interactive command intended for health probing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedResult {
+    pub code: i32,
+    pub timed_out: bool,
+    pub output: String,
+}
+
 /// Join the running container and run `request.argv` with its environment.
 /// Returns the command's exit code.
 pub fn run(request: ExecRequest<'_>) -> ZResult<i32> {
-    let ExecRequest {
+    Ok(execute(request, None)?.code)
+}
+
+/// Run a command in the container with bounded combined stdout/stderr.
+///
+/// Unlike the CLI path this never touches the caller's terminal, and a command
+/// that exceeds `timeout` is terminated as a process group. The public
+/// namespace/cgroup/security machinery is shared with `zerun exec`.
+pub fn run_captured(
+    state: &ContainerState,
+    argv: &[String],
+    timeout: std::time::Duration,
+    max_output: usize,
+) -> ZResult<CapturedResult> {
+    let request = ExecRequest {
         state,
-        tty,
-        interactive,
+        env_extra: &[],
+        user_override: None,
+        workdir: None,
+        tty: false,
+        interactive: false,
         argv,
-        ..
-    } = request;
+    };
+    execute(
+        request,
+        Some(CaptureOptions {
+            timeout,
+            max_output: max_output.max(1),
+        }),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct CaptureOptions {
+    timeout: std::time::Duration,
+    max_output: usize,
+}
+
+fn execute(request: ExecRequest<'_>, capture: Option<CaptureOptions>) -> ZResult<CapturedResult> {
+    let state = request.state;
     if state.status != Status::Running {
         return Err(crate::zerr!(
             "container {} is not running (status {})",
@@ -75,7 +116,7 @@ pub fn run(request: ExecRequest<'_>) -> ZResult<i32> {
             state.id
         ));
     }
-    if argv.is_empty() {
+    if request.argv.is_empty() {
         return Err(crate::zerr!("exec: a command is required"));
     }
 
@@ -119,30 +160,41 @@ pub fn run(request: ExecRequest<'_>) -> ZResult<i32> {
         }
     }
 
-    // The CLI owns the PTY master and pump. A thread cannot be created in C
+    // The caller owns the PTY master and pump. A thread cannot be created in C
     // after it joins the container's PID namespace: the new thread would be a
     // child in that namespace while sharing C's address space, which the kernel
-    // rejects. C therefore reports D's host PID so the CLI can pump host stdio
-    // and kill D if attaching the PTY fails.
-    let pty_pair = if tty { Some(PtyPair::open()?) } else { None };
-    let (pid_r, pid_w) = if tty {
-        crate::syscalls::pipe2_cloexec()?
+    // rejects. C therefore reports D's host PID so the caller can pump host
+    // stdio, enforce a probe timeout, and kill D if setup fails.
+    let pty_pair = if request.tty {
+        Some(PtyPair::open()?)
     } else {
-        (-1, -1)
+        None
     };
+    let (pid_r, pid_w) = crate::syscalls::pipe2_cloexec()?;
+    let mut capture_pipe = capture.map(|_| crate::syscalls::Pipe::new()).transpose()?;
+
+    let owner_pid = crate::syscalls::process_id();
 
     // The joiner C.
     match crate::syscalls::fork_process() {
         Err(error) => {
-            if pid_r >= 0 {
-                crate::syscalls::close(pid_r);
-                crate::syscalls::close(pid_w);
-            }
+            crate::syscalls::close(pid_r);
+            crate::syscalls::close(pid_w);
             Err(crate::zerr!("exec: fork: {error}"))
         }
         Ok(0) => {
-            if pid_r >= 0 {
-                crate::syscalls::close(pid_r);
+            crate::syscalls::close(pid_r);
+            let capture_w = capture_pipe
+                .as_ref()
+                .map_or(-1, crate::syscalls::Pipe::write_fd);
+            if let Some(pipe) = capture_pipe.as_ref() {
+                crate::syscalls::close(pipe.read_fd());
+            }
+            if capture.is_some() {
+                if let Err(error) = arm_parent_death_signal(owner_pid) {
+                    eprintln!("zerun exec: probe joiner lifetime: {error}");
+                    crate::syscalls::exit_process(1);
+                }
             }
             let code = joiner(
                 request,
@@ -150,53 +202,243 @@ pub fn run(request: ExecRequest<'_>) -> ZResult<i32> {
                 cgroup_path.as_deref(),
                 pty_pair,
                 pid_w,
+                capture_w,
             );
             crate::syscalls::exit_process(code)
         }
         Ok(parent) => {
-            if pid_w >= 0 {
-                crate::syscalls::close(pid_w);
-            }
-            let exec_pid = if pid_r >= 0 {
-                let result = read_exec_pid(pid_r);
-                crate::syscalls::close(pid_r);
-                match result {
-                    Ok(pid) => pid,
-                    Err(error) => {
-                        let _ = crate::syscalls::kill(parent, libc::SIGKILL);
-                        let _ = crate::syscalls::wait_pid(parent, 0);
-                        return Err(crate::zerr!("exec: worker pid pipe: {error}"));
-                    }
+            crate::syscalls::close(pid_w);
+            let exec_pid = match read_exec_pid(pid_r) {
+                Ok(pid) => pid,
+                Err(error) => {
+                    crate::syscalls::close(pid_r);
+                    let _ = crate::syscalls::kill(parent, libc::SIGKILL);
+                    let _ = crate::syscalls::wait_pid(parent, 0);
+                    return Err(crate::zerr!("exec: worker pid pipe: {error}"));
                 }
-            } else {
-                None
             };
+            crate::syscalls::close(pid_r);
+
+            // The parent must not retain the capture write end, or the reader
+            // would never observe EOF. C closes its copy after the worker fork.
+            let capture_reader =
+                if let (Some(pipe), Some(options)) = (capture_pipe.as_mut(), capture) {
+                    pipe.close_write();
+                    let read = pipe.take_read().expect("capture pipe read end");
+                    Some(std::thread::spawn(move || {
+                        read_capture(read, options.max_output, options.timeout)
+                    }))
+                } else {
+                    None
+                };
 
             let mut pty_pair = pty_pair;
-            let pump = if let Some(exec_pid) = exec_pid {
-                match start_pty_pump(&mut pty_pair, interactive) {
-                    Ok(pump) => pump,
-                    Err(error) => {
-                        let _ = crate::syscalls::kill(exec_pid, libc::SIGKILL);
-                        let _ = crate::syscalls::wait_pid(parent, 0);
-                        return Err(error);
+            let pump = if request.tty {
+                match exec_pid {
+                    Some(exec_pid) => match start_pty_pump(&mut pty_pair, request.interactive) {
+                        Ok(pump) => pump,
+                        Err(error) => {
+                            let _ = crate::syscalls::kill(exec_pid, libc::SIGKILL);
+                            let _ = crate::syscalls::wait_pid(parent, 0);
+                            if let Some(reader) = capture_reader {
+                                let _ = reader.join();
+                            }
+                            return Err(error);
+                        }
+                    },
+                    None => {
+                        // C failed before forking D; there is no PTY consumer.
+                        drop(pty_pair);
+                        None
                     }
                 }
             } else {
-                // C failed before forking D; there is no PTY consumer.
-                drop(pty_pair);
                 None
             };
 
-            // Wait for C, which exits with D's code.
-            let (_, status) = crate::syscalls::wait_pid(parent, 0)?
-                .ok_or_else(|| crate::zerr!("exec: waitpid returned no child"))?;
+            let mut capture_wait_error = None;
+            let (code, timed_out) = match capture {
+                Some(options) => match exec_pid {
+                    Some(exec_pid) => match wait_captured(parent, exec_pid, options.timeout) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            // A wait failure must not leave the probe worker and
+                            // its joiner running after the monitor has recorded
+                            // the failure. The bounded output reader then sees
+                            // EOF (or its own deadline) and can be joined.
+                            let _ = crate::syscalls::kill_process_group_if_exists(
+                                exec_pid,
+                                libc::SIGKILL,
+                            );
+                            let _ = crate::syscalls::kill_if_exists(parent, libc::SIGKILL);
+                            let _ = crate::syscalls::wait_pid(parent, 0);
+                            capture_wait_error = Some(error);
+                            (1, false)
+                        }
+                    },
+                    None => {
+                        let (_, status) = crate::syscalls::wait_pid(parent, 0)?
+                            .ok_or_else(|| crate::zerr!("exec: waitpid returned no child"))?;
+                        (
+                            crate::syscalls::wait_status_code(status).unwrap_or(1),
+                            false,
+                        )
+                    }
+                },
+                None => {
+                    let (_, status) = crate::syscalls::wait_pid(parent, 0)?
+                        .ok_or_else(|| crate::zerr!("exec: waitpid returned no child"))?;
+                    (
+                        crate::syscalls::wait_status_code(status).unwrap_or(1),
+                        false,
+                    )
+                }
+            };
             if let Some(handle) = pump {
                 let _ = handle.join();
             }
-            Ok(crate::syscalls::wait_status_code(status).unwrap_or(1))
+            let output = match capture_reader {
+                Some(reader) => reader
+                    .join()
+                    .unwrap_or_else(|_| "health probe output reader panicked".to_string()),
+                None => String::new(),
+            };
+            if let Some(error) = capture_wait_error {
+                return Err(error);
+            }
+            Ok(CapturedResult {
+                code,
+                timed_out,
+                output,
+            })
         }
     }
+}
+
+/// Wait for the joiner while enforcing the probe deadline on the worker.
+fn wait_captured(
+    joiner_pid: i32,
+    worker_pid: i32,
+    timeout: std::time::Duration,
+) -> ZResult<(i32, bool)> {
+    let worker_pidfd = match crate::syscalls::pidfd_open_if_exists(worker_pid) {
+        Ok(pidfd) => pidfd,
+        Err(error) => {
+            // The numeric process-group kill below still provides timeout
+            // enforcement; losing the pidfd is diagnostic rather than fatal.
+            eprintln!("zerun exec: open probe pidfd: {error}");
+            None
+        }
+    };
+    let started = std::time::Instant::now();
+    loop {
+        if let Some((_, status)) = crate::syscalls::wait_pid(joiner_pid, libc::WNOHANG)? {
+            return Ok((
+                crate::syscalls::wait_status_code(status).unwrap_or(1),
+                false,
+            ));
+        }
+        if started.elapsed() >= timeout {
+            if let Some(pidfd) = worker_pidfd.as_ref() {
+                if let Err(error) =
+                    crate::syscalls::pidfd_send_signal_if_exists(pidfd.as_raw_fd(), libc::SIGKILL)
+                {
+                    eprintln!("zerun exec: stop timed-out worker: {error}");
+                }
+            }
+            if let Err(error) =
+                crate::syscalls::kill_process_group_if_exists(worker_pid, libc::SIGKILL)
+            {
+                eprintln!("zerun exec: stop timed-out process group: {error}");
+            }
+            let (_, status) = crate::syscalls::wait_pid(joiner_pid, 0)?
+                .ok_or_else(|| crate::zerr!("exec: timed-out waitpid returned no child"))?;
+            return Ok((crate::syscalls::wait_status_code(status).unwrap_or(1), true));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Tie a health-probe helper to the parent that must reap it. PDEATHSIG resets
+/// across fork, so both the namespace joiner and its in-container worker arm it.
+fn arm_parent_death_signal(owner_pid: i32) -> ZResult<()> {
+    crate::syscalls::set_parent_death_signal(libc::SIGTERM)?;
+    if crate::syscalls::parent_process_id() != owner_pid {
+        return Err(crate::zerr!("probe parent exited during setup"));
+    }
+    Ok(())
+}
+
+/// Drain combined probe output while retaining only a bounded prefix.
+///
+/// A probe may fork a process that keeps the inherited pipe open after the
+/// command itself exits. Polling instead of blocking forever makes output
+/// collection obey the probe deadline; otherwise the health monitor would
+/// stall even though its command timeout had already fired.
+fn read_capture(
+    read: std::os::fd::OwnedFd,
+    max_output: usize,
+    timeout: std::time::Duration,
+) -> String {
+    let started = std::time::Instant::now();
+    let mut kept = Vec::with_capacity(max_output.min(4096));
+    let mut truncated = false;
+    let mut collection_timed_out = false;
+    let mut buffer = [0u8; 4096];
+    loop {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            collection_timed_out = true;
+            break;
+        }
+        let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut pollfd = libc::pollfd {
+            fd: read.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        match crate::syscalls::poll_fds(std::slice::from_mut(&mut pollfd), millis.max(1)) {
+            Ok(0) => continue,
+            Ok(_) if pollfd.revents == 0 => continue,
+            Ok(_) => {}
+            Err(error) => {
+                append_output_error(&mut kept, error);
+                break;
+            }
+        }
+        match crate::syscalls::read_fd(read.as_raw_fd(), &mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                let count = count as usize;
+                let room = max_output.saturating_sub(kept.len());
+                let take = room.min(count);
+                kept.extend_from_slice(&buffer[..take]);
+                truncated |= take < count;
+            }
+            Err(error) => {
+                append_output_error(&mut kept, error);
+                break;
+            }
+        }
+    }
+    // Ensure the ownership of the read descriptor is retained until the drain
+    // finishes and is closed on every return path.
+    drop(read);
+    let mut output = String::from_utf8_lossy(&kept).into_owned();
+    if truncated {
+        output.push_str("\n[health probe output truncated]");
+    }
+    if collection_timed_out {
+        output.push_str("\n[health probe output collection timed out]");
+    }
+    output
+}
+
+fn append_output_error(kept: &mut Vec<u8>, error: crate::error::ZError) {
+    if !kept.is_empty() {
+        kept.push(b'\n');
+    }
+    kept.extend_from_slice(format!("health probe output error: {error}").as_bytes());
 }
 
 /// Which namespace flags `exec` joins. Rootless containers enter their private
@@ -210,6 +452,7 @@ fn joiner(
     cgroup_path: Option<&Path>,
     mut pty_pair: Option<PtyPair>,
     pid_w: std::os::fd::RawFd,
+    capture_w: std::os::fd::RawFd,
 ) -> i32 {
     let state = request.state;
     // After `setns(mnt)`, `/sys/fs/cgroup` resolves inside the container's
@@ -259,10 +502,21 @@ fn joiner(
             1
         }
         Ok(0) => {
-            let code = worker(request, cgroup_procs.as_ref(), tty_master, tty_slave);
+            let code = worker(
+                request,
+                cgroup_procs.as_ref(),
+                tty_master,
+                tty_slave,
+                capture_w,
+            );
             crate::syscalls::exit_process(code)
         }
         Ok(d) => {
+            if capture_w >= 0 {
+                // Only D needs the probe output pipe. Closing C's copy here
+                // lets the reader observe EOF as soon as the workload exits.
+                crate::syscalls::close(capture_w);
+            }
             if pid_w >= 0 {
                 let result = crate::syscalls::write_all_fd(pid_w, &d.to_ne_bytes());
                 crate::syscalls::close(pid_w);
@@ -342,6 +596,7 @@ fn worker(
     cgroup_procs: Option<&File>,
     tty_master: std::os::fd::RawFd,
     tty_slave: std::os::fd::RawFd,
+    capture_w: std::os::fd::RawFd,
 ) -> i32 {
     let ExecRequest {
         state,
@@ -357,7 +612,20 @@ fn worker(
     if tty_master >= 0 {
         crate::syscalls::close(tty_master);
     }
-    if let Err(error) = configure_stdio(tty_slave, interactive) {
+    if capture_w >= 0 {
+        // The worker's real parent lives outside its new PID namespace, so
+        // getppid() cannot validate it. PDEATHSIG still tracks the real task;
+        // the joiner installed a checked signal before forking us.
+        if let Err(error) = crate::syscalls::set_parent_death_signal(libc::SIGTERM) {
+            eprintln!("zerun exec: probe lifetime: {error}");
+            return 1;
+        }
+        if let Err(error) = crate::syscalls::set_process_group() {
+            eprintln!("zerun exec: process group: {error}");
+            return 1;
+        }
+    }
+    if let Err(error) = configure_stdio(tty_slave, interactive, capture_w) {
         eprintln!("zerun exec: stdio: {error}");
         return 1;
     }
@@ -540,8 +808,17 @@ fn start_pty_pump(
 /// Give the in-container worker the requested stdio. Without `exec -i`, stdin
 /// is /dev/null just like a non-interactive `docker exec`; with `-t`, the PTY
 /// slave becomes both stdio endpoints and the worker's controlling terminal.
-fn configure_stdio(tty_slave: std::os::fd::RawFd, interactive: bool) -> ZResult<()> {
-    if tty_slave >= 0 {
+fn configure_stdio(
+    tty_slave: std::os::fd::RawFd,
+    interactive: bool,
+    capture_w: std::os::fd::RawFd,
+) -> ZResult<()> {
+    if capture_w >= 0 {
+        crate::syscalls::redirect_stdin_devnull()?;
+        crate::syscalls::dup2(capture_w, libc::STDOUT_FILENO)?;
+        crate::syscalls::dup2(capture_w, libc::STDERR_FILENO)?;
+        crate::syscalls::close(capture_w);
+    } else if tty_slave >= 0 {
         crate::syscalls::redirect_stdio(tty_slave)?;
         crate::syscalls::new_session()?;
         crate::syscalls::set_controlling_terminal(tty_slave)?;
@@ -575,8 +852,9 @@ fn upsert(env: &mut Vec<(String, String)>, key: &str, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{join_cgroup, namespace_flags, open_cgroup_procs, read_exec_pid};
+    use super::{join_cgroup, namespace_flags, open_cgroup_procs, read_capture, read_exec_pid};
     use crate::state::{NamespaceMode, NamespaceModes};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn user_namespace_is_joined_separately_before_other_namespaces() {
@@ -678,5 +956,30 @@ mod tests {
         std::fs::write(&dir, b"not a directory").unwrap();
         assert!(open_cgroup_procs(&dir).is_err());
         let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn captured_output_is_bounded_and_closes_at_eof() {
+        let mut pipe = crate::syscalls::Pipe::new().unwrap();
+        crate::syscalls::write_all_fd(pipe.write_fd(), b"health-output").unwrap();
+        pipe.close_write();
+        let read = pipe.take_read().expect("pipe read end");
+        assert_eq!(
+            read_capture(read, 6, Duration::from_secs(1)),
+            "health\n[health probe output truncated]"
+        );
+    }
+
+    #[test]
+    fn captured_output_does_not_hang_when_a_descendant_holds_the_pipe() {
+        let mut pipe = crate::syscalls::Pipe::new().unwrap();
+        crate::syscalls::write_all_fd(pipe.write_fd(), b"partial").unwrap();
+        let read = pipe.take_read().expect("pipe read end");
+        let started = Instant::now();
+        let output = read_capture(read, 32, Duration::from_millis(25));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(output.starts_with("partial"));
+        assert!(output.contains("output collection timed out"));
+        drop(pipe);
     }
 }

@@ -4,7 +4,13 @@
 //! records directly, matching Docker's behavior; other selectors merely
 //! narrow whichever records the caller asked `zerun ps` to consider.
 
-use crate::state::{ContainerState, Status};
+use crate::state::{ContainerState, HealthStatus, Status};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthFilter {
+    None,
+    Status(HealthStatus),
+}
 
 /// Selection rules for `zerun ps --filter KEY=VALUE`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -17,6 +23,7 @@ pub struct PsFilter {
     image: Option<String>,
     exit_code: Option<i32>,
     net: Option<String>,
+    health: Option<HealthFilter>,
     labels: Vec<(String, Option<String>)>,
 }
 
@@ -58,6 +65,16 @@ impl PsFilter {
                 }
                 Err(_) => invalid("exit code"),
             },
+            "health" => {
+                self.health = Some(match value {
+                    "none" => HealthFilter::None,
+                    "starting" => HealthFilter::Status(HealthStatus::Starting),
+                    "healthy" => HealthFilter::Status(HealthStatus::Healthy),
+                    "unhealthy" => HealthFilter::Status(HealthStatus::Unhealthy),
+                    _ => return invalid("health (expected starting, healthy, unhealthy, or none)"),
+                });
+                Ok(())
+            }
             "label" => {
                 let (name, wanted) = match value.split_once('=') {
                     Some((name, value)) => (name, Some(value)),
@@ -103,6 +120,13 @@ impl PsFilter {
         let exit_ok = self
             .exit_code
             .is_none_or(|want| state.exit_code == Some(want));
+        let health_ok = self.health.is_none_or(|want| match want {
+            HealthFilter::None => state.health.is_none(),
+            HealthFilter::Status(want) => state
+                .health
+                .as_ref()
+                .is_some_and(|health| health.status == want),
+        });
         let labels_ok = self.labels.iter().all(|(name, wanted)| {
             state
                 .labels
@@ -117,6 +141,7 @@ impl PsFilter {
             && image_ok
             && net_ok
             && exit_ok
+            && health_ok
             && labels_ok
     }
 }
@@ -161,6 +186,8 @@ mod tests {
             restart_policy: crate::restart::RestartPolicy::No,
             restart_count: 0,
             restart_pending: false,
+            healthcheck: None,
+            health: None,
             capabilities: None,
             seccomp: None,
             ulimits: None,
@@ -267,5 +294,20 @@ mod tests {
         assert!(filter("exitCode", "0").widens_status());
         assert!(!filter("status", "running").widens_status());
         assert!(!filter("name", "web").widens_status());
+    }
+
+    #[test]
+    fn health_selectors_distinguish_probe_states() {
+        let mut healthy = state(Status::Running, None);
+        healthy.health = Some(crate::state::HealthState {
+            status: HealthStatus::Healthy,
+            failing_streak: 0,
+            log: Vec::new(),
+        });
+        assert!(filter("health", "healthy").matches(&healthy));
+        assert!(!filter("health", "starting").matches(&healthy));
+        assert!(!filter("health", "none").matches(&healthy));
+        assert!(filter("health", "none").matches(&state(Status::Running, None)));
+        assert!(PsFilter::default().set("health", "sick").is_err());
     }
 }

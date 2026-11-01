@@ -236,6 +236,33 @@ pub fn diff_events(previous: &[ContainerState], current: &[ContainerState]) -> V
                         detail: None,
                     });
                 }
+                if old.status == Status::Running && st.status == Status::Running {
+                    let old_health = old.health.as_ref().map(|health| health.status);
+                    let new_health = st.health.as_ref().map(|health| health.status);
+                    if old_health != new_health {
+                        if let Some(status) = new_health {
+                            let label = match status {
+                                crate::state::HealthStatus::Starting => "starting",
+                                crate::state::HealthStatus::Healthy => "healthy",
+                                crate::state::HealthStatus::Unhealthy => "unhealthy",
+                            };
+                            let at = st
+                                .health
+                                .as_ref()
+                                .and_then(|health| health.log.last())
+                                .map(|log| log.end.clone())
+                                .unwrap_or_else(|| now.clone());
+                            events.push(Event {
+                                at,
+                                action: "health_status",
+                                id: st.id.clone(),
+                                name: name.clone(),
+                                image: st.image.clone(),
+                                detail: Some(format!("health={label}")),
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -297,6 +324,8 @@ mod tests {
             restart_policy: crate::restart::RestartPolicy::No,
             restart_count: 0,
             restart_pending: false,
+            healthcheck: None,
+            health: None,
             capabilities: None,
             seccomp: None,
             ulimits: None,
@@ -432,5 +461,28 @@ mod tests {
         );
         let before = crate::logs::LogTimeFilter::parse(Some("3000-01-01T00:00:00Z"), None).unwrap();
         assert!(select_events_with_time_filter(events, &[], &before).is_empty());
+    }
+
+    #[test]
+    fn health_transitions_emit_health_status_events() {
+        let mut old = state("abc", Some("web"), Status::Running, None);
+        old.health = Some(crate::state::HealthState::starting());
+        let mut current = old.clone();
+        current.health = Some(crate::state::HealthState {
+            status: crate::state::HealthStatus::Healthy,
+            failing_streak: 0,
+            log: vec![crate::state::HealthLog {
+                start: "2026-09-10T00:00:02Z".to_string(),
+                end: "2026-09-10T00:00:03Z".to_string(),
+                exit_code: 0,
+                output: String::new(),
+            }],
+        });
+        let events = diff_events(&[old], &[current]);
+        assert!(events.iter().any(|event| {
+            event.action == "health_status"
+                && event.detail.as_deref() == Some("health=healthy")
+                && event.at == "2026-09-10T00:00:03Z"
+        }));
     }
 }
