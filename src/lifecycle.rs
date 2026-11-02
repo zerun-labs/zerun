@@ -372,8 +372,7 @@ fn refresh_shared_namespaces(store: &Store, spec: &mut RunSpec) -> ZResult<()> {
             .net_container
             .as_deref()
             .ok_or_else(|| crate::zerr!("shared network mode has no target container"))?;
-        let target = ContainerState::load(store, target_id)
-            .ok_or_else(|| crate::zerr!("network target container {target_id} no longer exists"))?;
+        let target = load_shared_namespace_target(store, target_id, "network")?;
         netns = Some(Arc::new(target.open_network_namespace()?));
         bridge_ip = target.ip;
     }
@@ -382,9 +381,7 @@ fn refresh_shared_namespaces(store: &Store, spec: &mut RunSpec) -> ZResult<()> {
             .pid_container
             .as_deref()
             .ok_or_else(|| crate::zerr!("shared PID namespace mode has no target container"))?;
-        let target = ContainerState::load(store, target_id).ok_or_else(|| {
-            crate::zerr!("PID namespace target container {target_id} no longer exists")
-        })?;
+        let target = load_shared_namespace_target(store, target_id, "PID namespace")?;
         pidns = Some(Arc::new(target.open_pid_namespace()?));
     }
     if spec.namespaces.ipc == IpcMode::Container {
@@ -392,9 +389,7 @@ fn refresh_shared_namespaces(store: &Store, spec: &mut RunSpec) -> ZResult<()> {
             .ipc_container
             .as_deref()
             .ok_or_else(|| crate::zerr!("shared IPC namespace mode has no target container"))?;
-        let target = ContainerState::load(store, target_id).ok_or_else(|| {
-            crate::zerr!("IPC namespace target container {target_id} no longer exists")
-        })?;
+        let target = load_shared_namespace_target(store, target_id, "IPC namespace")?;
         ipcns = Some(Arc::new(target.open_ipc_namespace()?));
     }
     // Assign only after every requested target has been reopened. The local
@@ -407,6 +402,15 @@ fn refresh_shared_namespaces(store: &Store, spec: &mut RunSpec) -> ZResult<()> {
         spec.bridge_ip = bridge_ip;
     }
     Ok(())
+}
+
+fn load_shared_namespace_target(
+    store: &Store,
+    target_id: &str,
+    label: &str,
+) -> ZResult<ContainerState> {
+    ContainerState::load_checked(store, target_id)?
+        .ok_or_else(|| crate::zerr!("{label} target container {target_id} no longer exists"))
 }
 
 fn persist_reaper_claim(store: &Store, id: &str, pid: i32, start_time: Option<u64>) -> ZResult<()> {
@@ -1470,6 +1474,37 @@ mod shared_namespace_tests {
 
         let error = refresh_shared_namespaces(&store, &mut spec).unwrap_err();
         assert!(error.to_string().contains("PID namespace target"));
+        assert!(spec.shared_netns.is_none());
+        assert!(spec.shared_pidns.is_none());
+        assert!(spec.shared_ipcns.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn corrupt_target_state_is_not_reported_as_a_missing_target() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-shared-namespace-corrupt-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.join("data"), root.join("run"));
+        store.ensure_dirs().unwrap();
+
+        let pid = crate::syscalls::process_id();
+        let start_time = crate::procinfo::process_start_time(pid).unwrap();
+        running_state("0123456789ab", pid, start_time)
+            .save(&store)
+            .unwrap();
+        let corrupt_id = "fedcba987654";
+        let corrupt_dir = ContainerState::dir(&store, corrupt_id);
+        fsutil::mkdir_p_mode(&corrupt_dir, 0o700).unwrap();
+        std::fs::write(corrupt_dir.join("state.json"), b"{not-json").unwrap();
+        let mut spec = shared_namespace_spec(&store, "0123456789ab", corrupt_id);
+
+        let error = refresh_shared_namespaces(&store, &mut spec).unwrap_err();
+        assert!(error.to_string().contains("parse container state"));
         assert!(spec.shared_netns.is_none());
         assert!(spec.shared_pidns.is_none());
         assert!(spec.shared_ipcns.is_none());
