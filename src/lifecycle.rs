@@ -357,6 +357,12 @@ pub fn run_detached(
 /// retaining descriptors from the original `run`. A target may restart with a
 /// different namespace while this reaper is waiting.
 fn refresh_shared_namespaces(store: &Store, spec: &mut RunSpec) -> ZResult<()> {
+    // A partial refresh failure below must not leave earlier descriptors in the
+    // reaper until the next retry: that would pin namespaces from targets the
+    // failed attempt no longer owns.
+    spec.shared_netns = None;
+    spec.shared_pidns = None;
+    spec.shared_ipcns = None;
     if spec.net == NetMode::Container {
         let target_id = spec
             .net_container
