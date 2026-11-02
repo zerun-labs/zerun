@@ -634,12 +634,15 @@ impl ImageStore {
     /// held. This closes races with a detached run that persists its state
     /// while GC is waiting to start. The callback must not re-enter this image
     /// store because the exclusive operation lock is already held.
-    pub fn gc_with_protected_from<F>(&self, protected_rootfs: F) -> ZResult<()>
+    /// Callers that derive protections from another store must propagate an
+    /// inventory error instead of allowing garbage collection to proceed with
+    /// an incomplete protection set.
+    pub fn gc_with_protected_from_result<F>(&self, protected_rootfs: F) -> ZResult<()>
     where
-        F: FnOnce() -> BTreeSet<PathBuf>,
+        F: FnOnce() -> ZResult<BTreeSet<PathBuf>>,
     {
         let _operation = self.lock_operations_exclusive()?;
-        let protected_rootfs = protected_rootfs();
+        let protected_rootfs = protected_rootfs()?;
         let _lock = self.lock_index()?;
         let records = self.records()?;
         let mut keep_blobs: BTreeSet<String> = BTreeSet::new(); // "sha256:<hex>"
@@ -980,7 +983,8 @@ mod tests {
             expected
         );
 
-        s.gc_with_protected_from(BTreeSet::new).unwrap();
+        s.gc_with_protected_from_result(|| Ok(BTreeSet::new()))
+            .unwrap();
         assert!(s.verify_blob(&kept_digest).unwrap());
         assert!(!s.verify_blob(&orphan_digest).unwrap());
         assert!(!orphan_rootfs.exists());
@@ -1021,7 +1025,7 @@ mod tests {
             let gc_store = ImageStore::at(&data_root).unwrap();
             started_tx.send(()).unwrap();
             gc_store
-                .gc_with_protected_from(|| {
+                .gc_with_protected_from_result(|| {
                     let probe = OpenOptions::new()
                         .read(true)
                         .write(true)
@@ -1031,7 +1035,7 @@ mod tests {
                         probe.try_lock_shared(),
                         Err(std::fs::TryLockError::WouldBlock)
                     ));
-                    BTreeSet::from([gc_root_for_thread.clone()])
+                    Ok(BTreeSet::from([gc_root_for_thread.clone()]))
                 })
                 .unwrap();
         });
@@ -1039,6 +1043,24 @@ mod tests {
         drop(operation);
         gc.join().unwrap();
         assert!(gc_root.join("marker").is_file());
+        let _ = fs::remove_dir_all(&s.data_root);
+    }
+
+    #[test]
+    fn garbage_collection_fails_closed_when_protection_inventory_fails() {
+        let s = test_store();
+        let untracked = s.rootfs_dir().join("b".repeat(64));
+        fs::create_dir_all(&untracked).unwrap();
+        fs::write(untracked.join("marker"), b"keep me").unwrap();
+
+        let error = s
+            .gc_with_protected_from_result(|| {
+                Err(crate::zerr!("simulated container state corruption"))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("state corruption"));
+        assert!(untracked.join("marker").is_file());
+
         let _ = fs::remove_dir_all(&s.data_root);
     }
 
@@ -1060,11 +1082,13 @@ mod tests {
             0,
             "active rootfs leases must not be reported as reclaimable"
         );
-        s.gc_with_protected_from(BTreeSet::new).unwrap();
+        s.gc_with_protected_from_result(|| Ok(BTreeSet::new()))
+            .unwrap();
         assert!(rootfs.join("marker").is_file());
 
         drop(rootfs_lease);
-        s.gc_with_protected_from(BTreeSet::new).unwrap();
+        s.gc_with_protected_from_result(|| Ok(BTreeSet::new()))
+            .unwrap();
         assert!(!rootfs.exists());
         let _ = fs::remove_dir_all(&s.data_root);
     }
@@ -1094,7 +1118,8 @@ mod tests {
         drop(operation);
         assert!(lock_path.exists());
 
-        s.gc_with_protected_from(BTreeSet::new).unwrap();
+        s.gc_with_protected_from_result(|| Ok(BTreeSet::new()))
+            .unwrap();
         assert!(rootfs.join("marker").is_file());
         assert!(!lock_path.exists());
         let _ = fs::remove_dir_all(&s.data_root);
@@ -1115,7 +1140,8 @@ mod tests {
             s.reclaimable_bytes_with_protected(&protected_set),
             b"remove me".len() as u64
         );
-        s.gc_with_protected_from(|| protected_set.clone()).unwrap();
+        s.gc_with_protected_from_result(|| Ok(protected_set.clone()))
+            .unwrap();
         assert!(protected.join("marker").is_file());
         assert!(!orphan.exists());
         let _ = fs::remove_dir_all(&s.data_root);

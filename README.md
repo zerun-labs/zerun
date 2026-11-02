@@ -494,7 +494,10 @@ sudo target/release/zerun system df                   # image and container disk
 
 Detached containers keep no daemon: the per-container reaper is a tiny process that
 disappears when the container exits. If the host crashes (or the reaper is killed), the
-next `ps`/`rm` reconciles the stale record and reclaims host-side resources.
+next `ps`/`rm` reconciles the stale record and reclaims host-side resources. State inventory
+is fail-closed: an unreadable or malformed `state.json` makes lifecycle commands and
+inventory-dependent image GC report the damaged record instead of silently ignoring it.
+`doctor` reports the same state-store check.
 
 `-dt` allocates a PTY for a detached workload, so terminal-aware services retain
 line-buffered output and `TERM` defaults. Detached PTYs start at a conventional 24x80
@@ -557,7 +560,9 @@ unbounded line; `attach` still receives the original bytes unchanged.
 `prune` removes every retained exited container and its writable layer. It reconciles stale
 Running records first, never touches live containers, and requires `--force` when stdin is
 not a terminal. `--images` additionally runs the image-store garbage collector for unreachable
-blobs/rootfs left by interrupted pulls or removed records; tagged images are retained.
+blobs/rootfs left by interrupted pulls or removed records; tagged images are retained. Image GC
+refuses to run when container state cannot be fully enumerated, preventing a damaged record
+from losing its referenced lower rootfs.
 `stats` is a one-shot snapshot of cgroup v2 memory, CPU, PID, and block-I/O data.
 It reads live control files while a container runs and persists a final snapshot
 when it exits. Metrics are `n/a` when the cgroup was unavailable or the command

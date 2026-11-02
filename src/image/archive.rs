@@ -624,7 +624,9 @@ mod tests {
         store
             .remove_record("docker.io/example/zerun-archive", Some("v1"), None)
             .unwrap();
-        store.gc_with_protected_from(BTreeSet::new).unwrap();
+        store
+            .gc_with_protected_from_result(|| Ok(BTreeSet::new()))
+            .unwrap();
 
         let imported = load_archive(&store, &archive_path).unwrap();
         assert_eq!(imported.len(), 1);
@@ -781,7 +783,9 @@ mod tests {
         store
             .remove_record("docker.io/example/multi-arm", Some("v1"), None)
             .unwrap();
-        store.gc_with_protected_from(BTreeSet::new).unwrap();
+        store
+            .gc_with_protected_from_result(|| Ok(BTreeSet::new()))
+            .unwrap();
         assert!(!store.verify_blob(&index_digest).unwrap());
 
         let imported = load_archive(&store, &archive_path).unwrap();

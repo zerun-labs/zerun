@@ -629,24 +629,47 @@ impl ContainerState {
         store.run_root().join("containers").join(id)
     }
 
-    /// Load the state of one container id (exact match).
-    pub fn load(store: &Store, id: &str) -> Option<ContainerState> {
-        // `load` is also reached by CLI arguments through `resolve`; never
-        // allow an arbitrary path component to escape `containers/`.
+    /// Load the state of one container id (exact match), preserving
+    /// filesystem and parse errors for lifecycle commands that must fail
+    /// closed on a damaged record.
+    pub fn load_checked(store: &Store, id: &str) -> ZResult<Option<ContainerState>> {
+        // `load_checked` is also reached by CLI arguments through `resolve`;
+        // never allow an arbitrary path component to escape `containers/`.
         if !valid_id(id) {
-            return None;
+            return Ok(None);
         }
         let p = Self::path(store, id);
-        let text = std::fs::read_to_string(&p).ok()?;
-        let mut state: ContainerState = serde_json::from_str(&text).ok()?;
+        let text = match std::fs::read_to_string(&p) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(crate::zerr!(
+                    "read container state {}: {error}",
+                    p.display()
+                ))
+            }
+        };
+        let mut state: ContainerState = serde_json::from_str(&text)
+            .map_err(|error| crate::zerr!("parse container state {}: {error}", p.display()))?;
         // The directory name is the record's identity. Reject a JSON payload
         // that claims another id rather than letting metadata redirect later
         // lifecycle operations.
         if state.id != id || !valid_id(&state.id) {
-            return None;
+            return Err(crate::zerr!(
+                "container state {} has id '{}', expected '{id}'",
+                p.display(),
+                state.id
+            ));
         }
         state.log = Self::log_path(store, id).display().to_string();
-        Some(state)
+        Ok(Some(state))
+    }
+
+    /// Best-effort exact lookup retained for callers where a concurrent
+    /// removal is an expected absence. Inventory and CLI resolution should use
+    /// [`Self::load_checked`] or [`list`] so corruption is not hidden.
+    pub fn load(store: &Store, id: &str) -> Option<ContainerState> {
+        Self::load_checked(store, id).ok().flatten()
     }
 
     /// Canonical console-log path for this container.
@@ -855,11 +878,14 @@ fn valid_id(id: &str) -> bool {
 /// Returns the matching state or a descriptive error when zero or multiple
 /// records match.
 pub fn resolve(store: &Store, arg: &str) -> Result<ContainerState, String> {
-    // Exact id first.
-    if let Some(s) = ContainerState::load(store, arg) {
-        return Ok(s);
+    // Exact id first. A matching but damaged record must not fall through to
+    // an unrelated name/prefix lookup.
+    match ContainerState::load_checked(store, arg) {
+        Ok(Some(state)) => return Ok(state),
+        Ok(None) => {}
+        Err(error) => return Err(error.to_string()),
     }
-    let all = list(store);
+    let all = list(store).map_err(|error| error.to_string())?;
     // Name match (exact).
     if let Some(s) = all.iter().find(|s| s.name.as_deref() == Some(arg)) {
         return Ok(s.clone());
@@ -877,22 +903,66 @@ pub fn resolve(store: &Store, arg: &str) -> Result<ContainerState, String> {
 }
 
 /// Every state record, newest first.
-pub fn list(store: &Store) -> Vec<ContainerState> {
+///
+/// A missing state file is tolerated because a concurrent `run` reserves its
+/// ID directory before committing `state.json`. Once a state file exists,
+/// however, unreadable JSON, identity mismatches, and directory read failures
+/// are fatal inventory errors. Silently skipping such a record would make
+/// lifecycle commands misreport it and could let image GC discard its lower
+/// rootfs.
+pub fn list(store: &Store) -> ZResult<Vec<ContainerState>> {
     let mut out = Vec::new();
     let dir = store.run_root().join("containers");
-    let Ok(rd) = std::fs::read_dir(&dir) else {
-        return out;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(error) => {
+            return Err(crate::zerr!(
+                "read container state directory {}: {error}",
+                dir.display()
+            ))
+        }
     };
-    for entry in rd.flatten() {
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            crate::zerr!(
+                "read entry in container state directory {}: {error}",
+                dir.display()
+            )
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            crate::zerr!(
+                "inspect container state entry {}: {error}",
+                entry.path().display()
+            )
+        })?;
+        // Symlinks and regular files cannot be authoritative container
+        // records. They may be operator debris and are never followed.
+        if !file_type.is_dir() {
             continue;
         }
-        if let Some(s) = ContainerState::load(store, &entry.file_name().to_string_lossy()) {
-            out.push(s);
+        let file_name = entry.file_name();
+        let id = file_name.to_str().ok_or_else(|| {
+            crate::zerr!(
+                "container state directory has a non-UTF-8 name: {}",
+                entry.path().display()
+            )
+        })?;
+        if !valid_id(id) {
+            return Err(crate::zerr!(
+                "invalid container state directory name '{id}' at {}",
+                entry.path().display()
+            ));
+        }
+        // An empty reservation is normal while `run` is in progress. A state
+        // file that exists but cannot be loaded is corruption and must abort
+        // the inventory rather than disappearing from `ps`/`prune`/GC.
+        if let Some(state) = ContainerState::load_checked(store, id)? {
+            out.push(state);
         }
     }
     out.sort_by(|a, b| b.created.cmp(&a.created));
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1322,6 +1392,45 @@ mod tests {
         invalid.id = "../outside".to_string();
         assert!(invalid.save(&store).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_inventory_reports_corruption_instead_of_hiding_it() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-state-inventory-corrupt-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.join("data"), root.join("run"));
+        store.ensure_dirs().unwrap();
+        let id = "abc123";
+        std::fs::create_dir_all(ContainerState::dir(&store, id)).unwrap();
+        std::fs::write(ContainerState::path(&store, id), b"{not valid json").unwrap();
+
+        let error = list(&store).unwrap_err().to_string();
+        assert!(error.contains("parse container state"), "{error}");
+        assert!(error.contains(id), "{error}");
+        assert!(resolve(&store, id).unwrap_err().contains(id));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn state_inventory_skips_an_uncommitted_reservation() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-state-inventory-reservation-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.join("data"), root.join("run"));
+        store.ensure_dirs().unwrap();
+        std::fs::create_dir_all(ContainerState::dir(&store, "abc123")).unwrap();
+
+        assert!(list(&store).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

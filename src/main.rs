@@ -1373,7 +1373,10 @@ fn state_environment(st: &ContainerState) -> Result<Option<Vec<(String, String)>
 /// Materialized image rootfs directories still referenced by retained
 /// containers. They must survive image tag removal and `prune --images` so a
 /// stopped container can be started or committed without re-pulling its image.
-fn protected_image_rootfs(imgstore: &image::store::ImageStore, store: &Store) -> BTreeSet<PathBuf> {
+fn protected_image_rootfs(
+    imgstore: &image::store::ImageStore,
+    store: &Store,
+) -> crate::error::ZResult<BTreeSet<PathBuf>> {
     protected_image_rootfs_excluding(imgstore, store, &BTreeSet::new())
 }
 
@@ -1381,16 +1384,16 @@ fn protected_image_rootfs_excluding(
     imgstore: &image::store::ImageStore,
     store: &Store,
     excluded_ids: &BTreeSet<String>,
-) -> BTreeSet<PathBuf> {
+) -> crate::error::ZResult<BTreeSet<PathBuf>> {
     let rootfs_root =
         std::fs::canonicalize(imgstore.rootfs_dir()).unwrap_or_else(|_| imgstore.rootfs_dir());
-    state::list(store)
+    Ok(state::list(store)?
         .into_iter()
         .filter(|st| !excluded_ids.contains(&st.id))
         .filter_map(|st| st.lower)
         .filter_map(|path| std::fs::canonicalize(path).ok())
         .filter(|path| path.starts_with(&rootfs_root))
-        .collect()
+        .collect())
 }
 
 fn cmd_run(args: &[String]) -> i32 {
@@ -2552,12 +2555,10 @@ fn run_detached(
     };
     if !resuming {
         if let Some(n) = &info.name {
-            if state::list(store)
-                .iter()
-                .any(|c| c.name.as_deref() == Some(n))
-            {
-                eprintln!("zerun run: name '{n}' is already in use by another container");
-                if !resuming {
+            let states = match state::list(store) {
+                Ok(states) => states,
+                Err(error) => {
+                    eprintln!("zerun run: {error}");
                     cleanup_failed_detached_start(
                         store,
                         &id,
@@ -2565,7 +2566,18 @@ fn run_detached(
                         &info.anonymous_volumes,
                         &sdir,
                     );
+                    return 1;
                 }
+            };
+            if states.iter().any(|c| c.name.as_deref() == Some(n)) {
+                eprintln!("zerun run: name '{n}' is already in use by another container");
+                cleanup_failed_detached_start(
+                    store,
+                    &id,
+                    container_fs.as_ref(),
+                    &info.anonymous_volumes,
+                    &sdir,
+                );
                 return 1;
             }
         }
@@ -4208,7 +4220,7 @@ fn cmd_rmi(args: &[String]) -> i32 {
     }
     if removed_any {
         if let Err(e) =
-            imgstore.gc_with_protected_from(|| protected_image_rootfs(&imgstore, &store))
+            imgstore.gc_with_protected_from_result(|| protected_image_rootfs(&imgstore, &store))
         {
             eprintln!("zerun rmi: garbage collection: {e}");
             failed = true;
@@ -4597,6 +4609,13 @@ fn cmd_doctor(args: &[String]) -> i32 {
                 Ok(true) => println!("bridge IPAM    : OK"),
                 Err(error) => println!("bridge IPAM    : INVALID ({error})"),
             }
+            match state::list(&store) {
+                Ok(states) => println!("container state: OK ({} record(s))", states.len()),
+                Err(error) => {
+                    println!("container state: INVALID ({error})");
+                    required_failure = true;
+                }
+            }
         }
         Err(error) => {
             println!("data root      : <error: {error}>");
@@ -4701,7 +4720,14 @@ fn cmd_ps(args: &[String]) -> i32 {
     }
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut json: Vec<ContainerState> = Vec::new();
-    for mut st in state::list(&store) {
+    let states = match state::list(&store) {
+        Ok(states) => states,
+        Err(error) => {
+            eprintln!("zerun ps: {error}");
+            return 1;
+        }
+    };
+    for mut st in states {
         // Crash reconcile: a record that says Running for a dead PID belongs
         // to a reaper that never got to clean up; mark it exited and reclaim
         // its host-side resources (nft table, veth, cgroup, IPAM, overlay).
@@ -5340,8 +5366,14 @@ fn cmd_system_df(args: &[String]) -> i32 {
     };
     let image_bytes = fsutil::dir_size(&store.data_root().join("blobs"))
         + fsutil::dir_size(&store.data_root().join("rootfs"));
-    let image_reclaimable =
-        imgstore.reclaimable_bytes_with_protected(&protected_image_rootfs(&imgstore, &store));
+    let protected_rootfs = match protected_image_rootfs(&imgstore, &store) {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("zerun system df: {error}");
+            return 1;
+        }
+    };
+    let image_reclaimable = imgstore.reclaimable_bytes_with_protected(&protected_rootfs);
     let volumes_root = store.data_root().join("volumes");
     let volume_count = std::fs::read_dir(&volumes_root)
         .map(|entries| {
@@ -5356,7 +5388,14 @@ fn cmd_system_df(args: &[String]) -> i32 {
     let mut containers = 0;
     let mut container_bytes = 0;
     let mut reclaimable_bytes = 0;
-    for mut st in state::list(&store) {
+    let states = match state::list(&store) {
+        Ok(states) => states,
+        Err(error) => {
+            eprintln!("zerun system df: {error}");
+            return 1;
+        }
+    };
+    for mut st in states {
         if let Err(e) = reconcile_stale_state(&store, &mut st) {
             eprintln!("zerun system df: {e}");
             return 1;
@@ -5443,7 +5482,13 @@ fn cmd_prune(args: &[String]) -> i32 {
 
     // Reconcile before selection so a dead reaper's Running record is treated
     // like the Exited record it logically represents.
-    let states = state::list(&store);
+    let states = match state::list(&store) {
+        Ok(states) => states,
+        Err(error) => {
+            eprintln!("zerun prune: {error}");
+            return 1;
+        }
+    };
     let mut targets = Vec::new();
     for mut st in states {
         if let Err(e) = reconcile_stale_state(&store, &mut st) {
@@ -5455,7 +5500,14 @@ fn cmd_prune(args: &[String]) -> i32 {
         }
     }
     let image_reclaimable = if images {
-        imgstore.reclaimable_bytes_with_protected(&protected_image_rootfs(&imgstore, &store))
+        let protected_rootfs = match protected_image_rootfs(&imgstore, &store) {
+            Ok(paths) => paths,
+            Err(error) => {
+                eprintln!("zerun prune: {error}");
+                return 1;
+            }
+        };
+        imgstore.reclaimable_bytes_with_protected(&protected_rootfs)
     } else {
         0
     };
@@ -5509,7 +5561,7 @@ fn cmd_prune(args: &[String]) -> i32 {
     }
 
     if images {
-        match imgstore.gc_with_protected_from(|| protected_image_rootfs(&imgstore, &store)) {
+        match imgstore.gc_with_protected_from_result(|| protected_image_rootfs(&imgstore, &store)) {
             Ok(()) => println!(
                 "Reclaimed image storage: {}",
                 fsutil::human_size(image_reclaimable)
@@ -5981,7 +6033,14 @@ fn cmd_stats(args: &[String]) -> i32 {
     };
     let mut states: Vec<state::ContainerState> = Vec::new();
     if all {
-        for mut st in state::list(&store) {
+        let listed = match state::list(&store) {
+            Ok(states) => states,
+            Err(error) => {
+                eprintln!("zerun stats: {error}");
+                return 1;
+            }
+        };
+        for mut st in listed {
             if let Err(e) = reconcile_stale_state(&store, &mut st) {
                 eprintln!("zerun stats: {e}");
                 return 1;
@@ -6608,7 +6667,14 @@ fn cmd_rename(args: &[String]) -> i32 {
     if st.name.as_deref() == Some(new) {
         return 0;
     }
-    if state::list(&store)
+    let states = match state::list(&store) {
+        Ok(states) => states,
+        Err(error) => {
+            eprintln!("zerun rename: {error}");
+            return 1;
+        }
+    };
+    if states
         .iter()
         .any(|other| other.id != st.id && other.name.as_deref() == Some(new))
     {
@@ -7449,13 +7515,25 @@ fn cmd_events(args: &[String]) -> i32 {
     let mut previous = if replay {
         Vec::new()
     } else {
-        state::list(&store)
+        match state::list(&store) {
+            Ok(states) => states,
+            Err(error) => {
+                eprintln!("zerun events: {error}");
+                return 1;
+            }
+        }
     };
     loop {
         // A bounded replay should emit existing records immediately, while an
         // unbounded invocation keeps the first snapshot silent like Docker's
         // live event stream.
-        let current = state::list(&store);
+        let current = match state::list(&store) {
+            Ok(states) => states,
+            Err(error) => {
+                eprintln!("zerun events: {error}");
+                return 1;
+            }
+        };
         for event in events::diff_events(&previous, &current) {
             let event = events::select_events_with_time_filter(vec![event], &filters, &time_filter);
             let Some(event) = event.first() else {

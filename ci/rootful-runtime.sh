@@ -40,11 +40,19 @@ fi
 cleanup_ids=()
 cleanup_pids=()
 cleanup_paths=()
+cleanup_dirs=()
 remove_cleanup_path() {
   if (( EUID == 0 )); then
     rm -f -- "$1"
   else
     sudo rm -f -- "$1"
+  fi
+}
+remove_cleanup_dir() {
+  if (( EUID == 0 )); then
+    rm -rf -- "$1"
+  else
+    sudo rm -rf -- "$1"
   fi
 }
 # A background command started through sudo is represented by the sudo
@@ -97,6 +105,9 @@ cleanup() {
   for path in "${cleanup_paths[@]}"; do
     remove_cleanup_path "$path" >/dev/null 2>&1 || true
   done
+  for path in "${cleanup_dirs[@]}"; do
+    remove_cleanup_dir "$path" >/dev/null 2>&1 || true
+  done
 }
 trap cleanup EXIT
 
@@ -105,6 +116,33 @@ trap cleanup EXIT
 doctor_output=$("${zerun[@]}" doctor)
 grep -F 'device policy  : OK' <<<"$doctor_output" >/dev/null
 grep -F 'readiness      : OK' <<<"$doctor_output" >/dev/null
+
+# A damaged state record must be visible and fail closed. Silently skipping it
+# would hide a retained container and could let image GC discard its lower
+# rootfs. Empty reservation directories remain valid during concurrent runs.
+corrupt_state_id=$(printf '%012x' "$BASHPID")
+corrupt_state_dir="$runtime_root/containers/$corrupt_state_id"
+cleanup_dirs+=("$corrupt_state_dir")
+mkdir -p "$corrupt_state_dir"
+printf '{not valid json\n' >"$corrupt_state_dir/state.json"
+if corrupt_doctor_output=$("${zerun[@]}" doctor 2>&1); then
+  echo "doctor accepted a corrupted container state record" >&2
+  exit 1
+fi
+grep -F 'container state: INVALID' <<<"$corrupt_doctor_output" >/dev/null
+if corrupt_ps_output=$("${zerun[@]}" ps -a 2>&1); then
+  echo "ps silently accepted a corrupted container state record" >&2
+  exit 1
+fi
+grep -F "parse container state" <<<"$corrupt_ps_output" >/dev/null
+grep -F "$corrupt_state_id" <<<"$corrupt_ps_output" >/dev/null
+if corrupt_prune_output=$("${zerun[@]}" prune -f --images 2>&1); then
+  echo "prune proceeded with incomplete container protections" >&2
+  exit 1
+fi
+grep -F "parse container state" <<<"$corrupt_prune_output" >/dev/null
+remove_cleanup_dir "$corrupt_state_dir"
+echo "rootful-state-inventory-fail-closed-ok"
 
 # Pick a high, currently unused TCP port instead of assuming a shared runner
 # has 18080 available. The check is intentionally only a race-avoidance hint:

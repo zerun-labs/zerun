@@ -181,9 +181,9 @@ mod tests {
         let gc = std::thread::spawn(move || {
             let gc_store = ImageStore::at(&gc_data_dir).unwrap();
             gc_store
-                .gc_with_protected_from(|| {
+                .gc_with_protected_from_result(|| {
                     entered_gc_tx.send(()).unwrap();
-                    std::collections::BTreeSet::new()
+                    Ok(std::collections::BTreeSet::new())
                 })
                 .unwrap();
         });
