@@ -140,7 +140,17 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
     }
     if a.namespaces.ipc != crate::state::IpcMode::Private {
         run_args.push("--ipc".into());
-        run_args.push(a.namespaces.ipc.label().into());
+        run_args.push(match a.namespaces.ipc {
+            crate::state::IpcMode::Private => "private".into(),
+            crate::state::IpcMode::None => "none".into(),
+            crate::state::IpcMode::Host => "host".into(),
+            crate::state::IpcMode::Container => format!(
+                "container:{}",
+                a.ipc_container
+                    .as_deref()
+                    .expect("container IPC target was validated")
+            ),
+        });
     }
     if let Some(v) = &a.user {
         run_args.push("--user".into());
@@ -447,6 +457,15 @@ fn validate(a: &RunArgs, rootful: bool) -> Result<(), String> {
     if a.namespaces.pid != crate::state::PidMode::Container && a.pid_container.is_some() {
         return Err("container PID target requires --pid container".into());
     }
+    if a.namespaces.ipc == crate::state::IpcMode::Container && !rootful {
+        return Err("--ipc container requires a rootful runtime".into());
+    }
+    if a.namespaces.ipc == crate::state::IpcMode::Container && a.ipc_container.is_none() {
+        return Err("--ipc container requires a target container".into());
+    }
+    if a.namespaces.ipc != crate::state::IpcMode::Container && a.ipc_container.is_some() {
+        return Err("container IPC target requires --ipc container".into());
+    }
     crate::network::resolve_host_aliases(
         &a.add_hosts,
         (effective_net == NetMode::Bridge).then_some(crate::network::GATEWAY_IP),
@@ -679,6 +698,26 @@ mod tests {
         mismatch.pid_container = Some("web".to_string());
         let error = render(Path::new("/usr/local/bin/zerun"), &mismatch, true).unwrap_err();
         assert!(error.contains("requires --pid container"));
+    }
+
+    #[test]
+    fn renders_and_validates_shared_ipc_namespace() {
+        let a = args(&["--ipc", "container:web", "alpine", "true"]);
+        let unit = render(Path::new("/usr/local/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains("--ipc container:web"));
+
+        let error = render(Path::new("/usr/local/bin/zerun"), &a, false).unwrap_err();
+        assert!(error.contains("requires a rootful runtime"));
+
+        let mut missing_target = args(&["--ipc", "container:web", "alpine", "true"]);
+        missing_target.ipc_container = None;
+        let error = render(Path::new("/usr/local/bin/zerun"), &missing_target, true).unwrap_err();
+        assert!(error.contains("requires a target container"));
+
+        let mut mismatch = args(&["--ipc", "private", "alpine", "true"]);
+        mismatch.ipc_container = Some("web".to_string());
+        let error = render(Path::new("/usr/local/bin/zerun"), &mismatch, true).unwrap_err();
+        assert!(error.contains("requires --ipc container"));
     }
 
     #[test]

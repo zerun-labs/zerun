@@ -46,9 +46,10 @@ pub fn validate_for_namespaces(
                 ));
             }
         } else if is_ipc_sysctl(key) {
-            if matches!(namespaces.ipc, IpcMode::Host) {
+            if matches!(namespaces.ipc, IpcMode::Host | IpcMode::Container) {
                 return Err(format!(
-                    "--sysctl {key} requires a private IPC namespace; remove --ipc host"
+                    "--sysctl {key} requires a private IPC namespace; \
+                     do not use --ipc host or --ipc container"
                 ));
             }
         } else if key == "kernel.domainname" && matches!(namespaces.uts, NamespaceMode::Host) {
@@ -191,6 +192,11 @@ mod tests {
             ..NamespaceModes::default()
         };
         assert!(validate_for_namespaces(&ipc, host_ipc, NetMode::None).is_err());
+        let shared_ipc = NamespaceModes {
+            ipc: IpcMode::Container,
+            ..NamespaceModes::default()
+        };
+        assert!(validate_for_namespaces(&ipc, shared_ipc, NetMode::None).is_err());
         assert!(validate_for_namespaces(&ipc, NamespaceModes::default(), NetMode::None).is_ok());
 
         let uts = values(&[("kernel.domainname", "example.test")]);

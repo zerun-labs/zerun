@@ -925,6 +925,16 @@ mod tests {
     }
 
     #[test]
+    fn shared_container_ipc_namespace_is_rejoined_by_exec() {
+        let modes = NamespaceModes {
+            ipc: crate::state::IpcMode::Container,
+            ..NamespaceModes::default()
+        };
+        let (_, flags) = namespace_flags(false, modes, "none").unwrap();
+        assert_ne!(flags & libc::CLONE_NEWIPC, 0);
+    }
+
+    #[test]
     fn malformed_persisted_network_mode_is_rejected() {
         assert!(namespace_flags(false, NamespaceModes::default(), "network-ish").is_err());
         assert!(namespace_flags(false, NamespaceModes::default(), "container:").is_err());

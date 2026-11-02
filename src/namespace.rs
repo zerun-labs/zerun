@@ -64,6 +64,12 @@ pub struct RunSpec {
     /// Pinned PID namespace for `PidMode::Container`. `setns` affects the
     /// supervisor's next child, so it must be installed before forking.
     pub shared_pidns: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
+    /// Source container id for `IpcMode::Container`; persisted in state and
+    /// used only in diagnostics after the namespace was opened.
+    pub ipc_container: Option<String>,
+    /// Pinned IPC namespace for `IpcMode::Container`. The supervisor enters it
+    /// before forking the workload and keeps a private `/dev/shm` mount.
+    pub shared_ipcns: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
     pub net: NetMode,
     /// Source container id for `NetMode::Container`; persisted in state and
     /// used only in diagnostics after the namespace was opened.
@@ -291,6 +297,9 @@ where
         }
         if spec.namespaces.pid == PidMode::Container {
             return Err(crate::zerr!("--pid container requires a rootful runtime"));
+        }
+        if spec.namespaces.ipc == IpcMode::Container {
+            return Err(crate::zerr!("--ipc container requires a rootful runtime"));
         }
     }
     let flags = namespace_flags(rootless, spec.namespaces, spec.net);
@@ -676,7 +685,7 @@ fn namespace_flags(rootless: bool, namespaces: NamespaceModes, net: NetMode) -> 
     if matches!(namespaces.uts, NamespaceMode::Private) {
         flags |= libc::CLONE_NEWUTS;
     }
-    if !matches!(namespaces.ipc, IpcMode::Host) {
+    if matches!(namespaces.ipc, IpcMode::Private | IpcMode::None) {
         flags |= libc::CLONE_NEWIPC;
     }
     if matches!(net, NetMode::None | NetMode::Bridge) {
@@ -907,6 +916,11 @@ fn supervisor_main(
     }
     if let Some(pidns) = spec.shared_pidns.take() {
         if let Err(error) = syscalls::setns(pidns.as_raw_fd(), libc::CLONE_NEWPID) {
+            supervisor_fail(status_w, &error);
+        }
+    }
+    if let Some(ipcns) = spec.shared_ipcns.take() {
+        if let Err(error) = syscalls::setns(ipcns.as_raw_fd(), libc::CLONE_NEWIPC) {
             supervisor_fail(status_w, &error);
         }
     }
@@ -1533,6 +1547,18 @@ mod tests {
         };
         let flags = namespace_flags(false, modes, NetMode::None);
         assert_ne!(flags & libc::CLONE_NEWIPC, 0);
+    }
+
+    #[test]
+    fn namespace_flags_join_an_existing_ipc_namespace() {
+        let modes = NamespaceModes {
+            ipc: IpcMode::Container,
+            ..NamespaceModes::default()
+        };
+        let flags = namespace_flags(false, modes, NetMode::None);
+        assert_eq!(flags & libc::CLONE_NEWIPC, 0);
+        assert_ne!(flags & libc::CLONE_NEWNS, 0);
+        assert_ne!(flags & libc::CLONE_NEWNET, 0);
     }
 
     #[test]

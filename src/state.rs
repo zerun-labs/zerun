@@ -113,7 +113,9 @@ impl PidMode {
 /// `none` keeps a private IPC namespace but does not mount `/dev/shm`, while
 /// `private` is the normal isolated namespace with a private shared-memory
 /// tmpfs. Both private forms are joined by `zerun exec`; only the `/dev/shm`
-/// setup differs.
+/// setup differs. `container` joins another running container's IPC namespace;
+/// the concrete target id is persisted separately so a restart cannot silently
+/// follow a reused name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IpcMode {
@@ -124,16 +126,37 @@ pub enum IpcMode {
     None,
     /// Join the runtime's (host) IPC namespace and `/dev/shm` mount.
     Host,
+    /// Join another container's IPC namespace. The container keeps its own
+    /// `/dev/shm` mount, matching Docker's IPC namespace sharing semantics.
+    Container,
 }
 
 impl IpcMode {
-    /// Parse a Docker-style `--ipc` value.
-    pub fn parse(value: &str) -> Result<Self, String> {
+    /// Parse a Docker-style `--ipc` value and return the target reference for
+    /// `container:` mode.
+    pub fn parse(option: &str, value: &str) -> Result<(Self, Option<String>), String> {
         match value {
-            "private" => Ok(Self::Private),
-            "none" => Ok(Self::None),
-            "host" => Ok(Self::Host),
-            other => Err(format!("invalid --ipc value '{other}' (private|none|host)")),
+            "private" => Ok((Self::Private, None)),
+            "none" => Ok((Self::None, None)),
+            "host" => Ok((Self::Host, None)),
+            other => {
+                let Some(target) = other.strip_prefix("container:") else {
+                    return Err(format!(
+                        "invalid {option} value '{other}' (private|none|host|container:<id|name>)"
+                    ));
+                };
+                if target.is_empty() {
+                    return Err(format!(
+                        "invalid {option} value '{other}': container target cannot be empty"
+                    ));
+                }
+                if target.chars().any(char::is_control) {
+                    return Err(format!(
+                        "invalid {option} value '{other}': container target contains control characters"
+                    ));
+                }
+                Ok((Self::Container, Some(target.to_string())))
+            }
         }
     }
 
@@ -142,6 +165,7 @@ impl IpcMode {
             Self::Private => "private",
             Self::None => "none",
             Self::Host => "host",
+            Self::Container => "container",
         }
     }
 }
@@ -494,6 +518,9 @@ pub struct ContainerState {
     /// Concrete target id for `namespaces.pid == container`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid_container: Option<String>,
+    /// Concrete target id for `namespaces.ipc == container`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipc_container: Option<String>,
     /// Published ports (host, container).
     pub ports: Vec<(u16, u16)>,
     /// Transport for each port (`tcp`/`udp`). Older records are TCP.
@@ -736,6 +763,12 @@ impl ContainerState {
     /// with `--pid container`.
     pub fn open_pid_namespace(&self) -> ZResult<std::os::fd::OwnedFd> {
         self.open_namespace("pid", "PID")
+    }
+
+    /// Pin the recorded process's IPC namespace for a container that shares it
+    /// with `--ipc container`.
+    pub fn open_ipc_namespace(&self) -> ZResult<std::os::fd::OwnedFd> {
+        self.open_namespace("ipc", "IPC")
     }
 
     /// Open a namespace under `/proc/<pid>/ns`.
@@ -1008,6 +1041,7 @@ mod tests {
             net: "none".to_string(),
             namespaces: Default::default(),
             pid_container: None,
+            ipc_container: None,
             ports: Vec::new(),
             port_protocols: None,
             port_ips: None,
@@ -1071,6 +1105,7 @@ mod tests {
         assert!(state.exposed_ports.is_empty());
         assert_eq!(state.namespaces, NamespaceModes::default());
         assert_eq!(state.pid_container, None);
+        assert_eq!(state.ipc_container, None);
     }
 
     #[test]
@@ -1111,6 +1146,20 @@ mod tests {
             serde_json::from_str::<NamespaceModes>(&json).unwrap(),
             modes
         );
+
+        let modes = NamespaceModes {
+            ipc: IpcMode::Container,
+            ..NamespaceModes::default()
+        };
+        let json = serde_json::to_string(&modes).unwrap();
+        assert_eq!(
+            json,
+            r#"{"pid":"private","ipc":"container","uts":"private"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<NamespaceModes>(&json).unwrap(),
+            modes
+        );
     }
 
     #[test]
@@ -1127,6 +1176,26 @@ mod tests {
         for value in ["container:", "none", "pod:web", "container:web\n"] {
             assert!(
                 PidMode::parse("--pid", value).is_err(),
+                "{value:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn ipc_mode_parsing_requires_a_concrete_container_target() {
+        assert_eq!(
+            IpcMode::parse("--ipc", "private"),
+            Ok((IpcMode::Private, None))
+        );
+        assert_eq!(IpcMode::parse("--ipc", "none"), Ok((IpcMode::None, None)));
+        assert_eq!(IpcMode::parse("--ipc", "host"), Ok((IpcMode::Host, None)));
+        assert_eq!(
+            IpcMode::parse("--ipc", "container:web"),
+            Ok((IpcMode::Container, Some("web".to_string())))
+        );
+        for value in ["container:", "shareable", "pod:web", "container:web\n"] {
+            assert!(
+                IpcMode::parse("--ipc", value).is_err(),
                 "{value:?} was accepted"
             );
         }
@@ -1199,6 +1268,7 @@ mod tests {
             net: "none".to_string(),
             namespaces: Default::default(),
             pid_container: None,
+            ipc_container: None,
             ports: vec![],
             port_protocols: None,
             port_ips: None,
@@ -1312,6 +1382,7 @@ mod tests {
             net: "none".to_string(),
             namespaces: Default::default(),
             pid_container: None,
+            ipc_container: None,
             ports: vec![],
             port_protocols: None,
             port_ips: None,

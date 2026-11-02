@@ -20,7 +20,7 @@ use crate::fsutil;
 use crate::logs::LogOptions;
 use crate::namespace::{run_container_with_report, NetMode, RunSpec};
 use crate::state::PidMode;
-use crate::state::{self, ContainerState, Status};
+use crate::state::{self, ContainerState, IpcMode, Status};
 use crate::store::{ContainerFs, Store};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -113,6 +113,7 @@ pub fn run_detached(
     // restarts or removal.
     drop(spec.shared_netns.take());
     drop(spec.shared_pidns.take());
+    drop(spec.shared_ipcns.take());
     // Replace inherited stdio with a timestamping collector before launching
     // the namespace supervisor so the container's real stdout/stderr are the
     // collector's write ends. The collector and attach hub remain installed
@@ -180,6 +181,7 @@ pub fn run_detached(
             });
             spec.shared_netns = None;
             spec.shared_pidns = None;
+            spec.shared_ipcns = None;
             result
         };
         let attempt_elapsed = attempt_started.elapsed();
@@ -376,6 +378,17 @@ fn refresh_shared_namespaces(store: &Store, spec: &mut RunSpec) -> ZResult<()> {
         })?;
         let pidns = target.open_pid_namespace()?;
         spec.shared_pidns = Some(Arc::new(pidns));
+    }
+    if spec.namespaces.ipc == IpcMode::Container {
+        let target_id = spec
+            .ipc_container
+            .as_deref()
+            .ok_or_else(|| crate::zerr!("shared IPC namespace mode has no target container"))?;
+        let target = ContainerState::load(store, target_id).ok_or_else(|| {
+            crate::zerr!("IPC namespace target container {target_id} no longer exists")
+        })?;
+        let ipcns = target.open_ipc_namespace()?;
+        spec.shared_ipcns = Some(Arc::new(ipcns));
     }
     Ok(())
 }
@@ -1234,6 +1247,7 @@ mod attach_tests {
             net: "none".to_string(),
             namespaces: Default::default(),
             pid_container: None,
+            ipc_container: None,
             ports: Vec::new(),
             port_protocols: None,
             port_ips: None,

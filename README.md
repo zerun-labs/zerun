@@ -19,7 +19,8 @@ Milestone-based development status:
 - **M1 — isolation executor (done)**: namespace isolation (PID/MNT/UTS/IPC/NET/USER),
   corrected `pivot_root(".", ".")` sequence, container pseudo-filesystems, minimal `/dev`,
   masked/readonly paths, capability dropping, cgroups v2 (memory/cpu/pids/io), per-process
-  rlimits, namespaced `--sysctl` settings, rootful `--pid container:NAME|ID` sharing,
+  rlimits, namespaced `--sysctl` settings, rootful `--pid container:NAME|ID` and
+  `--ipc container:NAME|ID` sharing,
   optional
   built-in mini-init, and a reproducible benchmark harness.
 - **M2 — storage & security (done)**: deny-by-default seccomp allowlist; per-run OverlayFS
@@ -230,11 +231,12 @@ Run options (current subset):
 --pid private|host|container:TARGET
                      private PID namespace (default), share the host PID namespace, or
                      join a running detached container's PID namespace (rootful only)
---ipc private|none|host
+--ipc private|none|host|container:TARGET
                      private IPC and /dev/shm (default), a private IPC namespace
-                     without /dev/shm mounted, or the host IPC namespace
+                     without /dev/shm mounted, the host IPC namespace, or a running
+                     detached container's IPC namespace (rootful only)
 --uts private|host   private UTS namespace (default) or share the host hostname
-                     (host or container PID sharing and host IPC/UTS sharing are
+                     (host or container PID/IPC sharing and host UTS sharing are
                      security-sensitive; --hostname is incompatible with --uts host)
 -u, --user USER[:GROUP]
                      run as a container user (numeric or from the image's /etc/passwd;
@@ -339,6 +341,15 @@ subject to credentials and capabilities, signal each other. The kernel also kill
 PID namespace when its PID 1 exits, so a running joining container exits when its target exits and
 must be started again after the target is running.
 
+`--ipc container:TARGET` is rootful-only and resolves `TARGET` to the concrete ID of a currently
+running detached container. The joining container shares SysV IPC objects and other IPC-namespace
+state, but keeps its own `/dev/shm` mount and `--shm-size`, matching Docker's namespace-sharing
+semantics. A running joiner keeps its current IPC namespace if the target exits or restarts; each
+manual start or automatic retry reopens the persisted target ID and joins its then-current
+namespace, failing closed when the target is not running. `exec` joins the joining container's
+captured IPC namespace. IPC sharing is security-sensitive because both containers can observe and,
+subject to credentials and capabilities, operate on the same IPC objects.
+
 Cgroup flags bound aggregate container resource use. `--ulimit` additionally
 sets POSIX per-process limits; supported types match Docker (`core`, `cpu`,
 `data`, `fsize`, `locks`, `memlock`, `msgqueue`, `nice`, `nofile`, `nproc`,
@@ -364,7 +375,7 @@ service units retain the same launch policy.
 
 `--sysctl` accepts only settings scoped to a private container namespace.
 Network and IPC families are rejected with `--net host`, `--net container:...`,
-or `--ipc host`, and `kernel.domainname` is rejected with `--uts host`, so a
+`--ipc host`, or `--ipc container:...`, and `kernel.domainname` is rejected with `--uts host`, so a
 container option cannot silently mutate the host. Values are applied after
 bridge/loopback setup (which allows per-interface keys such as
 `net.ipv4.conf.eth0.*`) and before `/proc/sys` is remounted read-only for the

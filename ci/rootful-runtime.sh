@@ -330,6 +330,105 @@ grep -Fx ipc-none-ok <<<"$ipc_none_exec" >/dev/null
 "${zerun[@]}" wait "$ipc_none_id" >/dev/null
 "${zerun[@]}" rm "$ipc_none_id" >/dev/null
 
+# Shared IPC namespaces pin the target's namespace but keep each container's
+# private /dev/shm mount, matching Docker's --ipc=container semantics. A
+# running joiner stays in the old namespace when the target restarts; its next
+# start reopens the concrete target id and joins the target's new namespace.
+shared_ipc_target_name="ci-shared-ipc-$BASHPID"
+shared_ipc_target=$("${zerun[@]}" run -d --name "$shared_ipc_target_name" \
+  --rootfs "$rootfs" --net none --no-overlay --ipc private --init -- /bin/sleep 30)
+shared_ipc_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --net none --no-overlay \
+  --ipc "container:$shared_ipc_target_name" --init -- /bin/sleep 30)
+cleanup_ids+=("$shared_ipc_id" "$shared_ipc_target")
+shared_ipc_target_ns=$("${zerun[@]}" exec "$shared_ipc_target" \
+  /bin/busybox readlink /proc/self/ns/ipc)
+test "$("${zerun[@]}" exec "$shared_ipc_id" \
+  /bin/busybox readlink /proc/self/ns/ipc)" = "$shared_ipc_target_ns"
+shared_ipc_inspect=$("${zerun[@]}" inspect "$shared_ipc_id")
+grep -F '"ipc": "container"' <<<"$shared_ipc_inspect" >/dev/null
+grep -F "\"ipc_container\": \"$shared_ipc_target\"" \
+  <<<"$shared_ipc_inspect" >/dev/null
+grep -F "\"container:$shared_ipc_target\"" <<<"$shared_ipc_inspect" >/dev/null
+
+shared_ipc_shm="/dev/shm/zerun-shared-ipc-$BASHPID"
+"${zerun[@]}" exec "$shared_ipc_target" \
+  /bin/sh -c "printf target > '$shared_ipc_shm'" >/dev/null
+"${zerun[@]}" exec "$shared_ipc_id" /bin/sh -c \
+  "if test -e '$shared_ipc_shm'; then exit 1; fi" >/dev/null
+
+"${zerun[@]}" stop --time 2 "$shared_ipc_target" >/dev/null
+shared_ipc_join_inspect=$("${zerun[@]}" inspect "$shared_ipc_id")
+grep -F '"status": "running"' <<<"$shared_ipc_join_inspect" >/dev/null
+test "$("${zerun[@]}" exec "$shared_ipc_id" \
+  /bin/busybox readlink /proc/self/ns/ipc)" = "$shared_ipc_target_ns"
+set +e
+shared_ipc_stopped_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none \
+  --no-overlay --ipc "container:$shared_ipc_target_name" -- /bin/true 2>&1)
+shared_ipc_stopped_status=$?
+set -e
+test "$shared_ipc_stopped_status" -eq 1
+grep -F 'IPC namespace target' <<<"$shared_ipc_stopped_output" >/dev/null
+grep -F 'is not running' <<<"$shared_ipc_stopped_output" >/dev/null
+"${zerun[@]}" start "$shared_ipc_target" >/dev/null
+shared_ipc_target_ns_after_restart=$("${zerun[@]}" exec "$shared_ipc_target" \
+  /bin/busybox readlink /proc/self/ns/ipc)
+test "$shared_ipc_target_ns_after_restart" != "$shared_ipc_target_ns"
+test "$("${zerun[@]}" exec "$shared_ipc_id" \
+  /bin/busybox readlink /proc/self/ns/ipc)" = "$shared_ipc_target_ns"
+"${zerun[@]}" stop --time 2 "$shared_ipc_id" >/dev/null
+"${zerun[@]}" start "$shared_ipc_id" >/dev/null
+test "$("${zerun[@]}" exec "$shared_ipc_id" \
+  /bin/busybox readlink /proc/self/ns/ipc)" = "$shared_ipc_target_ns_after_restart"
+"${zerun[@]}" stop --time 2 "$shared_ipc_id" >/dev/null
+"${zerun[@]}" rm "$shared_ipc_id" >/dev/null
+"${zerun[@]}" stop --time 2 "$shared_ipc_target" >/dev/null
+"${zerun[@]}" rm "$shared_ipc_target" >/dev/null
+
+# Automatic retry must discard the launch-time IPC namespace descriptor and
+# reopen the persisted target id after the target itself restarts.
+auto_shared_ipc_target_name="ci-auto-shared-ipc-$BASHPID"
+auto_shared_ipc_target=$("${zerun[@]}" run -d --name "$auto_shared_ipc_target_name" \
+  --rootfs "$rootfs" --net none --no-overlay --init -- /bin/sleep 30)
+auto_shared_ipc_target_ns=$("${zerun[@]}" exec "$auto_shared_ipc_target" \
+  /bin/busybox readlink /proc/self/ns/ipc)
+auto_shared_ipc_id=$("${zerun[@]}" run -d --restart=on-failure:1 \
+  --rootfs "$rootfs" --ipc "container:$auto_shared_ipc_target_name" \
+  --init -- /bin/sh -c \
+  'if [ ! -e /shared-ipc-auto-retry ]; then /bin/busybox touch /shared-ipc-auto-retry; while [ ! -e /shared-ipc-auto-release ]; do /bin/sleep 0.1; done; exit 7; fi; /bin/sleep 30')
+cleanup_ids+=("$auto_shared_ipc_id" "$auto_shared_ipc_target")
+test "$("${zerun[@]}" exec "$auto_shared_ipc_id" \
+  /bin/busybox readlink /proc/self/ns/ipc)" = "$auto_shared_ipc_target_ns"
+"${zerun[@]}" stop --time 2 "$auto_shared_ipc_target" >/dev/null
+"${zerun[@]}" start "$auto_shared_ipc_target" >/dev/null
+auto_shared_ipc_target_ns_after_restart=$("${zerun[@]}" exec "$auto_shared_ipc_target" \
+  /bin/busybox readlink /proc/self/ns/ipc)
+test "$auto_shared_ipc_target_ns_after_restart" != "$auto_shared_ipc_target_ns"
+test "$("${zerun[@]}" exec "$auto_shared_ipc_id" \
+  /bin/busybox readlink /proc/self/ns/ipc)" = "$auto_shared_ipc_target_ns"
+"${zerun[@]}" exec "$auto_shared_ipc_id" \
+  /bin/busybox touch /shared-ipc-auto-release >/dev/null
+for attempt in $(seq 1 100); do
+  auto_shared_ipc_inspect=$("${zerun[@]}" inspect "$auto_shared_ipc_id")
+  if grep -F '"status": "running"' <<<"$auto_shared_ipc_inspect" >/dev/null &&
+      grep -F '"restart_count": 1' <<<"$auto_shared_ipc_inspect" >/dev/null; then
+    break
+  fi
+  if (( attempt == 100 )); then
+    echo "shared-IPC automatic retry did not start" >&2
+    printf '%s\n' "$auto_shared_ipc_inspect" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+test "$("${zerun[@]}" exec "$auto_shared_ipc_id" \
+  /bin/busybox readlink /proc/self/ns/ipc)" = "$auto_shared_ipc_target_ns_after_restart"
+grep -F '"restart_pending": false' <<<"$auto_shared_ipc_inspect" >/dev/null
+"${zerun[@]}" stop --time 2 "$auto_shared_ipc_id" >/dev/null
+"${zerun[@]}" rm "$auto_shared_ipc_id" >/dev/null
+"${zerun[@]}" stop --time 2 "$auto_shared_ipc_target" >/dev/null
+"${zerun[@]}" rm "$auto_shared_ipc_target" >/dev/null
+echo "rootful-shared-ipc-lifecycle-ok"
+
 # A host PID namespace has no kernel-wide kill boundary when its top-level
 # process exits. The runtime must act as a subreaper and reap every remaining
 # descendant before returning, or a background workload would escape to the

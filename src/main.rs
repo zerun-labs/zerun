@@ -166,6 +166,9 @@ struct RunArgs {
     /// Running container whose PID namespace is joined by `--pid
     /// container:NAME|ID`.
     pid_container: Option<String>,
+    /// Running container whose IPC namespace is joined by `--ipc
+    /// container:NAME|ID`.
+    ipc_container: Option<String>,
     /// Container user (`--user USER[:GROUP]`; image `config.User` wins when no
     /// explicit flag is given).
     user: Option<String>,
@@ -410,7 +413,9 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--ipc" => {
                 let value = next_value(args, &mut i, "--ipc")?;
-                a.namespaces.ipc = state::IpcMode::parse(&value)?;
+                let (mode, target) = state::IpcMode::parse("--ipc", &value)?;
+                a.namespaces.ipc = mode;
+                a.ipc_container = target;
             }
             "--uts" => {
                 let value = next_value(args, &mut i, "--uts")?;
@@ -853,7 +858,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 i += 1;
             }
             other if other.starts_with("--ipc=") => {
-                a.namespaces.ipc = state::IpcMode::parse(&other["--ipc=".len()..])?;
+                let value = &other["--ipc=".len()..];
+                let (mode, target) = state::IpcMode::parse("--ipc", value)?;
+                a.namespaces.ipc = mode;
+                a.ipc_container = target;
                 i += 1;
             }
             other if other.starts_with("--dns=") => {
@@ -1469,6 +1477,33 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
             );
             return 1;
         }
+        if a.namespaces.ipc != st.namespaces.ipc {
+            eprintln!(
+                "zerun run: persisted IPC namespace mode for container {} conflicts with its launch arguments",
+                display_name(st)
+            );
+            return 1;
+        }
+        if a.namespaces.ipc == state::IpcMode::Container {
+            let Some(target) = st
+                .ipc_container
+                .as_deref()
+                .filter(|target| !target.is_empty())
+            else {
+                eprintln!(
+                    "zerun run: persisted container {} does not identify its IPC namespace target",
+                    display_name(st)
+                );
+                return 1;
+            };
+            a.ipc_container = Some(target.to_string());
+        } else if a.ipc_container.is_some() {
+            eprintln!(
+                "zerun run: persisted IPC namespace target for container {} conflicts with its launch arguments",
+                display_name(st)
+            );
+            return 1;
+        }
     }
     if a.net == NetMode::Container {
         if euid != 0 {
@@ -1494,6 +1529,19 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         }
     } else if a.pid_container.is_some() {
         eprintln!("zerun run: internal PID target without --pid container");
+        return 2;
+    }
+    if a.namespaces.ipc == state::IpcMode::Container {
+        if euid != 0 {
+            eprintln!("zerun run: --ipc container requires a rootful runtime");
+            return 2;
+        }
+        if a.ipc_container.is_none() {
+            eprintln!("zerun run: --ipc container requires a target container");
+            return 2;
+        }
+    } else if a.ipc_container.is_some() {
+        eprintln!("zerun run: internal IPC target without --ipc container");
         return 2;
     }
     if let Err(error) = sysctl::validate_for_namespaces(&a.sysctls, a.namespaces, a.net) {
@@ -1686,6 +1734,24 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
             Ok((pidns, id)) => {
                 a.pid_container = Some(id.clone());
                 (Some(pidns), Some(id))
+            }
+            Err(error) => {
+                eprintln!("zerun run: {error}");
+                return 1;
+            }
+        }
+    } else {
+        (None, None)
+    };
+    let (shared_ipcns, ipc_container) = if a.namespaces.ipc == state::IpcMode::Container {
+        let target = a
+            .ipc_container
+            .as_deref()
+            .expect("container IPC target was validated");
+        match open_shared_ipc_namespace(&store, target) {
+            Ok((ipcns, id)) => {
+                a.ipc_container = Some(id.clone());
+                (Some(ipcns), Some(id))
             }
             Err(error) => {
                 eprintln!("zerun run: {error}");
@@ -2141,6 +2207,8 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         namespaces: a.namespaces,
         pid_container,
         shared_pidns,
+        ipc_container,
+        shared_ipcns,
         net: a.net,
         net_container,
         shared_netns,
@@ -2667,6 +2735,7 @@ fn run_detached(
         net: net_label(spec.net, spec.net_container.as_deref()),
         namespaces: spec.namespaces,
         pid_container: spec.pid_container.clone(),
+        ipc_container: spec.ipc_container.clone(),
         ports: Vec::new(),
         port_protocols: None,
         port_ips: None,
@@ -2719,6 +2788,7 @@ fn run_detached(
     st.net = net_label(spec.net, spec.net_container.as_deref());
     st.namespaces = spec.namespaces;
     st.pid_container = spec.pid_container.clone();
+    st.ipc_container = spec.ipc_container.clone();
     st.ports = spec.ports.iter().map(|p| (p.host, p.container)).collect();
     st.port_protocols = if spec.ports.is_empty() {
         None
@@ -2999,7 +3069,10 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
         args.extend(["--uts".to_string(), a.namespaces.uts.label().to_string()]);
     }
     if a.namespaces.ipc != state::IpcMode::Private {
-        args.extend(["--ipc".to_string(), a.namespaces.ipc.label().to_string()]);
+        args.extend([
+            "--ipc".to_string(),
+            ipc_label(a.namespaces.ipc, a.ipc_container.as_deref()),
+        ]);
     }
     if let Some(v) = &a.user {
         args.extend(["--user".to_string(), v.clone()]);
@@ -3503,6 +3576,19 @@ fn open_shared_pid_namespace(
     Ok((std::sync::Arc::new(pidns), target.id))
 }
 
+/// Open and pin the IPC namespace of a running container selected with
+/// `--ipc container:NAME|ID`.
+fn open_shared_ipc_namespace(
+    store: &Store,
+    reference: &str,
+) -> Result<(std::sync::Arc<std::os::fd::OwnedFd>, String), String> {
+    let target = resolve_running_shared_container(store, reference, "IPC namespace target")?;
+    let ipcns = target
+        .open_ipc_namespace()
+        .map_err(|error| format!("IPC namespace target {}: {error}", display_name(&target)))?;
+    Ok((std::sync::Arc::new(ipcns), target.id))
+}
+
 fn resolve_running_shared_container(
     store: &Store,
     reference: &str,
@@ -3524,6 +3610,14 @@ fn net_label(net: NetMode, container: Option<&str>) -> String {
         NetMode::Container => {
             format!("container:{}", container.expect("container network target"))
         }
+    }
+}
+
+fn ipc_label(ipc: state::IpcMode, container: Option<&str>) -> String {
+    if ipc == state::IpcMode::Container {
+        format!("container:{}", container.expect("container IPC target"))
+    } else {
+        ipc.label().to_string()
     }
 }
 
@@ -8138,9 +8232,10 @@ RUN OPTIONS:\n  \
   --pid private|host|container:TARGET\n  \
                       private PID namespace (default), share host PID, or join a\n  \
                       running detached container's PID namespace (rootful only)\n  \
-  --ipc private|none|host\n  \
-                      private IPC+shm (default), private IPC without /dev/shm, or\n  \
-                      share host IPC (sensitive)\n  \
+  --ipc private|none|host|container:TARGET\n  \
+                      private IPC+shm (default), private IPC without /dev/shm,\n  \
+                      share host IPC (sensitive), or join a running target's IPC\n  \
+                      namespace (rootful only; keeps this container's /dev/shm)\n  \
   --uts private|host  private UTS namespace (default) or share host name (sensitive)\n  \
   -u, --user USER[:GROUP]  run as container user (numeric or /etc/passwd name)\n  \
   --group-add NAME|GID     add a supplementary group (repeatable/comma-separated)\n  \
@@ -9314,6 +9409,18 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["--pid", "container:web"]));
 
+        let ipc_container = ["--ipc=container:web", "alpine", "true"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        let ipc_container = parse_run_args(&ipc_container).expect("--ipc container");
+        assert_eq!(ipc_container.namespaces.ipc, state::IpcMode::Container);
+        assert_eq!(ipc_container.ipc_container.as_deref(), Some("web"));
+        let launch = detached_launch_args(&ipc_container, Path::new("/tmp/rootfs"));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--ipc", "container:web"]));
+
         for value in ["--pid=container:", "--pid=container:web\n", "--pid=pod:web"] {
             let args = [value, "alpine", "true"]
                 .iter()
@@ -9322,7 +9429,13 @@ mod tests {
             assert!(parse_run_args(&args).is_err(), "{value:?} was accepted");
         }
 
-        for option in ["--pid=none", "--ipc=container:web", "--uts="] {
+        for option in [
+            "--pid=none",
+            "--ipc=container:",
+            "--ipc=container:web\n",
+            "--ipc=shareable",
+            "--uts=",
+        ] {
             let args = vec![option.to_string(), "alpine".to_string()];
             assert!(parse_run_args(&args).is_err(), "{option} should fail");
         }
