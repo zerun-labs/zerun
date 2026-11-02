@@ -19,7 +19,8 @@ Milestone-based development status:
 - **M1 — isolation executor (done)**: namespace isolation (PID/MNT/UTS/IPC/NET/USER),
   corrected `pivot_root(".", ".")` sequence, container pseudo-filesystems, minimal `/dev`,
   masked/readonly paths, capability dropping, cgroups v2 (memory/cpu/pids/io), per-process
-  rlimits, namespaced `--sysctl` settings, optional
+  rlimits, namespaced `--sysctl` settings, rootful `--pid container:NAME|ID` sharing,
+  optional
   built-in mini-init, and a reproducible benchmark harness.
 - **M2 — storage & security (done)**: deny-by-default seccomp allowlist; per-run OverlayFS
   with disk upper and automatic cleanup; OCI whiteout materialization; safe host bind-mount
@@ -72,8 +73,8 @@ concurrent name uniqueness across creation and rename,
 `commit`,
 bounded `events` replay, bridge/veth networking, TCP/UDP published-port proxies, translated
 published-port ranges, `--expose`/`-P` traffic, and service rendering that retains port
-bindings. A separate
-rootless smoke job creates a dedicated unprivileged runner account and verifies
+bindings. Shared PID namespace lifecycle and automatic target re-resolution are covered there as
+well. A separate rootless smoke job creates a dedicated unprivileged runner account and verifies
 user-namespace execution; static GNU and musl builds plus ARM64, ARMv7, and RISC-V64
 cross-builds are checked as well. Tagged releases are gated on both debug and release-profile
 source tests before artifacts are published.
@@ -226,13 +227,15 @@ Run options (current subset):
 --device-write-iops DEV:COUNT cgroup v2 io.max
 --ulimit TYPE=SOFT[:HARD]     per-process rlimit (repeatable; -1/unlimited)
 -h, --hostname H     container hostname (new UTS namespace)
---pid private|host   private PID namespace (default) or share the host PID namespace
+--pid private|host|container:TARGET
+                     private PID namespace (default), share the host PID namespace, or
+                     join a running detached container's PID namespace (rootful only)
 --ipc private|none|host
                      private IPC and /dev/shm (default), a private IPC namespace
                      without /dev/shm mounted, or the host IPC namespace
 --uts private|host   private UTS namespace (default) or share the host hostname
-                     (host PID/IPC/UTS sharing is security-sensitive; --hostname is
-                     incompatible with --uts host)
+                     (host or container PID sharing and host IPC/UTS sharing are
+                     security-sensitive; --hostname is incompatible with --uts host)
 -u, --user USER[:GROUP]
                      run as a container user (numeric or from the image's /etc/passwd;
                      image config USER applies automatically when --user is absent)
@@ -325,6 +328,16 @@ container stays in the namespace it joined; after the target restarts, restart t
 container to attach to the target's new namespace. Each launch requires the target to be running.
 Hostname, DNS, `/etc/hosts`, port publishing, and network `--sysctl` options are not accepted in
 this mode because they would mutate target-owned state.
+
+`--pid container:TARGET` is rootful-only and resolves `TARGET` to the concrete ID of a currently
+running detached container. The joining container keeps its other requested namespace choices, but
+its worker is created in the target's PID namespace. The resolved
+target ID is persisted; each `start` or automatic retry reopens that target's current PID namespace
+and fails closed if the target is not running. `exec` joins the joining container's captured PID
+namespace. PID namespace sharing is security-sensitive: processes in both containers can see and,
+subject to credentials and capabilities, signal each other. The kernel also kills every task in a
+PID namespace when its PID 1 exits, so a running joining container exits when its target exits and
+must be started again after the target is running.
 
 Cgroup flags bound aggregate container resource use. `--ulimit` additionally
 sets POSIX per-process limits; supported types match Docker (`core`, `cpu`,

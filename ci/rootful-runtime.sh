@@ -319,6 +319,99 @@ if [[ -e /proc/$host_orphan_pid ]]; then
   exit 1
 fi
 
+# A shared PID namespace must be pinned before the worker fork and re-entered
+# by exec. The concrete target ID is persisted just like shared networking,
+# but kernel semantics are stricter: when the target's PID 1 exits, every task
+# in its namespace is killed, including a running joiner.
+shared_pid_target_name="ci-shared-pid-$BASHPID"
+shared_pid_target=$("${zerun[@]}" run -d --name "$shared_pid_target_name" \
+  --rootfs "$rootfs" --net none --no-overlay --init -- /bin/sleep 30)
+shared_pid_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --net none --no-overlay \
+  --pid "container:$shared_pid_target_name" --init -- /bin/sleep 30)
+cleanup_ids+=("$shared_pid_id" "$shared_pid_target")
+shared_pid_target_ns=$("${zerun[@]}" exec "$shared_pid_target" \
+  /bin/busybox readlink /proc/self/ns/pid)
+test "$("${zerun[@]}" exec "$shared_pid_id" \
+  /bin/busybox readlink /proc/self/ns/pid)" = "$shared_pid_target_ns"
+shared_pid_inspect=$("${zerun[@]}" inspect "$shared_pid_id")
+grep -F '"pid": "container"' <<<"$shared_pid_inspect" >/dev/null
+grep -F "\"pid_container\": \"$shared_pid_target\"" \
+  <<<"$shared_pid_inspect" >/dev/null
+test "$(grep -Fc "container:$shared_pid_target" <<<"$shared_pid_inspect")" -ge 1
+
+# A joiner keeps its shared namespace across its own stop/start while the
+# target is alive. Once the target exits, the kernel kills the joiner, and a
+# later start must reopen the target's new PID namespace.
+"${zerun[@]}" stop --time 2 "$shared_pid_id" >/dev/null
+"${zerun[@]}" start "$shared_pid_id" >/dev/null
+test "$("${zerun[@]}" exec "$shared_pid_id" \
+  /bin/busybox readlink /proc/self/ns/pid)" = "$shared_pid_target_ns"
+"${zerun[@]}" stop --time 2 "$shared_pid_target" >/dev/null
+for attempt in $(seq 1 100); do
+  shared_pid_inspect=$("${zerun[@]}" inspect "$shared_pid_id")
+  if grep -F '"status": "exited"' <<<"$shared_pid_inspect" >/dev/null; then
+    break
+  fi
+  if (( attempt == 100 )); then
+    echo "shared-PID joiner survived its target namespace" >&2
+    printf '%s\n' "$shared_pid_inspect" >&2
+    exit 1
+  fi
+  sleep 0.05
+done
+"${zerun[@]}" start "$shared_pid_target" >/dev/null
+shared_pid_target_ns_after_restart=$("${zerun[@]}" exec "$shared_pid_target" \
+  /bin/busybox readlink /proc/self/ns/pid)
+"${zerun[@]}" start "$shared_pid_id" >/dev/null
+test "$("${zerun[@]}" exec "$shared_pid_id" \
+  /bin/busybox readlink /proc/self/ns/pid)" = "$shared_pid_target_ns_after_restart"
+"${zerun[@]}" stop --time 2 "$shared_pid_id" >/dev/null
+"${zerun[@]}" rm "$shared_pid_id" >/dev/null
+"${zerun[@]}" stop --time 2 "$shared_pid_target" >/dev/null
+"${zerun[@]}" rm "$shared_pid_target" >/dev/null
+
+# Automatic restart must discard the launch-time PID namespace descriptor and
+# reopen the persisted target ID. Restart the target while the reaper is in its
+# failure backoff, then require the retry to enter the target's new namespace.
+auto_shared_pid_target_name="ci-auto-shared-pid-$BASHPID"
+auto_shared_pid_target=$("${zerun[@]}" run -d --name "$auto_shared_pid_target_name" \
+  --rootfs "$rootfs" --net none --no-overlay --init -- /bin/sleep 30)
+auto_shared_pid_target_ns=$("${zerun[@]}" exec "$auto_shared_pid_target" \
+  /bin/busybox readlink /proc/self/ns/pid)
+auto_shared_pid_id=$("${zerun[@]}" run -d --restart=on-failure:5 \
+  --rootfs "$rootfs" --net none --no-overlay \
+  --pid "container:$auto_shared_pid_target_name" --init -- /bin/sleep 30)
+cleanup_ids+=("$auto_shared_pid_id" "$auto_shared_pid_target")
+test "$("${zerun[@]}" exec "$auto_shared_pid_id" \
+  /bin/busybox readlink /proc/self/ns/pid)" = "$auto_shared_pid_target_ns"
+"${zerun[@]}" stop --time 2 "$auto_shared_pid_target" >/dev/null
+"${zerun[@]}" start "$auto_shared_pid_target" >/dev/null
+auto_shared_pid_target_ns_after_restart=$("${zerun[@]}" exec "$auto_shared_pid_target" \
+  /bin/busybox readlink /proc/self/ns/pid)
+for attempt in $(seq 1 100); do
+  auto_shared_pid_inspect=$("${zerun[@]}" inspect "$auto_shared_pid_id")
+  auto_shared_pid_restart_count=$(sed -n \
+    's/^[[:space:]]*"restart_count": \([0-9][0-9]*\),$/\1/p' \
+    <<<"$auto_shared_pid_inspect")
+  if grep -F '"status": "running"' <<<"$auto_shared_pid_inspect" >/dev/null &&
+      [[ ${auto_shared_pid_restart_count:-0} -gt 0 ]]; then
+    break
+  fi
+  if (( attempt == 100 )); then
+    echo "shared-PID automatic retry did not start" >&2
+    printf '%s\n' "$auto_shared_pid_inspect" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+test "$("${zerun[@]}" exec "$auto_shared_pid_id" \
+  /bin/busybox readlink /proc/self/ns/pid)" = "$auto_shared_pid_target_ns_after_restart"
+"${zerun[@]}" stop --time 2 "$auto_shared_pid_id" >/dev/null
+"${zerun[@]}" rm "$auto_shared_pid_id" >/dev/null
+"${zerun[@]}" stop --time 2 "$auto_shared_pid_target" >/dev/null
+"${zerun[@]}" rm "$auto_shared_pid_target" >/dev/null
+echo "rootful-shared-pid-lifecycle-ok"
+
 # A supervisor such as systemd stops a foreground run with SIGTERM. The parent
 # must translate that request into the resolved image/operator stop signal.
 foreground_stop_log=$(mktemp)

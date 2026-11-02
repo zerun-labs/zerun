@@ -163,6 +163,9 @@ struct RunArgs {
     hostname: Option<String>,
     /// PID/IPC/UTS namespace sharing selected for this run.
     namespaces: state::NamespaceModes,
+    /// Running container whose PID namespace is joined by `--pid
+    /// container:NAME|ID`.
+    pid_container: Option<String>,
     /// Container user (`--user USER[:GROUP]`; image `config.User` wins when no
     /// explicit flag is given).
     user: Option<String>,
@@ -401,7 +404,9 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--pid" => {
                 let value = next_value(args, &mut i, "--pid")?;
-                a.namespaces.pid = state::NamespaceMode::parse("--pid", &value)?;
+                let (mode, target) = state::PidMode::parse("--pid", &value)?;
+                a.namespaces.pid = mode;
+                a.pid_container = target;
             }
             "--ipc" => {
                 let value = next_value(args, &mut i, "--ipc")?;
@@ -842,7 +847,9 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 i += 1;
             }
             other if other.starts_with("--pid=") => {
-                a.namespaces.pid = state::NamespaceMode::parse("--pid", &other["--pid=".len()..])?;
+                let (mode, target) = state::PidMode::parse("--pid", &other["--pid=".len()..])?;
+                a.namespaces.pid = mode;
+                a.pid_container = target;
                 i += 1;
             }
             other if other.starts_with("--ipc=") => {
@@ -1432,6 +1439,33 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
             }
             _ => {}
         }
+        if a.namespaces.pid != st.namespaces.pid {
+            eprintln!(
+                "zerun run: persisted PID namespace mode for container {} conflicts with its launch arguments",
+                display_name(st)
+            );
+            return 1;
+        }
+        if a.namespaces.pid == state::PidMode::Container {
+            let Some(target) = st
+                .pid_container
+                .as_deref()
+                .filter(|target| !target.is_empty())
+            else {
+                eprintln!(
+                    "zerun run: persisted container {} does not identify its PID namespace target",
+                    display_name(st)
+                );
+                return 1;
+            };
+            a.pid_container = Some(target.to_string());
+        } else if a.pid_container.is_some() {
+            eprintln!(
+                "zerun run: persisted PID namespace target for container {} conflicts with its launch arguments",
+                display_name(st)
+            );
+            return 1;
+        }
     }
     if a.net == NetMode::Container {
         if euid != 0 {
@@ -1444,6 +1478,19 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         }
     } else if a.net_container.is_some() {
         eprintln!("zerun run: internal network target without --net container");
+        return 2;
+    }
+    if a.namespaces.pid == state::PidMode::Container {
+        if euid != 0 {
+            eprintln!("zerun run: --pid container requires a rootful runtime");
+            return 2;
+        }
+        if a.pid_container.is_none() {
+            eprintln!("zerun run: --pid container requires a target container");
+            return 2;
+        }
+    } else if a.pid_container.is_some() {
+        eprintln!("zerun run: internal PID target without --pid container");
         return 2;
     }
     if let Err(error) = sysctl::validate_for_namespaces(&a.sysctls, a.namespaces, a.net) {
@@ -1626,6 +1673,24 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         }
     } else {
         (None, None, None)
+    };
+    let (shared_pidns, pid_container) = if a.namespaces.pid == state::PidMode::Container {
+        let target = a
+            .pid_container
+            .as_deref()
+            .expect("container PID target was validated");
+        match open_shared_pid_namespace(&store, target) {
+            Ok((pidns, id)) => {
+                a.pid_container = Some(id.clone());
+                (Some(pidns), Some(id))
+            }
+            Err(error) => {
+                eprintln!("zerun run: {error}");
+                return 1;
+            }
+        }
+    } else {
+        (None, None)
     };
 
     // Protect image lookup/pull until a rootfs-scoped lease is established.
@@ -2071,6 +2136,8 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         argv,
         hostname: effective_hostname,
         namespaces: a.namespaces,
+        pid_container,
+        shared_pidns,
         net: a.net,
         net_container,
         shared_netns,
@@ -2587,6 +2654,7 @@ fn run_detached(
         rootless: syscalls::effective_uid() != 0,
         net: net_label(spec.net, spec.net_container.as_deref()),
         namespaces: spec.namespaces,
+        pid_container: spec.pid_container.clone(),
         ports: Vec::new(),
         port_protocols: None,
         port_ips: None,
@@ -2638,6 +2706,7 @@ fn run_detached(
     st.rootless = syscalls::effective_uid() != 0;
     st.net = net_label(spec.net, spec.net_container.as_deref());
     st.namespaces = spec.namespaces;
+    st.pid_container = spec.pid_container.clone();
     st.ports = spec.ports.iter().map(|p| (p.host, p.container)).collect();
     st.port_protocols = if spec.ports.is_empty() {
         None
@@ -2901,10 +2970,21 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     if let Some(v) = &a.hostname {
         args.extend(["--hostname".to_string(), v.clone()]);
     }
-    for (flag, mode) in [("--pid", a.namespaces.pid), ("--uts", a.namespaces.uts)] {
-        if mode == state::NamespaceMode::Host {
-            args.extend([flag.to_string(), mode.label().to_string()]);
-        }
+    match a.namespaces.pid {
+        state::PidMode::Private => {}
+        state::PidMode::Host => args.extend(["--pid".to_string(), "host".to_string()]),
+        state::PidMode::Container => args.extend([
+            "--pid".to_string(),
+            format!(
+                "container:{}",
+                a.pid_container
+                    .as_deref()
+                    .expect("container PID target was validated")
+            ),
+        ]),
+    }
+    if a.namespaces.uts == state::NamespaceMode::Host {
+        args.extend(["--uts".to_string(), a.namespaces.uts.label().to_string()]);
     }
     if a.namespaces.ipc != state::IpcMode::Private {
         args.extend(["--ipc".to_string(), a.namespaces.ipc.label().to_string()]);
@@ -3391,18 +3471,37 @@ fn open_shared_network_namespace(
     ),
     String,
 > {
-    let mut target = state::resolve(store, reference)?;
-    reconcile_stale_state(store, &mut target)?;
-    if target.status != state::Status::Running || !target.pid_alive() {
-        return Err(format!(
-            "network target {} is not running",
-            display_name(&target)
-        ));
-    }
+    let target = resolve_running_shared_container(store, reference, "network target")?;
     let netns = target
         .open_network_namespace()
         .map_err(|error| format!("network target {}: {error}", display_name(&target)))?;
     Ok((std::sync::Arc::new(netns), target.id, target.ip))
+}
+
+/// Open and pin the PID namespace of a running container selected with
+/// `--pid container:NAME|ID`.
+fn open_shared_pid_namespace(
+    store: &Store,
+    reference: &str,
+) -> Result<(std::sync::Arc<std::os::fd::OwnedFd>, String), String> {
+    let target = resolve_running_shared_container(store, reference, "PID namespace target")?;
+    let pidns = target
+        .open_pid_namespace()
+        .map_err(|error| format!("PID namespace target {}: {error}", display_name(&target)))?;
+    Ok((std::sync::Arc::new(pidns), target.id))
+}
+
+fn resolve_running_shared_container(
+    store: &Store,
+    reference: &str,
+    role: &str,
+) -> Result<state::ContainerState, String> {
+    let mut target = state::resolve(store, reference)?;
+    reconcile_stale_state(store, &mut target)?;
+    if target.status != state::Status::Running || !target.pid_alive() {
+        return Err(format!("{role} {} is not running", display_name(&target)));
+    }
+    Ok(target)
 }
 
 fn net_label(net: NetMode, container: Option<&str>) -> String {
@@ -7958,7 +8057,9 @@ RUN OPTIONS:\n  \
   --ulimit TYPE=SOFT[:HARD]      per-process rlimit (repeatable; -1 = unlimited)\n  \
   -h, --hostname H    container hostname (new UTS namespace)\n  \
   --cidfile FILE      write the container id to FILE without overwriting it\n  \
-  --pid private|host  private PID namespace (default) or share host PID (sensitive)\n  \
+  --pid private|host|container:TARGET\n  \
+                      private PID namespace (default), share host PID, or join a\n  \
+                      running detached container's PID namespace (rootful only)\n  \
   --ipc private|none|host\n  \
                       private IPC+shm (default), private IPC without /dev/shm, or\n  \
                       share host IPC (sensitive)\n  \
@@ -9106,7 +9207,7 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         let a = parse_run_args(&args).expect("namespace modes");
-        assert_eq!(a.namespaces.pid, state::NamespaceMode::Host);
+        assert_eq!(a.namespaces.pid, state::PidMode::Host);
         assert_eq!(a.namespaces.ipc, state::IpcMode::Host);
         assert_eq!(a.namespaces.uts, state::NamespaceMode::Private);
         let launch = detached_launch_args(&a, Path::new("/tmp/rootfs"));
@@ -9123,12 +9224,27 @@ mod tests {
         let launch = detached_launch_args(&ipc_none, Path::new("/tmp/rootfs"));
         assert!(launch.windows(2).any(|pair| pair == ["--ipc", "none"]));
 
-        for option in [
-            "--pid=container:web",
-            "--pid=none",
-            "--ipc=container:web",
-            "--uts=",
-        ] {
+        let pid_container = ["--pid=container:web", "alpine", "true"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        let pid_container = parse_run_args(&pid_container).expect("--pid container");
+        assert_eq!(pid_container.namespaces.pid, state::PidMode::Container);
+        assert_eq!(pid_container.pid_container.as_deref(), Some("web"));
+        let launch = detached_launch_args(&pid_container, Path::new("/tmp/rootfs"));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--pid", "container:web"]));
+
+        for value in ["--pid=container:", "--pid=container:web\n", "--pid=pod:web"] {
+            let args = [value, "alpine", "true"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>();
+            assert!(parse_run_args(&args).is_err(), "{value:?} was accepted");
+        }
+
+        for option in ["--pid=none", "--ipc=container:web", "--uts="] {
             let args = vec![option.to_string(), "alpine".to_string()];
             assert!(parse_run_args(&args).is_err(), "{option} should fail");
         }

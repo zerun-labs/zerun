@@ -565,7 +565,7 @@ fn namespace_flags(
     modes: crate::state::NamespaceModes,
     net: &str,
 ) -> ZResult<(Option<libc::c_int>, libc::c_int)> {
-    use crate::state::{IpcMode, NamespaceMode};
+    use crate::state::{IpcMode, NamespaceMode, PidMode};
 
     let user = rootless.then_some(libc::CLONE_NEWUSER);
     let mut rest = libc::CLONE_NEWNS | libc::CLONE_NEWCGROUP;
@@ -591,7 +591,7 @@ fn namespace_flags(
             ))
         }
     }
-    if matches!(modes.pid, NamespaceMode::Private) {
+    if matches!(modes.pid, PidMode::Private | PidMode::Container) {
         rest |= libc::CLONE_NEWPID;
     }
     Ok((user, rest))
@@ -860,7 +860,7 @@ fn upsert(env: &mut Vec<(String, String)>, key: &str, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::{join_cgroup, namespace_flags, open_cgroup_procs, read_capture, read_exec_pid};
-    use crate::state::{NamespaceMode, NamespaceModes};
+    use crate::state::{NamespaceMode, NamespaceModes, PidMode};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -891,7 +891,7 @@ mod tests {
     #[test]
     fn host_shared_namespaces_are_not_rejoined_by_exec() {
         let modes = NamespaceModes {
-            pid: NamespaceMode::Host,
+            pid: PidMode::Host,
             ipc: crate::state::IpcMode::Host,
             uts: NamespaceMode::Host,
         };
@@ -902,6 +902,16 @@ mod tests {
         assert_eq!(flags & libc::CLONE_NEWNET, 0);
         assert_ne!(flags & libc::CLONE_NEWNS, 0);
         assert_ne!(flags & libc::CLONE_NEWCGROUP, 0);
+    }
+
+    #[test]
+    fn shared_container_pid_namespace_is_rejoined_by_exec() {
+        let modes = NamespaceModes {
+            pid: PidMode::Container,
+            ..NamespaceModes::default()
+        };
+        let (_, flags) = namespace_flags(false, modes, "none").unwrap();
+        assert_ne!(flags & libc::CLONE_NEWPID, 0);
     }
 
     #[test]

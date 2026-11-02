@@ -27,7 +27,7 @@ use crate::mounts::{
 use crate::pty::PtyPair;
 use crate::seccomp::SeccompMode;
 use crate::security;
-use crate::state::{ContainerMetrics, IpcMode, NamespaceMode, NamespaceModes};
+use crate::state::{ContainerMetrics, IpcMode, NamespaceMode, NamespaceModes, PidMode};
 use crate::syscalls;
 use crate::trace;
 use std::collections::BTreeMap;
@@ -58,6 +58,12 @@ pub struct RunSpec {
     pub hostname: Option<String>,
     /// PID/IPC/UTS namespace sharing for this container.
     pub namespaces: NamespaceModes,
+    /// Source container id for `PidMode::Container`; persisted in state and
+    /// used only in diagnostics after the namespace was opened.
+    pub pid_container: Option<String>,
+    /// Pinned PID namespace for `PidMode::Container`. `setns` affects the
+    /// supervisor's next child, so it must be installed before forking.
+    pub shared_pidns: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
     pub net: NetMode,
     /// Source container id for `NetMode::Container`; persisted in state and
     /// used only in diagnostics after the namespace was opened.
@@ -204,11 +210,12 @@ where
         || spec.limits.pids.is_some()
         || spec.limits.oom_group
         || !spec.limits.io.is_empty();
-    // Host PID sharing has no namespace-wide kill boundary. Keep a cgroup
-    // where possible so runtime teardown and crash reconciliation can terminate
-    // exec workers and other processes that did not descend from the workload.
+    // Host PID sharing has no namespace-wide kill boundary of its own, and a
+    // container-shared PID namespace belongs to another container. Keep a
+    // cgroup where possible so teardown and crash reconciliation can terminate
+    // exec workers and descendants that did not descend from the workload.
     let needs_lifecycle_cgroup =
-        spec.lifecycle_cgroup || matches!(spec.namespaces.pid, NamespaceMode::Host);
+        spec.lifecycle_cgroup || matches!(spec.namespaces.pid, PidMode::Host | PidMode::Container);
     let needs_mandatory_cgroup = has_limits || needs_device_policy;
     let mut cg = if needs_mandatory_cgroup {
         Some(CgroupV2::create(&spec.id, &spec.limits)?)
@@ -282,9 +289,12 @@ where
             }
             NetMode::None | NetMode::Host => {}
         }
+        if spec.namespaces.pid == PidMode::Container {
+            return Err(crate::zerr!("--pid container requires a rootful runtime"));
+        }
     }
     let flags = namespace_flags(rootless, spec.namespaces, spec.net);
-    if matches!(spec.namespaces.pid, NamespaceMode::Host) {
+    if matches!(spec.namespaces.pid, PidMode::Host) {
         // In a private PID namespace, killing the namespace init kills every
         // remaining task. With --pid host there is no such kernel boundary, so
         // make this runtime a subreaper and explicitly sweep descendants after
@@ -660,7 +670,7 @@ where
 /// creates the namespace but does not move the caller into it.
 fn namespace_flags(rootless: bool, namespaces: NamespaceModes, net: NetMode) -> libc::c_int {
     let mut flags = libc::CLONE_NEWNS | libc::CLONE_NEWCGROUP;
-    if matches!(namespaces.pid, NamespaceMode::Private) {
+    if matches!(namespaces.pid, PidMode::Private) {
         flags |= libc::CLONE_NEWPID;
     }
     if matches!(namespaces.uts, NamespaceMode::Private) {
@@ -684,7 +694,7 @@ fn namespace_flags(rootless: bool, namespaces: NamespaceModes, net: NetMode) -> 
 /// descendants as direct children. Private PID namespaces do not need this
 /// sweep: the kernel kills every task when namespace init exits.
 fn reap_host_pid_descendants(namespaces: NamespaceModes) {
-    if !matches!(namespaces.pid, NamespaceMode::Host) {
+    if !matches!(namespaces.pid, PidMode::Host) {
         return;
     }
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -892,6 +902,11 @@ fn supervisor_main(
     }
     if let Some(netns) = spec.shared_netns.take() {
         if let Err(error) = syscalls::setns(netns.as_raw_fd(), libc::CLONE_NEWNET) {
+            supervisor_fail(status_w, &error);
+        }
+    }
+    if let Some(pidns) = spec.shared_pidns.take() {
+        if let Err(error) = syscalls::setns(pidns.as_raw_fd(), libc::CLONE_NEWPID) {
             supervisor_fail(status_w, &error);
         }
     }
@@ -1472,7 +1487,7 @@ mod tests {
     #[test]
     fn namespace_flags_honor_host_namespace_modes() {
         let modes = NamespaceModes {
-            pid: NamespaceMode::Host,
+            pid: PidMode::Host,
             ipc: IpcMode::Host,
             uts: NamespaceMode::Host,
         };
@@ -1496,6 +1511,18 @@ mod tests {
         assert_eq!(flags & libc::CLONE_NEWNET, 0);
         assert_ne!(flags & libc::CLONE_NEWNS, 0);
         assert_ne!(flags & libc::CLONE_NEWPID, 0);
+    }
+
+    #[test]
+    fn namespace_flags_join_an_existing_pid_namespace() {
+        let modes = NamespaceModes {
+            pid: PidMode::Container,
+            ..NamespaceModes::default()
+        };
+        let flags = namespace_flags(false, modes, NetMode::None);
+        assert_eq!(flags & libc::CLONE_NEWPID, 0);
+        assert_ne!(flags & libc::CLONE_NEWNS, 0);
+        assert_ne!(flags & libc::CLONE_NEWNET, 0);
     }
 
     #[test]

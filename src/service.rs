@@ -118,11 +118,25 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         run_args.push("--hostname".into());
         run_args.push(v.clone());
     }
-    for (flag, mode) in [("--pid", a.namespaces.pid), ("--uts", a.namespaces.uts)] {
-        if mode == crate::state::NamespaceMode::Host {
-            run_args.push(flag.into());
-            run_args.push(mode.label().into());
+    match a.namespaces.pid {
+        crate::state::PidMode::Private => {}
+        crate::state::PidMode::Host => {
+            run_args.push("--pid".into());
+            run_args.push("host".into());
         }
+        crate::state::PidMode::Container => {
+            run_args.push("--pid".into());
+            run_args.push(format!(
+                "container:{}",
+                a.pid_container
+                    .as_deref()
+                    .expect("container PID target was validated")
+            ));
+        }
+    }
+    if a.namespaces.uts == crate::state::NamespaceMode::Host {
+        run_args.push("--uts".into());
+        run_args.push(a.namespaces.uts.label().into());
     }
     if a.namespaces.ipc != crate::state::IpcMode::Private {
         run_args.push("--ipc".into());
@@ -424,6 +438,15 @@ fn validate(a: &RunArgs, rootful: bool) -> Result<(), String> {
     if a.hostname.is_some() && effective_net == NetMode::Container {
         return Err("--hostname cannot be used with --net container".into());
     }
+    if a.namespaces.pid == crate::state::PidMode::Container && !rootful {
+        return Err("--pid container requires a rootful runtime".into());
+    }
+    if a.namespaces.pid == crate::state::PidMode::Container && a.pid_container.is_none() {
+        return Err("--pid container requires a target container".into());
+    }
+    if a.namespaces.pid != crate::state::PidMode::Container && a.pid_container.is_some() {
+        return Err("container PID target requires --pid container".into());
+    }
     crate::network::resolve_host_aliases(
         &a.add_hosts,
         (effective_net == NetMode::Bridge).then_some(crate::network::GATEWAY_IP),
@@ -636,6 +659,26 @@ mod tests {
         mismatch.net_container = Some("web".to_string());
         let error = render(Path::new("/usr/local/bin/zerun"), &mismatch, true).unwrap_err();
         assert!(error.contains("requires --net container"));
+    }
+
+    #[test]
+    fn renders_and_validates_shared_pid_namespace() {
+        let a = args(&["--pid", "container:web", "alpine", "true"]);
+        let unit = render(Path::new("/usr/local/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains("--pid container:web"));
+
+        let error = render(Path::new("/usr/local/bin/zerun"), &a, false).unwrap_err();
+        assert!(error.contains("requires a rootful runtime"));
+
+        let mut missing_target = args(&["--pid", "container:web", "alpine", "true"]);
+        missing_target.pid_container = None;
+        let error = render(Path::new("/usr/local/bin/zerun"), &missing_target, true).unwrap_err();
+        assert!(error.contains("requires a target container"));
+
+        let mut mismatch = args(&["--pid", "private", "alpine", "true"]);
+        mismatch.pid_container = Some("web".to_string());
+        let error = render(Path::new("/usr/local/bin/zerun"), &mismatch, true).unwrap_err();
+        assert!(error.contains("requires --pid container"));
     }
 
     #[test]

@@ -33,11 +33,7 @@ fn default_stop_timeout() -> u64 {
     DEFAULT_STOP_TIMEOUT_SECS
 }
 
-/// Namespace-sharing mode for the PID and UTS namespaces.
-///
-/// The mount, network, cgroup, and user namespaces are still selected by their
-/// own runtime options. These modes share a simple persisted shape so
-/// `run`, restart, and `exec` make the same namespace decisions.
+/// Namespace-sharing mode for the UTS namespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NamespaceMode {
@@ -49,7 +45,7 @@ pub enum NamespaceMode {
 }
 
 impl NamespaceMode {
-    /// Parse a Docker-style `--pid` or `--uts` value.
+    /// Parse a Docker-style `--uts` value.
     pub fn parse(option: &str, value: &str) -> Result<Self, String> {
         match value {
             "private" => Ok(Self::Private),
@@ -62,6 +58,52 @@ impl NamespaceMode {
         match self {
             Self::Private => "private",
             Self::Host => "host",
+        }
+    }
+}
+
+/// PID namespace mode for one container.
+///
+/// `container` joins another running container's PID namespace. The concrete
+/// target id is persisted separately so a restart cannot silently follow a
+/// reused name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PidMode {
+    /// Create a fresh PID namespace for this container.
+    #[default]
+    Private,
+    /// Join the runtime's (host) PID namespace.
+    Host,
+    /// Join another container's PID namespace.
+    Container,
+}
+
+impl PidMode {
+    /// Parse a Docker-style `--pid` value and return the target reference for
+    /// `container:` mode.
+    pub fn parse(option: &str, value: &str) -> Result<(Self, Option<String>), String> {
+        match value {
+            "private" => Ok((Self::Private, None)),
+            "host" => Ok((Self::Host, None)),
+            other => {
+                let Some(target) = other.strip_prefix("container:") else {
+                    return Err(format!(
+                        "invalid {option} value '{other}' (private|host|container:<id|name>)"
+                    ));
+                };
+                if target.is_empty() {
+                    return Err(format!(
+                        "invalid {option} value '{other}': container target cannot be empty"
+                    ));
+                }
+                if target.chars().any(char::is_control) {
+                    return Err(format!(
+                        "invalid {option} value '{other}': container target contains control characters"
+                    ));
+                }
+                Ok((Self::Container, Some(target.to_string())))
+            }
         }
     }
 }
@@ -108,7 +150,7 @@ impl IpcMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NamespaceModes {
-    pub pid: NamespaceMode,
+    pub pid: PidMode,
     pub ipc: IpcMode,
     pub uts: NamespaceMode,
 }
@@ -444,11 +486,14 @@ pub struct ContainerState {
     pub started: Option<String>,
     pub finished: Option<String>,
     pub rootless: bool,
-    /// "none" | "host" | "bridge".
+    /// "none" | "host" | "bridge" | "container:<id>".
     pub net: String,
     /// PID/IPC/UTS namespace modes. Older records default to all-private.
     #[serde(default)]
     pub namespaces: NamespaceModes,
+    /// Concrete target id for `namespaces.pid == container`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_container: Option<String>,
     /// Published ports (host, container).
     pub ports: Vec<(u16, u16)>,
     /// Transport for each port (`tcp`/`udp`). Older records are TCP.
@@ -660,12 +705,23 @@ impl ContainerState {
 
     /// Pin the recorded process's network namespace for a container that
     /// shares it with `--net container`.
+    pub fn open_network_namespace(&self) -> ZResult<std::os::fd::OwnedFd> {
+        self.open_namespace("net", "network")
+    }
+
+    /// Pin the recorded process's PID namespace for a container that shares it
+    /// with `--pid container`.
+    pub fn open_pid_namespace(&self) -> ZResult<std::os::fd::OwnedFd> {
+        self.open_namespace("pid", "PID")
+    }
+
+    /// Open a namespace under `/proc/<pid>/ns`.
     ///
     /// A bare PID is insufficient because the target may exit and the PID may
-    /// be reused while the caller is opening `/proc/<pid>/ns/net`. New records
-    /// therefore must carry a start time, which is checked both before and
-    /// after opening the descriptor.
-    pub fn open_network_namespace(&self) -> ZResult<std::os::fd::OwnedFd> {
+    /// be reused while the caller is opening the namespace descriptor. New
+    /// records therefore must carry a start time, which is checked both before
+    /// and after opening the descriptor.
+    fn open_namespace(&self, namespace: &str, label: &str) -> ZResult<std::os::fd::OwnedFd> {
         if self.status != Status::Running {
             return Err(crate::zerr!(
                 "container {} is not running (status {})",
@@ -679,7 +735,7 @@ impl ContainerState {
             .ok_or_else(|| crate::zerr!("container {} has no live PID", self.id))?;
         let start_time = self.pid_start_time.ok_or_else(|| {
             crate::zerr!(
-                "container {} has no recorded process start time; cannot safely pin its network namespace",
+                "container {} has no recorded process start time; cannot safely pin its {label} namespace",
                 self.id
             )
         })?;
@@ -689,12 +745,12 @@ impl ContainerState {
                 self.id
             ));
         }
-        let path = PathBuf::from(format!("/proc/{pid}/ns/net"));
+        let path = PathBuf::from(format!("/proc/{pid}/ns/{namespace}"));
         let file = File::open(&path)
-            .map_err(|error| crate::zerr!("open network namespace {}: {error}", path.display()))?;
+            .map_err(|error| crate::zerr!("open {label} namespace {}: {error}", path.display()))?;
         if crate::procinfo::process_start_time(pid) != Some(start_time) {
             return Err(crate::zerr!(
-                "container {} exited while its network namespace was being opened",
+                "container {} exited while its {label} namespace was being opened",
                 self.id
             ));
         }
@@ -881,6 +937,7 @@ mod tests {
             rootless: false,
             net: "none".to_string(),
             namespaces: Default::default(),
+            pid_container: None,
             ports: Vec::new(),
             port_protocols: None,
             port_ips: None,
@@ -943,17 +1000,32 @@ mod tests {
         assert!(state.sysctls.is_empty());
         assert!(state.exposed_ports.is_empty());
         assert_eq!(state.namespaces, NamespaceModes::default());
+        assert_eq!(state.pid_container, None);
     }
 
     #[test]
     fn namespace_modes_round_trip_through_state_json() {
         let modes = NamespaceModes {
-            pid: NamespaceMode::Host,
+            pid: PidMode::Host,
             ipc: IpcMode::Host,
             uts: NamespaceMode::Private,
         };
         let json = serde_json::to_string(&modes).unwrap();
         assert_eq!(json, r#"{"pid":"host","ipc":"host","uts":"private"}"#);
+        assert_eq!(
+            serde_json::from_str::<NamespaceModes>(&json).unwrap(),
+            modes
+        );
+
+        let modes = NamespaceModes {
+            pid: PidMode::Container,
+            ..NamespaceModes::default()
+        };
+        let json = serde_json::to_string(&modes).unwrap();
+        assert_eq!(
+            json,
+            r#"{"pid":"container","ipc":"private","uts":"private"}"#
+        );
         assert_eq!(
             serde_json::from_str::<NamespaceModes>(&json).unwrap(),
             modes
@@ -969,6 +1041,25 @@ mod tests {
             serde_json::from_str::<NamespaceModes>(&json).unwrap(),
             modes
         );
+    }
+
+    #[test]
+    fn pid_mode_parsing_requires_a_concrete_container_target() {
+        assert_eq!(
+            PidMode::parse("--pid", "private"),
+            Ok((PidMode::Private, None))
+        );
+        assert_eq!(PidMode::parse("--pid", "host"), Ok((PidMode::Host, None)));
+        assert_eq!(
+            PidMode::parse("--pid", "container:web"),
+            Ok((PidMode::Container, Some("web".to_string())))
+        );
+        for value in ["container:", "none", "pod:web", "container:web\n"] {
+            assert!(
+                PidMode::parse("--pid", value).is_err(),
+                "{value:?} was accepted"
+            );
+        }
     }
 
     #[test]
@@ -1037,6 +1128,7 @@ mod tests {
             rootless: false,
             net: "none".to_string(),
             namespaces: Default::default(),
+            pid_container: None,
             ports: vec![],
             port_protocols: None,
             port_ips: None,
@@ -1077,6 +1169,8 @@ mod tests {
         assert!(state.pid_alive());
         let netns = state.open_network_namespace().unwrap();
         assert!(netns.as_raw_fd() >= 0);
+        let pidns = state.open_pid_namespace().unwrap();
+        assert!(pidns.as_raw_fd() >= 0);
         let mut legacy_identity = state.clone();
         legacy_identity.pid_start_time = None;
         assert!(legacy_identity.open_network_namespace().is_err());
@@ -1147,6 +1241,7 @@ mod tests {
             rootless: false,
             net: "none".to_string(),
             namespaces: Default::default(),
+            pid_container: None,
             ports: vec![],
             port_protocols: None,
             port_ips: None,

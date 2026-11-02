@@ -171,6 +171,7 @@ mod tests {
             rootless: false,
             net: "none".to_string(),
             namespaces: Default::default(),
+            pid_container: None,
             ports: vec![],
             port_protocols: None,
             port_ips: None,

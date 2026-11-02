@@ -19,6 +19,7 @@ use crate::error::ZResult;
 use crate::fsutil;
 use crate::logs::LogOptions;
 use crate::namespace::{run_container_with_report, NetMode, RunSpec};
+use crate::state::PidMode;
 use crate::state::{self, ContainerState, Status};
 use crate::store::{ContainerFs, Store};
 use std::fs::{File, OpenOptions};
@@ -111,6 +112,7 @@ pub fn run_detached(
     // in the long-lived reaper would pin a stale namespace across target
     // restarts or removal.
     drop(spec.shared_netns.take());
+    drop(spec.shared_pidns.take());
     // Replace inherited stdio with a timestamping collector before launching
     // the namespace supervisor so the container's real stdout/stderr are the
     // collector's write ends. The collector and attach hub remain installed
@@ -154,7 +156,7 @@ pub fn run_detached(
         // started hook, it remains held for the next terminal-state write.
         let mut start_lock = held_restart_lock.take();
         code = 1;
-        let launch = refresh_shared_network_namespace(&store, &mut spec);
+        let launch = refresh_shared_namespaces(&store, &mut spec);
         let result = if let Err(error) = launch {
             Err(error)
         } else {
@@ -177,6 +179,7 @@ pub fn run_detached(
                 Ok(())
             });
             spec.shared_netns = None;
+            spec.shared_pidns = None;
             result
         };
         let attempt_elapsed = attempt_started.elapsed();
@@ -346,24 +349,34 @@ pub fn run_detached(
     code
 }
 
-/// Reopen a shared network namespace for this launch attempt.
+/// Reopen shared namespaces for this launch attempt.
 ///
-/// Detached automatic restarts must follow the persisted target id rather than
-/// retaining the descriptor from the original `run`. The target may have
-/// restarted with a different namespace while this reaper was waiting.
-fn refresh_shared_network_namespace(store: &Store, spec: &mut RunSpec) -> ZResult<()> {
-    if spec.net != NetMode::Container {
-        return Ok(());
+/// Detached automatic restarts must follow persisted target ids rather than
+/// retaining descriptors from the original `run`. A target may restart with a
+/// different namespace while this reaper is waiting.
+fn refresh_shared_namespaces(store: &Store, spec: &mut RunSpec) -> ZResult<()> {
+    if spec.net == NetMode::Container {
+        let target_id = spec
+            .net_container
+            .as_deref()
+            .ok_or_else(|| crate::zerr!("shared network mode has no target container"))?;
+        let target = ContainerState::load(store, target_id)
+            .ok_or_else(|| crate::zerr!("network target container {target_id} no longer exists"))?;
+        let netns = target.open_network_namespace()?;
+        spec.shared_netns = Some(Arc::new(netns));
+        spec.bridge_ip = target.ip;
     }
-    let target_id = spec
-        .net_container
-        .as_deref()
-        .ok_or_else(|| crate::zerr!("shared network mode has no target container"))?;
-    let target = ContainerState::load(store, target_id)
-        .ok_or_else(|| crate::zerr!("network target container {target_id} no longer exists"))?;
-    let netns = target.open_network_namespace()?;
-    spec.shared_netns = Some(Arc::new(netns));
-    spec.bridge_ip = target.ip;
+    if spec.namespaces.pid == PidMode::Container {
+        let target_id = spec
+            .pid_container
+            .as_deref()
+            .ok_or_else(|| crate::zerr!("shared PID namespace mode has no target container"))?;
+        let target = ContainerState::load(store, target_id).ok_or_else(|| {
+            crate::zerr!("PID namespace target container {target_id} no longer exists")
+        })?;
+        let pidns = target.open_pid_namespace()?;
+        spec.shared_pidns = Some(Arc::new(pidns));
+    }
     Ok(())
 }
 
@@ -1220,6 +1233,7 @@ mod attach_tests {
             rootless: false,
             net: "none".to_string(),
             namespaces: Default::default(),
+            pid_container: None,
             ports: Vec::new(),
             port_protocols: None,
             port_ips: None,
