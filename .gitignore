@@ -2,9 +2,6 @@
 /target
 Cargo.lock.orig
 
-# --- Design document (reference only; must never be committed) ---
-/ZerunDesignDoc.md
-
 # --- Local AI/developer maintenance guide (working notes; must never be committed) ---
 /AGENTS.md
 

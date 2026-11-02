@@ -8,14 +8,13 @@ that usually live in 5–6 separate components — OCI image pulling, OverlayFS 
 networking via netlink/nftables, and minimal security isolation — into **one static Rust
 binary with no daemon**.
 
-> Design document: `ZerunDesignDoc.md` at the repo root (v2.1 draft, kept out of git on
-> purpose). It is an early-stage spec: the broad direction is followed, implementation
-> details may deviate where engineering judgment says otherwise. See `AGENTS.md` for the
-> authoritative maintenance guide.
+> This README is the public compatibility contract and the source of truth for supported
+> behavior. Maintainer-local design and development context are intentionally excluded from
+> the distributed repository.
 
 ## Status
 
-Milestone-based development (roadmap in `AGENTS.md` §5):
+Milestone-based development status:
 
 - **M1 — isolation executor (done)**: namespace isolation (PID/MNT/UTS/IPC/NET/USER),
   corrected `pivot_root(".", ".")` sequence, container pseudo-filesystems, minimal `/dev`,
@@ -52,7 +51,7 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   of stale records; `run -d --restart` applies Docker-style restart policies inside the
   per-container reaper; Docker-compatible `--health-*` checks are monitored by a tiny
   per-attempt process and exposed through `ps --filter health=...`/`inspect`; file-based
-  IPAM; `--rm` for auto-removal (see AGENTS.md).
+  IPAM; `--rm` for automatic removal (see Detached lifecycle below).
 - **M6 — operations and distribution (done)**: `generate-service` emits declarative foreground
   systemd units; `install.sh` verifies checksums, detects architectures, supports rootless
   installation, and creates the `ze` alias; Arch and Homebrew source packaging is included.
@@ -638,7 +637,7 @@ T0 budget ≤ 8 ms wall-clock for the isolation hot path).
 
 ## Architecture
 
-See `AGENTS.md` §2/§4. Short version:
+Short version:
 
 - One crate, one binary; **all raw syscalls are concentrated in `src/syscalls.rs`**.
 - The runtime forks a single-threaded namespace supervisor, which enters the requested
