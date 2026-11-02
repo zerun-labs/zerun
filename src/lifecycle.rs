@@ -363,6 +363,10 @@ fn refresh_shared_namespaces(store: &Store, spec: &mut RunSpec) -> ZResult<()> {
     spec.shared_netns = None;
     spec.shared_pidns = None;
     spec.shared_ipcns = None;
+    let mut netns = None;
+    let mut pidns = None;
+    let mut ipcns = None;
+    let mut bridge_ip = None;
     if spec.net == NetMode::Container {
         let target_id = spec
             .net_container
@@ -370,9 +374,8 @@ fn refresh_shared_namespaces(store: &Store, spec: &mut RunSpec) -> ZResult<()> {
             .ok_or_else(|| crate::zerr!("shared network mode has no target container"))?;
         let target = ContainerState::load(store, target_id)
             .ok_or_else(|| crate::zerr!("network target container {target_id} no longer exists"))?;
-        let netns = target.open_network_namespace()?;
-        spec.shared_netns = Some(Arc::new(netns));
-        spec.bridge_ip = target.ip;
+        netns = Some(Arc::new(target.open_network_namespace()?));
+        bridge_ip = target.ip;
     }
     if spec.namespaces.pid == PidMode::Container {
         let target_id = spec
@@ -382,8 +385,7 @@ fn refresh_shared_namespaces(store: &Store, spec: &mut RunSpec) -> ZResult<()> {
         let target = ContainerState::load(store, target_id).ok_or_else(|| {
             crate::zerr!("PID namespace target container {target_id} no longer exists")
         })?;
-        let pidns = target.open_pid_namespace()?;
-        spec.shared_pidns = Some(Arc::new(pidns));
+        pidns = Some(Arc::new(target.open_pid_namespace()?));
     }
     if spec.namespaces.ipc == IpcMode::Container {
         let target_id = spec
@@ -393,8 +395,16 @@ fn refresh_shared_namespaces(store: &Store, spec: &mut RunSpec) -> ZResult<()> {
         let target = ContainerState::load(store, target_id).ok_or_else(|| {
             crate::zerr!("IPC namespace target container {target_id} no longer exists")
         })?;
-        let ipcns = target.open_ipc_namespace()?;
-        spec.shared_ipcns = Some(Arc::new(ipcns));
+        ipcns = Some(Arc::new(target.open_ipc_namespace()?));
+    }
+    // Assign only after every requested target has been reopened. The local
+    // descriptors are dropped on any earlier `?`, so a failed refresh does not
+    // keep a partially resolved namespace alive through restart backoff.
+    spec.shared_netns = netns;
+    spec.shared_pidns = pidns;
+    spec.shared_ipcns = ipcns;
+    if spec.net == NetMode::Container {
+        spec.bridge_ip = bridge_ip;
     }
     Ok(())
 }
@@ -1324,6 +1334,146 @@ mod attach_tests {
         };
         let error = persist_started_state(&store, "0123456789ab", &info).unwrap_err();
         assert!(error.to_string().contains("disappeared before start"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod shared_namespace_tests {
+    use super::*;
+    use crate::namespace::{NetMode, RunSpec};
+    use crate::state::{NamespaceModes, PidMode};
+
+    fn running_state(id: &str, pid: i32, pid_start_time: u64) -> ContainerState {
+        ContainerState {
+            version: 1,
+            id: id.to_string(),
+            name: Some(id.to_string()),
+            image: "rootfs:/tmp/rootfs".to_string(),
+            pid: Some(pid),
+            pid_start_time: Some(pid_start_time),
+            reaper_pid: None,
+            reaper_start_time: None,
+            status: Status::Running,
+            paused: false,
+            exit_code: None,
+            created: state::now_rfc3339(),
+            started: Some(state::now_rfc3339()),
+            finished: None,
+            rootless: false,
+            net: "bridge".to_string(),
+            namespaces: NamespaceModes::default(),
+            pid_container: None,
+            ipc_container: None,
+            ports: Vec::new(),
+            port_protocols: None,
+            port_ips: None,
+            exposed_ports: Vec::new(),
+            ip: Some(std::net::Ipv4Addr::new(10, 88, 0, 2)),
+            cmd: vec!["/bin/sleep".to_string(), "60".to_string()],
+            env: Vec::new(),
+            cwd: None,
+            user: None,
+            group_add: None,
+            sysctls: std::collections::BTreeMap::new(),
+            stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
+            stop_timeout: state::DEFAULT_STOP_TIMEOUT_SECS,
+            restart_policy: crate::restart::RestartPolicy::No,
+            restart_count: 0,
+            restart_pending: false,
+            healthcheck: None,
+            health: None,
+            capabilities: None,
+            seccomp: Some(crate::seccomp::SeccompMode::Unconfined),
+            ulimits: None,
+            anonymous_volumes: Vec::new(),
+            image_volumes: Vec::new(),
+            log: String::new(),
+            log_max_size: None,
+            log_max_file: None,
+            lower: None,
+            rootfs: "/tmp/rootfs".to_string(),
+            overlay: None,
+            tmpfs_upper: false,
+            labels: std::collections::BTreeMap::new(),
+            launch_args: None,
+            table: None,
+            veth: None,
+            cgroup: None,
+            metrics: None,
+        }
+    }
+
+    fn shared_namespace_spec(store: &Store, net_target: &str, pid_target: &str) -> RunSpec {
+        let old_netns = Arc::new(File::open("/proc/self/ns/net").unwrap().into());
+        let old_pidns = Arc::new(File::open("/proc/self/ns/pid").unwrap().into());
+        RunSpec {
+            rootfs: Path::new("/tmp/rootfs").to_path_buf(),
+            argv: vec!["/bin/true".to_string()],
+            hostname: None,
+            namespaces: NamespaceModes {
+                pid: PidMode::Container,
+                ..NamespaceModes::default()
+            },
+            pid_container: Some(pid_target.to_string()),
+            shared_pidns: Some(old_pidns),
+            ipc_container: None,
+            shared_ipcns: None,
+            net: NetMode::Container,
+            net_container: Some(net_target.to_string()),
+            shared_netns: Some(old_netns),
+            use_init: false,
+            limits: Default::default(),
+            ulimits: Default::default(),
+            seccomp: crate::seccomp::SeccompMode::Unconfined,
+            capabilities: crate::security::CapabilitySet::default(),
+            tty: false,
+            interactive: false,
+            overlay: None,
+            id: "abcdef012345".to_string(),
+            stop_signal: crate::signal::DEFAULT_STOP_SIGNAL,
+            env: None,
+            cwd: None,
+            user: None,
+            group_add: Vec::new(),
+            sysctls: std::collections::BTreeMap::new(),
+            readonly: false,
+            tmpfs: Vec::new(),
+            shm_size: None,
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            devices: Vec::new(),
+            hosts: Vec::new(),
+            bridge_ip: Some(std::net::Ipv4Addr::new(10, 88, 0, 9)),
+            run_root: store.run_root().to_path_buf(),
+            lifecycle_cgroup: false,
+        }
+    }
+
+    #[test]
+    fn failed_refresh_drops_old_and_partially_resolved_namespace_pins() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-shared-namespace-refresh-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.join("data"), root.join("run"));
+        store.ensure_dirs().unwrap();
+
+        let pid = crate::syscalls::process_id();
+        let start_time = crate::procinfo::process_start_time(pid).unwrap();
+        running_state("0123456789ab", pid, start_time)
+            .save(&store)
+            .unwrap();
+        let mut spec = shared_namespace_spec(&store, "0123456789ab", "fedcba987654");
+
+        let error = refresh_shared_namespaces(&store, &mut spec).unwrap_err();
+        assert!(error.to_string().contains("PID namespace target"));
+        assert!(spec.shared_netns.is_none());
+        assert!(spec.shared_pidns.is_none());
+        assert!(spec.shared_ipcns.is_none());
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }
