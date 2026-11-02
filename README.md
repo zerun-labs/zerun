@@ -41,8 +41,10 @@ Milestone-based development (roadmap in `AGENTS.md` §5):
   (pure netlink, shared `zerun-nat` subnet rule), `-p [ADDR:]HOST[-END][:CONTAINER[-END]][/tcp|/udp]` publishing through a built-in userland
   proxy (Docker's docker-proxy in-binary), image `EXPOSE` plus `--expose` and
   `-P`/`--publish-all` random host-port mapping, `--dns` / host resolv.conf inheritance,
-  `--dns-search` / `--dns-option` resolver controls, and repeatable
-  `--add-host NAME:IP` aliases (including `host-gateway`).
+  `--dns-search` / `--dns-option` resolver controls, repeatable
+  `--add-host NAME:IP` aliases (including `host-gateway`), and rootful
+  `--network container:NAME|ID` sharing of a running detached container's network
+  namespace.
 - **M5 — detached lifecycle (done)**: `run -d` forks a tiny per-container reaper that
   redirects stdio to `console.log` and persists state to disk;
   `ps [-a] [-q] [--format table|json] [--filter KEY=VALUE]`, `start`, `pause`, `unpause`, `stop`, `restart`,
@@ -253,10 +255,11 @@ Run options (current subset):
 --no-healthcheck     disable an image-declared HEALTHCHECK
 --restart POLICY     detached restart policy: no, on-failure[:MAX], always, or
                      unless-stopped (requires -d; incompatible with --rm)
---net, --network bridge|none|host
+--net, --network bridge|none|host|container:TARGET
                      bridge = rootful bridge networking on zerun0 (veth + eth0 in container;
                      rootful default); none = fresh netns with loopback only (rootless default);
-                     host = share host net
+                     host = share host net; container:TARGET joins the network namespace of a
+                     running detached container (rootful only)
 -i, --interactive   keep stdin attached (foreground runs; without it stdin is /dev/null)
 -t, --tty           allocate a PTY for foreground or detached output (e.g. -dt)
 -p, --publish [ADDR:]HOST[-END][:CONTAINER[-END]][/proto]
@@ -317,6 +320,13 @@ Run options (current subset):
                     --ipc host or --ipc none)
 ```
 
+`--network container:TARGET` is rootful-only and resolves `TARGET` to the concrete ID of a
+currently running detached container. The joining container owns no veth or IPAM lease. A running
+container stays in the namespace it joined; after the target restarts, restart the joining
+container to attach to the target's new namespace. Each launch requires the target to be running.
+Hostname, DNS, `/etc/hosts`, port publishing, and network `--sysctl` options are not accepted in
+this mode because they would mutate target-owned state.
+
 Cgroup flags bound aggregate container resource use. `--ulimit` additionally
 sets POSIX per-process limits; supported types match Docker (`core`, `cpu`,
 `data`, `fsize`, `locks`, `memlock`, `msgqueue`, `nice`, `nofile`, `nproc`,
@@ -341,12 +351,13 @@ and map only gid 0, so group additions fail explicitly. Detached restart/exec an
 service units retain the same launch policy.
 
 `--sysctl` accepts only settings scoped to a private container namespace.
-Network and IPC families are rejected with `--net host` or `--ipc host`, and
-`kernel.domainname` is rejected with `--uts host`, so a container option cannot
-silently mutate the host. Values are applied after bridge/loopback setup (which
-allows per-interface keys such as `net.ipv4.conf.eth0.*`) and before `/proc/sys`
-is remounted read-only for the workload. Detached restart and generated service
-units preserve the same settings.
+Network and IPC families are rejected with `--net host`, `--net container:...`,
+or `--ipc host`, and `kernel.domainname` is rejected with `--uts host`, so a
+container option cannot silently mutate the host. Values are applied after
+bridge/loopback setup (which allows per-interface keys such as
+`net.ipv4.conf.eth0.*`) and before `/proc/sys` is remounted read-only for the
+workload. Detached restart and generated service units preserve the same
+settings.
 
 `ZERUN_REGISTRY_MIRRORS` (comma-separated), a zerun config file
 (`/etc/zerun/config.toml` with `[registry] mirrors = [...]`, overridable via

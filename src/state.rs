@@ -658,6 +658,49 @@ impl ContainerState {
         process_is_alive(self.pid, self.pid_start_time)
     }
 
+    /// Pin the recorded process's network namespace for a container that
+    /// shares it with `--net container`.
+    ///
+    /// A bare PID is insufficient because the target may exit and the PID may
+    /// be reused while the caller is opening `/proc/<pid>/ns/net`. New records
+    /// therefore must carry a start time, which is checked both before and
+    /// after opening the descriptor.
+    pub fn open_network_namespace(&self) -> ZResult<std::os::fd::OwnedFd> {
+        if self.status != Status::Running {
+            return Err(crate::zerr!(
+                "container {} is not running (status {})",
+                self.id,
+                self.status_label()
+            ));
+        }
+        let pid = self
+            .pid
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| crate::zerr!("container {} has no live PID", self.id))?;
+        let start_time = self.pid_start_time.ok_or_else(|| {
+            crate::zerr!(
+                "container {} has no recorded process start time; cannot safely pin its network namespace",
+                self.id
+            )
+        })?;
+        if crate::procinfo::process_start_time(pid) != Some(start_time) {
+            return Err(crate::zerr!(
+                "container {} PID {pid} no longer matches its recorded process",
+                self.id
+            ));
+        }
+        let path = PathBuf::from(format!("/proc/{pid}/ns/net"));
+        let file = File::open(&path)
+            .map_err(|error| crate::zerr!("open network namespace {}: {error}", path.display()))?;
+        if crate::procinfo::process_start_time(pid) != Some(start_time) {
+            return Err(crate::zerr!(
+                "container {} exited while its network namespace was being opened",
+                self.id
+            ));
+        }
+        Ok(file.into())
+    }
+
     /// Whether the detached reaper that owns this record is still alive.
     ///
     /// New records persist both the PID and its kernel start time. Legacy
@@ -974,6 +1017,8 @@ mod tests {
 
     #[test]
     fn pid_start_time_prevents_pid_reuse_false_positive() {
+        use std::os::fd::AsRawFd;
+
         let mut state = ContainerState {
             version: 1,
             id: "pid-check".to_string(),
@@ -1030,8 +1075,14 @@ mod tests {
             metrics: None,
         };
         assert!(state.pid_alive());
+        let netns = state.open_network_namespace().unwrap();
+        assert!(netns.as_raw_fd() >= 0);
+        let mut legacy_identity = state.clone();
+        legacy_identity.pid_start_time = None;
+        assert!(legacy_identity.open_network_namespace().is_err());
         state.pid_start_time = state.pid_start_time.map(|start| start.saturating_add(1));
         assert!(!state.pid_alive());
+        assert!(state.open_network_namespace().is_err());
 
         state.reaper_pid = Some(std::process::id() as i32);
         state.reaper_start_time = crate::procinfo::process_start_time(std::process::id() as i32);

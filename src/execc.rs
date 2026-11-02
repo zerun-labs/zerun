@@ -578,6 +578,13 @@ fn namespace_flags(
     match net {
         "host" => {}
         "none" | "bridge" => rest |= libc::CLONE_NEWNET,
+        other
+            if other
+                .strip_prefix("container:")
+                .is_some_and(|target| !target.is_empty()) =>
+        {
+            rest |= libc::CLONE_NEWNET
+        }
         other => {
             return Err(crate::zerr!(
                 "container has invalid persisted network mode '{other}'"
@@ -910,6 +917,14 @@ mod tests {
     #[test]
     fn malformed_persisted_network_mode_is_rejected() {
         assert!(namespace_flags(false, NamespaceModes::default(), "network-ish").is_err());
+        assert!(namespace_flags(false, NamespaceModes::default(), "container:").is_err());
+    }
+
+    #[test]
+    fn shared_container_network_joins_the_netns() {
+        let (_, flags) =
+            namespace_flags(false, NamespaceModes::default(), "container:abc123").unwrap();
+        assert_ne!(flags & libc::CLONE_NEWNET, 0);
     }
 
     #[test]

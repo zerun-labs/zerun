@@ -47,9 +47,49 @@ remove_cleanup_path() {
     sudo rm -f -- "$1"
   fi
 }
+# A background command started through sudo is represented by the sudo
+# process, not necessarily the zerun process that owns the container. Locate
+# the first zerun descendant so signal-forwarding tests exercise the runtime
+# rather than killing the wrapper. Linux hosts always expose this tree in
+# /proc, and the breadth-first search stops before container descendants.
+find_zerun_process() {
+  local root=$1
+  local -a pending=("$root")
+  local pid comm
+  local -a children=()
+  while ((${#pending[@]})); do
+    pid=${pending[0]}
+    pending=("${pending[@]:1}")
+    [[ -r /proc/$pid/comm ]] || continue
+    read -r comm </proc/$pid/comm
+    if [[ $comm == zerun ]]; then
+      printf '%s\n' "$pid"
+      return 0
+    fi
+    [[ -r /proc/$pid/task/$pid/children ]] || continue
+    children=()
+    read -r -a children </proc/$pid/task/$pid/children || true
+    pending+=("${children[@]}")
+  done
+  return 1
+}
+signal_rootful_process() {
+  local pid=$1
+  local signal=$2
+  if (( EUID == 0 )); then
+    kill -s "$signal" "$pid"
+  else
+    sudo kill -s "$signal" "$pid"
+  fi
+}
 cleanup() {
   for pid in "${cleanup_pids[@]}"; do
-    kill -TERM "$pid" >/dev/null 2>&1 || true
+    runtime_pid=$(find_zerun_process "$pid" 2>/dev/null || true)
+    if [[ -n $runtime_pid ]]; then
+      signal_rootful_process "$runtime_pid" TERM >/dev/null 2>&1 || true
+    else
+      kill -TERM "$pid" >/dev/null 2>&1 || true
+    fi
   done
   for id in "${cleanup_ids[@]}"; do
     "${zerun[@]}" rm -f "$id" >/dev/null 2>&1 || true
@@ -299,7 +339,11 @@ for attempt in $(seq 1 50); do
   fi
   sleep 0.1
 done
-kill -TERM "$foreground_stop_pid"
+foreground_stop_runtime_pid=$(find_zerun_process "$foreground_stop_pid") || {
+  echo "foreground stop could not locate the zerun runtime process" >&2
+  exit 1
+}
+signal_rootful_process "$foreground_stop_runtime_pid" TERM
 set +e
 wait "$foreground_stop_pid"
 foreground_stop_code=$?
@@ -986,6 +1030,106 @@ echo "rootful-name-race-ok"
 bridge_output=$("${zerun[@]}" run --rootfs "$rootfs" --net bridge --no-overlay --init -- \
   /bin/sh -c '/bin/busybox ip -4 addr show dev eth0 | /bin/busybox grep -q "10.88.0."; printf "bridge-ok\\n"')
 grep -Fx bridge-ok <<<"$bridge_output" >/dev/null
+
+# A container network mode joins an existing running container's netns. Use
+# exec in both containers so the check also covers the persisted
+# `container:<id>` network label and the exec namespace join mask.
+shared_net_target_name="ci-shared-net-$BASHPID"
+shared_net_target=$("${zerun[@]}" run -d --name "$shared_net_target_name" \
+  --rootfs "$rootfs" --net bridge --init -- /bin/sleep 30)
+shared_net_id=$("${zerun[@]}" run -d --rootfs "$rootfs" \
+  --network "container:$shared_net_target_name" --init -- /bin/sleep 30)
+cleanup_ids+=("$shared_net_id" "$shared_net_target")
+shared_net_target_ns=$("${zerun[@]}" exec "$shared_net_target" \
+  /bin/busybox readlink /proc/self/ns/net)
+shared_net_joined_ns=$("${zerun[@]}" exec "$shared_net_id" \
+  /bin/busybox readlink /proc/self/ns/net)
+test "$shared_net_joined_ns" = "$shared_net_target_ns"
+shared_net_inspect=$("${zerun[@]}" inspect "$shared_net_id")
+grep -F "\"net\": \"container:$shared_net_target\"" \
+  <<<"$shared_net_inspect" >/dev/null
+# The resolved id, not the original target name, is retained in canonical
+# launch arguments used by a later `start`.
+test "$(grep -Fc "container:$shared_net_target" <<<"$shared_net_inspect")" -ge 2
+# The joining container keeps the target's address in its self /etc/hosts
+# entry even though it owns no IPAM lease of its own.
+shared_net_target_ip=$("${zerun[@]}" exec "$shared_net_target" \
+  /bin/busybox grep -o '10[.]88[.]0[.][0-9][0-9]*' /etc/hosts | /bin/busybox head -n 1)
+shared_net_joined_ip=$("${zerun[@]}" exec "$shared_net_id" \
+  /bin/busybox grep -o '10[.]88[.]0[.][0-9][0-9]*' /etc/hosts | /bin/busybox head -n 1)
+test -n "$shared_net_target_ip"
+test "$shared_net_joined_ip" = "$shared_net_target_ip"
+
+# A shared namespace is pinned by the running joiner. Restarting the target
+# must not migrate that joiner; restarting the joiner must re-open the target
+# ID and attach to its new namespace.
+"${zerun[@]}" stop --time 2 "$shared_net_target" >/dev/null
+"${zerun[@]}" start "$shared_net_target" >/dev/null
+shared_net_target_ns_after_restart=$("${zerun[@]}" exec "$shared_net_target" \
+  /bin/busybox readlink /proc/self/ns/net)
+test "$shared_net_target_ns_after_restart" != "$shared_net_target_ns"
+test "$("${zerun[@]}" exec "$shared_net_id" \
+  /bin/busybox readlink /proc/self/ns/net)" = "$shared_net_target_ns"
+"${zerun[@]}" stop --time 2 "$shared_net_id" >/dev/null
+"${zerun[@]}" start "$shared_net_id" >/dev/null
+test "$("${zerun[@]}" exec "$shared_net_id" \
+  /bin/busybox readlink /proc/self/ns/net)" = "$shared_net_target_ns_after_restart"
+shared_net_target_ip=$("${zerun[@]}" exec "$shared_net_target" \
+  /bin/busybox grep -o '10[.]88[.]0[.][0-9][0-9]*' /etc/hosts | /bin/busybox head -n 1)
+shared_net_joined_ip=$("${zerun[@]}" exec "$shared_net_id" \
+  /bin/busybox grep -o '10[.]88[.]0[.][0-9][0-9]*' /etc/hosts | /bin/busybox head -n 1)
+test "$shared_net_joined_ip" = "$shared_net_target_ip"
+"${zerun[@]}" stop --time 2 "$shared_net_id" >/dev/null
+"${zerun[@]}" rm "$shared_net_id" >/dev/null
+"${zerun[@]}" stop --time 2 "$shared_net_target" >/dev/null
+"${zerun[@]}" rm "$shared_net_target" >/dev/null
+
+# The detached reaper must discard its launch-time netns descriptor and reopen
+# the persisted target ID before an automatic retry. Hold the first attempt in
+# its old namespace until the target has been restarted, then release it and
+# verify the retry runs in the target's new namespace.
+auto_shared_net_target_name="ci-auto-shared-net-$BASHPID"
+auto_shared_net_target=$("${zerun[@]}" run -d --name "$auto_shared_net_target_name" \
+  --rootfs "$rootfs" --net bridge --init -- /bin/sleep 30)
+auto_shared_net_target_ns=$("${zerun[@]}" exec "$auto_shared_net_target" \
+  /bin/busybox readlink /proc/self/ns/net)
+auto_shared_net_id=$("${zerun[@]}" run -d --restart=on-failure:1 \
+  --rootfs "$rootfs" --network "container:$auto_shared_net_target_name" \
+  --init -- /bin/sh -c \
+  'if [ ! -e /shared-net-auto-retry ]; then /bin/busybox touch /shared-net-auto-retry; while [ ! -e /shared-net-auto-release ]; do /bin/sleep 0.1; done; exit 7; fi; /bin/sleep 30')
+cleanup_ids+=("$auto_shared_net_id" "$auto_shared_net_target")
+test "$("${zerun[@]}" exec "$auto_shared_net_id" \
+  /bin/busybox readlink /proc/self/ns/net)" = "$auto_shared_net_target_ns"
+"${zerun[@]}" stop --time 2 "$auto_shared_net_target" >/dev/null
+"${zerun[@]}" start "$auto_shared_net_target" >/dev/null
+auto_shared_net_target_ns_after_restart=$("${zerun[@]}" exec "$auto_shared_net_target" \
+  /bin/busybox readlink /proc/self/ns/net)
+test "$auto_shared_net_target_ns_after_restart" != "$auto_shared_net_target_ns"
+test "$("${zerun[@]}" exec "$auto_shared_net_id" \
+  /bin/busybox readlink /proc/self/ns/net)" = "$auto_shared_net_target_ns"
+"${zerun[@]}" exec "$auto_shared_net_id" \
+  /bin/busybox touch /shared-net-auto-release >/dev/null
+for attempt in $(seq 1 100); do
+  auto_shared_net_inspect=$("${zerun[@]}" inspect "$auto_shared_net_id")
+  if grep -F '"status": "running"' <<<"$auto_shared_net_inspect" >/dev/null &&
+      grep -F '"restart_count": 1' <<<"$auto_shared_net_inspect" >/dev/null; then
+    break
+  fi
+  if (( attempt == 100 )); then
+    echo "shared-network automatic retry did not start" >&2
+    printf '%s\n' "$auto_shared_net_inspect" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+test "$("${zerun[@]}" exec "$auto_shared_net_id" \
+  /bin/busybox readlink /proc/self/ns/net)" = "$auto_shared_net_target_ns_after_restart"
+grep -F '"restart_pending": false' <<<"$auto_shared_net_inspect" >/dev/null
+"${zerun[@]}" stop --time 2 "$auto_shared_net_id" >/dev/null
+"${zerun[@]}" rm "$auto_shared_net_id" >/dev/null
+"${zerun[@]}" stop --time 2 "$auto_shared_net_target" >/dev/null
+"${zerun[@]}" rm "$auto_shared_net_target" >/dev/null
+echo "rootful-shared-net-lifecycle-ok"
 
 # Bridge resolv.conf injection accepts explicit search domains and options
 # without exposing them to the source rootfs.

@@ -39,9 +39,10 @@ pub fn validate_for_namespaces(
         validate_value(value)
             .map_err(|error| format!("invalid --sysctl value for '{key}': {error}"))?;
         if key.starts_with("net.") {
-            if matches!(net, NetMode::Host) {
+            if matches!(net, NetMode::Host | NetMode::Container) {
                 return Err(format!(
-                    "--sysctl {key} requires a private network namespace; remove --net host"
+                    "--sysctl {key} requires a private network namespace; \
+                     do not use --net host or --net container"
                 ));
             }
         } else if is_ipc_sysctl(key) {

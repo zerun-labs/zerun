@@ -46,6 +46,9 @@ pub enum NetMode {
     Bridge,
     /// Share the host network.
     Host,
+    /// Join another running container's network namespace. `shared_netns`
+    /// carries the namespace descriptor opened by the runtime parent.
+    Container,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +59,12 @@ pub struct RunSpec {
     /// PID/IPC/UTS namespace sharing for this container.
     pub namespaces: NamespaceModes,
     pub net: NetMode,
+    /// Source container id for `NetMode::Container`; persisted in state and
+    /// used only in diagnostics after the namespace was opened.
+    pub net_container: Option<String>,
+    /// Pinned network namespace for `NetMode::Container`. The supervisor
+    /// enters it before forking the workload.
+    pub shared_netns: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
     pub use_init: bool,
     pub limits: ResourceLimits,
     /// Per-process POSIX limits applied to the workload.
@@ -260,11 +269,19 @@ where
     // Namespace flags: MNT/CGROUP are always private. PID/IPC/UTS/NET are private
     // unless the operator explicitly selected host sharing. Non-root
     // automatically adds NEWUSER (the kernel creates it first).
-    if rootless && matches!(spec.net, NetMode::Bridge) {
-        return Err(crate::zerr!(
-            "--net bridge needs CAP_NET_ADMIN in the host network namespace; \
-             run rootful, or use --net none / --net host"
-        ));
+    if rootless {
+        match spec.net {
+            NetMode::Bridge => {
+                return Err(crate::zerr!(
+                    "--net bridge needs CAP_NET_ADMIN in the host network namespace; \
+                     run rootful, or use --net none / --net host"
+                ))
+            }
+            NetMode::Container => {
+                return Err(crate::zerr!("--net container requires a rootful runtime"))
+            }
+            NetMode::None | NetMode::Host => {}
+        }
     }
     let flags = namespace_flags(rootless, spec.namespaces, spec.net);
     if matches!(spec.namespaces.pid, NamespaceMode::Host) {
@@ -279,10 +296,12 @@ where
     // userland proxies. Both happen before starting the child so that IP exhaustion or
     // a busy host port abort the run before any container work happens.
     let mut spec = spec;
-    spec.bridge_ip = if matches!(spec.net, NetMode::Bridge) {
-        Some(crate::network::allocate_ip(&spec.run_root, &spec.id)?)
-    } else {
-        None
+    spec.bridge_ip = match spec.net {
+        NetMode::Bridge => Some(crate::network::allocate_ip(&spec.run_root, &spec.id)?),
+        // The parent resolved the target's address when it pinned the shared
+        // netns. Preserve it for /etc/hosts and persisted introspection.
+        NetMode::Container => spec.bridge_ip,
+        NetMode::None | NetMode::Host => None,
     };
     let _port_proxies = if let (NetMode::Bridge, Some(ip)) = (spec.net, spec.bridge_ip) {
         if !spec.ports.is_empty() {
@@ -650,7 +669,7 @@ fn namespace_flags(rootless: bool, namespaces: NamespaceModes, net: NetMode) -> 
     if !matches!(namespaces.ipc, IpcMode::Host) {
         flags |= libc::CLONE_NEWIPC;
     }
-    if !matches!(net, NetMode::Host) {
+    if matches!(net, NetMode::None | NetMode::Bridge) {
         flags |= libc::CLONE_NEWNET;
     }
     if rootless {
@@ -853,7 +872,7 @@ fn spawn_namespaced_child(
 /// Body of the intermediate process. This function never returns.
 fn supervisor_main(
     flags: libc::c_int,
-    spec: RunSpec,
+    mut spec: RunSpec,
     ipc: ChildIpc,
     identity: ChildIdentity,
     status_w: RawFd,
@@ -868,6 +887,11 @@ fn supervisor_main(
     }
     if identity.rootless {
         if let Err(error) = write_self_id_mapping(identity.host_euid, identity.host_egid) {
+            supervisor_fail(status_w, &error);
+        }
+    }
+    if let Some(netns) = spec.shared_netns.take() {
+        if let Err(error) = syscalls::setns(netns.as_raw_fd(), libc::CLONE_NEWNET) {
             supervisor_fail(status_w, &error);
         }
     }
@@ -1123,7 +1147,7 @@ fn child_stage(
                 syscalls::close(fd);
             }
         }
-        NetMode::Host => {
+        NetMode::Host | NetMode::Container => {
             if let Some(fd) = net_r {
                 syscalls::close(fd);
             }
@@ -1464,6 +1488,14 @@ mod tests {
         assert_ne!(flags & libc::CLONE_NEWNS, 0);
         assert_ne!(flags & libc::CLONE_NEWCGROUP, 0);
         assert_ne!(flags & libc::CLONE_NEWUSER, 0);
+    }
+
+    #[test]
+    fn namespace_flags_join_an_existing_network_namespace() {
+        let flags = namespace_flags(false, NamespaceModes::default(), NetMode::Container);
+        assert_eq!(flags & libc::CLONE_NEWNET, 0);
+        assert_ne!(flags & libc::CLONE_NEWNS, 0);
+        assert_ne!(flags & libc::CLONE_NEWPID, 0);
     }
 
     #[test]

@@ -178,6 +178,9 @@ struct RunArgs {
     /// Detached automatic restart policy (`--restart`).
     restart: Option<restart::RestartPolicy>,
     net: NetMode,
+    /// Running container whose network namespace is joined by `--net
+    /// container:NAME|ID` before the target is resolved.
+    net_container: Option<String>,
     /// True after the operator explicitly selected `--net`.
     net_specified: bool,
     use_init: bool,
@@ -456,8 +459,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--net" | "--network" => {
                 let v = next_value(args, &mut i, s)?;
+                let (net, target) = parse_net_mode(s, &v)?;
                 a.net_specified = true;
-                a.net = parse_net_mode(s, &v)?;
+                a.net = net;
+                a.net_container = target;
             }
             "-i" | "--interactive" => {
                 a.interactive = true;
@@ -796,14 +801,18 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             other if other.starts_with("--net=") => {
                 let value = &other["--net=".len()..];
+                let (net, target) = parse_net_mode("--net", value)?;
                 a.net_specified = true;
-                a.net = parse_net_mode("--net", value)?;
+                a.net = net;
+                a.net_container = target;
                 i += 1;
             }
             other if other.starts_with("--network=") => {
                 let value = &other["--network=".len()..];
+                let (net, target) = parse_net_mode("--network", value)?;
                 a.net_specified = true;
-                a.net = parse_net_mode("--network", value)?;
+                a.net = net;
+                a.net_container = target;
                 i += 1;
             }
             other if other.starts_with("--cpu-shares=") => {
@@ -1108,14 +1117,29 @@ fn parse_pids_limit(option: &str, value: &str) -> Result<i64, String> {
         .map_err(|_| format!("invalid {option} value '{value}'"))
 }
 
-fn parse_net_mode(option: &str, value: &str) -> Result<NetMode, String> {
+fn parse_net_mode(option: &str, value: &str) -> Result<(NetMode, Option<String>), String> {
     match value {
-        "bridge" => Ok(NetMode::Bridge),
-        "host" => Ok(NetMode::Host),
-        "none" => Ok(NetMode::None),
-        other => Err(format!(
-            "invalid {option} value '{other}' (bridge|host|none)"
-        )),
+        "bridge" => Ok((NetMode::Bridge, None)),
+        "host" => Ok((NetMode::Host, None)),
+        "none" => Ok((NetMode::None, None)),
+        _ => {
+            let Some(target) = value.strip_prefix("container:") else {
+                return Err(format!(
+                    "invalid {option} value '{value}' (bridge|host|none|container:<id|name>)"
+                ));
+            };
+            if target.is_empty() {
+                return Err(format!(
+                    "invalid {option} value '{value}': container target cannot be empty"
+                ));
+            }
+            if target.chars().any(char::is_control) {
+                return Err(format!(
+                    "invalid {option} value '{value}': container target contains control characters"
+                ));
+            }
+            Ok((NetMode::Container, Some(target.to_string())))
+        }
     }
 }
 
@@ -1385,6 +1409,43 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
     if a.pids.is_none() {
         a.pids = default_pids_limit(euid);
     }
+    // A resumed record's concrete target id is authoritative. Re-resolving the
+    // original name could silently attach the container to a new target.
+    if let Some(st) = &resume {
+        match (a.net, st.net.strip_prefix("container:")) {
+            (NetMode::Container, Some(target)) if !target.is_empty() => {
+                a.net_container = Some(target.to_string());
+            }
+            (NetMode::Container, _) => {
+                eprintln!(
+                    "zerun run: persisted container {} does not identify its network target",
+                    display_name(st)
+                );
+                return 1;
+            }
+            (_, Some(_)) => {
+                eprintln!(
+                    "zerun run: persisted network mode for container {} conflicts with its launch arguments",
+                    display_name(st)
+                );
+                return 1;
+            }
+            _ => {}
+        }
+    }
+    if a.net == NetMode::Container {
+        if euid != 0 {
+            eprintln!("zerun run: --net container requires a rootful runtime");
+            return 2;
+        }
+        if a.net_container.is_none() {
+            eprintln!("zerun run: --net container requires a target container");
+            return 2;
+        }
+    } else if a.net_container.is_some() {
+        eprintln!("zerun run: internal network target without --net container");
+        return 2;
+    }
     if let Err(error) = sysctl::validate_for_namespaces(&a.sysctls, a.namespaces, a.net) {
         eprintln!("zerun run: {error}");
         return 2;
@@ -1414,6 +1475,12 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
     if (!a.dns.is_empty() || !a.dns_search.is_empty() || !a.dns_options.is_empty())
         && a.net != NetMode::Bridge
     {
+        if a.net == NetMode::Container {
+            eprintln!(
+                "zerun run: DNS options cannot be used with a shared container network namespace"
+            );
+            return 2;
+        }
         eprintln!("zerun: warning: DNS options only apply to --net bridge; ignoring");
     }
     if a.rootfs.is_none() && a.image.is_none() {
@@ -1441,6 +1508,10 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         eprintln!("zerun run: --workdir cannot be empty");
         return 2;
     }
+    if a.net == NetMode::Container && a.hostname.is_some() {
+        eprintln!("zerun run: --hostname cannot be used with --net container");
+        return 2;
+    }
     if a.log_options_set && !a.detach {
         eprintln!(
             "zerun: warning: log rotation options only apply to detached containers; ignoring"
@@ -1465,21 +1536,25 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         eprintln!("zerun run: --restart cannot be combined with --rm");
         return 2;
     }
-    let host_aliases = if !a.add_hosts.is_empty() && a.net == NetMode::Host {
-        eprintln!("zerun run: --add-host cannot be used with --net host");
-        return 2;
-    } else {
-        match network::resolve_host_aliases(
-            &a.add_hosts,
-            (a.net == NetMode::Bridge).then_some(network::GATEWAY_IP),
-        ) {
-            Ok(entries) => entries,
-            Err(e) => {
-                eprintln!("zerun run: {e}");
-                return 2;
+    let host_aliases =
+        if !a.add_hosts.is_empty() && matches!(a.net, NetMode::Host | NetMode::Container) {
+            eprintln!(
+                "zerun run: --add-host cannot be used with --net {}",
+                net_label(a.net, a.net_container.as_deref())
+            );
+            return 2;
+        } else {
+            match network::resolve_host_aliases(
+                &a.add_hosts,
+                (a.net == NetMode::Bridge).then_some(network::GATEWAY_IP),
+            ) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    eprintln!("zerun run: {e}");
+                    return 2;
+                }
             }
-        }
-    };
+        };
     let capabilities = match security::CapabilitySet::resolve(&a.cap_add, &a.cap_drop) {
         Ok(capabilities) => capabilities,
         Err(e) => {
@@ -1531,6 +1606,27 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         eprintln!("zerun run: {e}");
         return 2;
     }
+    let (shared_netns, net_container, shared_bridge_ip) = if a.net == NetMode::Container {
+        let target = a
+            .net_container
+            .as_deref()
+            .expect("container network target was validated");
+        match open_shared_network_namespace(&store, target) {
+            Ok((netns, id, ip)) => {
+                // Capture the resolved id in canonical launch args so a later
+                // start cannot silently attach to a replacement with the same
+                // name after the original target was removed.
+                a.net_container = Some(id.clone());
+                (Some(netns), Some(id), ip)
+            }
+            Err(error) => {
+                eprintln!("zerun run: {error}");
+                return 1;
+            }
+        }
+    } else {
+        (None, None, None)
+    };
 
     // Protect image lookup/pull until a rootfs-scoped lease is established.
     // Detached state then protects the lower rootfs after it is persisted.
@@ -1976,6 +2072,8 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         hostname: effective_hostname,
         namespaces: a.namespaces,
         net: a.net,
+        net_container,
+        shared_netns,
         use_init: a.use_init,
         limits: ResourceLimits {
             memory: a.memory,
@@ -2018,8 +2116,9 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
         readonly: a.readonly,
         tmpfs: a.tmpfs,
         shm_size: a.shm_size,
-        // Allocated from the file IPAM inside run_container (bridge mode).
-        bridge_ip: None,
+        // Allocated from the file IPAM inside run_container (bridge mode), or
+        // inherited from the target for a shared network namespace.
+        bridge_ip: shared_bridge_ip,
         run_root: store.run_root().to_path_buf(),
         lifecycle_cgroup: a.detach,
     };
@@ -2486,7 +2585,7 @@ fn run_detached(
         started: None,
         finished: None,
         rootless: syscalls::effective_uid() != 0,
-        net: net_label(spec.net),
+        net: net_label(spec.net, spec.net_container.as_deref()),
         namespaces: spec.namespaces,
         ports: Vec::new(),
         port_protocols: None,
@@ -2537,7 +2636,7 @@ fn run_detached(
     st.finished = None;
     st.ip = None;
     st.rootless = syscalls::effective_uid() != 0;
-    st.net = net_label(spec.net);
+    st.net = net_label(spec.net, spec.net_container.as_deref());
     st.namespaces = spec.namespaces;
     st.ports = spec.ports.iter().map(|p| (p.host, p.container)).collect();
     st.port_protocols = if spec.ports.is_empty() {
@@ -2846,7 +2945,10 @@ fn detached_launch_args(a: &RunArgs, rootfs: &Path) -> Vec<String> {
     if let Some(policy) = a.restart.filter(|policy| policy.is_enabled()) {
         args.extend(["--restart".to_string(), policy.to_string()]);
     }
-    args.extend(["--net".to_string(), net_label(a.net)]);
+    args.extend([
+        "--net".to_string(),
+        net_label(a.net, a.net_container.as_deref()),
+    ]);
     if a.use_init {
         args.push("--init".to_string());
     }
@@ -3272,11 +3374,45 @@ fn cmd_commit(args: &[String]) -> i32 {
     }
 }
 
-fn net_label(net: NetMode) -> String {
+/// Open and pin the network namespace of a running container selected with
+/// `--net container:NAME|ID`.
+///
+/// The descriptor is inherited by the namespace supervisor, which joins it
+/// before forking the workload. Re-checking the target's `/proc` start time
+/// after opening prevents a recycled PID from donating an unrelated namespace.
+fn open_shared_network_namespace(
+    store: &Store,
+    reference: &str,
+) -> Result<
+    (
+        std::sync::Arc<std::os::fd::OwnedFd>,
+        String,
+        Option<std::net::Ipv4Addr>,
+    ),
+    String,
+> {
+    let mut target = state::resolve(store, reference)?;
+    reconcile_stale_state(store, &mut target)?;
+    if target.status != state::Status::Running || !target.pid_alive() {
+        return Err(format!(
+            "network target {} is not running",
+            display_name(&target)
+        ));
+    }
+    let netns = target
+        .open_network_namespace()
+        .map_err(|error| format!("network target {}: {error}", display_name(&target)))?;
+    Ok((std::sync::Arc::new(netns), target.id, target.ip))
+}
+
+fn net_label(net: NetMode, container: Option<&str>) -> String {
     match net {
         NetMode::None => "none".to_string(),
         NetMode::Host => "host".to_string(),
         NetMode::Bridge => "bridge".to_string(),
+        NetMode::Container => {
+            format!("container:{}", container.expect("container network target"))
+        }
     }
 }
 
@@ -7839,10 +7975,11 @@ RUN OPTIONS:\n  \
   --health-start-interval D  probe delay during the start period (default 5s)\n  \
   --no-healthcheck         disable an image-declared HEALTHCHECK\n  \
   --restart POLICY        detached restart policy (no|on-failure[:max]|always|unless-stopped)\n  \
-  --net, --network none|host|bridge\n  \
+  --net, --network none|host|bridge|container:TARGET\n  \
                       none = fresh netns + loopback; host = share host net;\n  \
                       bridge = zerun0 bridge + NAT (needs CAP_NET_ADMIN;\n  \
-                      rootful default; rootless default is none)\n  \
+                      rootful default; rootless default is none); container =\n  \
+                      join a running detached container's netns (rootful only)\n  \
   -i, --interactive      keep stdin attached (foreground runs)\n  \
   -t, --tty              allocate a PTY for foreground or detached output\n  \
   -p, --publish [ADDR:]HOST[-END][:CONTAINER[-END]][/proto]\n  \
@@ -9615,12 +9752,34 @@ mod tests {
         assert_eq!(parsed.net, NetMode::Bridge);
         assert_eq!(parsed.pids, Some(-1));
 
-        assert!(
-            parse_run_args(&["--network=container:web".to_string(), "alpine".to_string()])
-                .err()
-                .expect("container network mode must be rejected")
-                .contains("bridge|host|none")
-        );
+        let args: Vec<String> = [
+            "--network=container:web",
+            "--pid",
+            "private",
+            "alpine",
+            "true",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let parsed = parse_run_args(&args).expect("container network mode");
+        assert_eq!(parsed.net, NetMode::Container);
+        assert_eq!(parsed.net_container.as_deref(), Some("web"));
+        let launch = detached_launch_args(&parsed, Path::new("/tmp/rootfs"));
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--net", "container:web"]));
+
+        for value in [
+            "--network=container:",
+            "--network=container:web\n",
+            "--network=pod:web",
+        ] {
+            assert!(
+                parse_run_args(&[value.to_string(), "alpine".to_string()]).is_err(),
+                "{value:?} was accepted"
+            );
+        }
         assert!(parse_run_args(&["--pids-limit=all".to_string(), "alpine".to_string()]).is_err());
     }
 

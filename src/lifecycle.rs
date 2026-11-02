@@ -18,7 +18,7 @@
 use crate::error::ZResult;
 use crate::fsutil;
 use crate::logs::LogOptions;
-use crate::namespace::{run_container_with_report, RunSpec};
+use crate::namespace::{run_container_with_report, NetMode, RunSpec};
 use crate::state::{self, ContainerState, Status};
 use crate::store::{ContainerFs, Store};
 use std::fs::{File, OpenOptions};
@@ -99,13 +99,18 @@ pub struct LogTarget<'a> {
 /// "0" (started) or "1:<error>" signal back to the `run -d` CLI exactly once.
 pub fn run_detached(
     store: Store,
-    spec: RunSpec,
+    mut spec: RunSpec,
     container_fs: Option<ContainerFs>,
     remove_state: bool,
     started_w: RawFd,
     log: LogTarget<'_>,
 ) -> i32 {
     let id = spec.id.clone();
+    // The CLI opened one descriptor to validate the target and capture its
+    // concrete id. Each launch attempt reopens it below, so keeping this clone
+    // in the long-lived reaper would pin a stale namespace across target
+    // restarts or removal.
+    drop(spec.shared_netns.take());
     // Replace inherited stdio with a timestamping collector before launching
     // the namespace supervisor so the container's real stdout/stderr are the
     // collector's write ends. The collector and attach hub remain installed
@@ -149,24 +154,31 @@ pub fn run_detached(
         // started hook, it remains held for the next terminal-state write.
         let mut start_lock = held_restart_lock.take();
         code = 1;
-        let result = run_container_with_report(spec.clone(), |info| {
-            // Persist "running" before releasing the CLI so `ze ps` never sees
-            // a Created-but-alive container. On an automatic retry this also
-            // replaces the previous terminal attempt in one atomic write.
-            persist_started_state(&store, &id, info)?;
-            started_once = true;
-            // The reaper owns this lock only through the next successful
-            // exec. Releasing it here lets `stop`/`kill` address the new run.
-            drop(start_lock.take());
-            health_monitor =
-                crate::health::Monitor::spawn(&store, &id, info.pid, info.pid_start_time)?;
-            if !signaled {
-                signaled = true;
-                let _ = write_all(started_w, b"0\n");
-                crate::syscalls::close(started_w);
-            }
-            Ok(())
-        });
+        let launch = refresh_shared_network_namespace(&store, &mut spec);
+        let result = if let Err(error) = launch {
+            Err(error)
+        } else {
+            let result = run_container_with_report(spec.clone(), |info| {
+                // Persist "running" before releasing the CLI so `ze ps` never sees
+                // a Created-but-alive container. On an automatic retry this also
+                // replaces the previous terminal attempt in one atomic write.
+                persist_started_state(&store, &id, info)?;
+                started_once = true;
+                // The reaper owns this lock only through the next successful
+                // exec. Releasing it here lets `stop`/`kill` address the new run.
+                drop(start_lock.take());
+                health_monitor =
+                    crate::health::Monitor::spawn(&store, &id, info.pid, info.pid_start_time)?;
+                if !signaled {
+                    signaled = true;
+                    let _ = write_all(started_w, b"0\n");
+                    crate::syscalls::close(started_w);
+                }
+                Ok(())
+            });
+            spec.shared_netns = None;
+            result
+        };
         let attempt_elapsed = attempt_started.elapsed();
         if let Some(monitor) = health_monitor.take() {
             monitor.stop();
@@ -332,6 +344,27 @@ pub fn run_detached(
     }
     drop(terminal_lock);
     code
+}
+
+/// Reopen a shared network namespace for this launch attempt.
+///
+/// Detached automatic restarts must follow the persisted target id rather than
+/// retaining the descriptor from the original `run`. The target may have
+/// restarted with a different namespace while this reaper was waiting.
+fn refresh_shared_network_namespace(store: &Store, spec: &mut RunSpec) -> ZResult<()> {
+    if spec.net != NetMode::Container {
+        return Ok(());
+    }
+    let target_id = spec
+        .net_container
+        .as_deref()
+        .ok_or_else(|| crate::zerr!("shared network mode has no target container"))?;
+    let target = ContainerState::load(store, target_id)
+        .ok_or_else(|| crate::zerr!("network target container {target_id} no longer exists"))?;
+    let netns = target.open_network_namespace()?;
+    spec.shared_netns = Some(Arc::new(netns));
+    spec.bridge_ip = target.ip;
+    Ok(())
 }
 
 fn persist_reaper_claim(store: &Store, id: &str, pid: i32, start_time: Option<u64>) -> ZResult<()> {

@@ -149,6 +149,12 @@ pub fn render(binary: &Path, a: &RunArgs, rootful: bool) -> Result<String, Strin
         NetMode::Host => "host".into(),
         NetMode::Bridge => "bridge".into(),
         NetMode::None => "none".into(),
+        NetMode::Container => format!(
+            "container:{}",
+            a.net_container
+                .as_deref()
+                .expect("container network target was validated")
+        ),
     });
     if a.use_init {
         run_args.push("--init".into());
@@ -395,6 +401,15 @@ fn validate(a: &RunArgs, rootful: bool) -> Result<(), String> {
     if (a.publish_all || !a.ports.is_empty()) && effective_net != NetMode::Bridge {
         return Err("-p/--publish and -P/--publish-all require --net bridge".into());
     }
+    if effective_net == NetMode::Container && !rootful {
+        return Err("--net container requires a rootful runtime".into());
+    }
+    if effective_net == NetMode::Container && a.net_container.is_none() {
+        return Err("--net container requires a target container".into());
+    }
+    if effective_net != NetMode::Container && a.net_container.is_some() {
+        return Err("container network target requires --net container".into());
+    }
     if (!a.dns.is_empty() || !a.dns_search.is_empty() || !a.dns_options.is_empty())
         && effective_net != NetMode::Bridge
     {
@@ -402,6 +417,12 @@ fn validate(a: &RunArgs, rootful: bool) -> Result<(), String> {
     }
     if !a.add_hosts.is_empty() && effective_net == NetMode::Host {
         return Err("--add-host cannot be used with --net host".into());
+    }
+    if !a.add_hosts.is_empty() && effective_net == NetMode::Container {
+        return Err("--add-host cannot be used with --net container".into());
+    }
+    if a.hostname.is_some() && effective_net == NetMode::Container {
+        return Err("--hostname cannot be used with --net container".into());
     }
     crate::network::resolve_host_aliases(
         &a.add_hosts,
@@ -594,6 +615,27 @@ mod tests {
         let unit = render(Path::new("/usr/local/bin/zerun"), &a, false).unwrap();
         assert!(unit.contains("--net none"));
         assert!(unit.contains("--pids -1"));
+    }
+
+    #[test]
+    fn renders_and_validates_shared_container_networking() {
+        let a = args(&["--net", "container:web", "alpine", "true"]);
+        let unit = render(Path::new("/usr/local/bin/zerun"), &a, true).unwrap();
+        assert!(unit.contains("--net container:web"));
+
+        let error = render(Path::new("/usr/local/bin/zerun"), &a, false).unwrap_err();
+        assert!(error.contains("requires a rootful runtime"));
+
+        let mut missing_target = args(&["--net", "container:web", "alpine", "true"]);
+        missing_target.net_container = None;
+        let error = render(Path::new("/usr/local/bin/zerun"), &missing_target, true).unwrap_err();
+        assert!(error.contains("requires a target container"));
+
+        let mismatch = args(&["--net", "bridge", "alpine", "true"]);
+        let mut mismatch = mismatch;
+        mismatch.net_container = Some("web".to_string());
+        let error = render(Path::new("/usr/local/bin/zerun"), &mismatch, true).unwrap_err();
+        assert!(error.contains("requires --net container"));
     }
 
     #[test]
