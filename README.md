@@ -600,7 +600,10 @@ and `logs` reports an error if a retained file is a symlink or cannot be read. A
 timestamped records in `console.log`, so a workload cannot make the reaper buffer an
 unbounded line; `attach` still receives the original bytes unchanged. When a container is
 started again after ending with an unterminated line, a newline separates that line from the
-next log record if both occupy the same file.
+next log record if both occupy the same file. If the collector cannot write or rotate a log,
+it continues draining output and forwarding it to attached clients, but stops recording output
+for that run. It attempts to record the failure in the open log file; that diagnostic may be
+unavailable if the file itself cannot be written or has been removed.
 `prune` removes every retained exited container and its writable layer. It reconciles stale
 Running records first, never touches live containers, and requires `--force` when stdin is
 not a terminal. `--images` additionally runs the image-store garbage collector for unreachable

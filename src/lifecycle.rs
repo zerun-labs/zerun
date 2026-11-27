@@ -784,15 +784,19 @@ fn collect_timestamped(
     attach: Option<Arc<Mutex<Vec<UnixStream>>>>,
 ) {
     let mut pending: Vec<u8> = Vec::new();
+    let mut log_failed = false;
     let mut buf = [0u8; 8 * 1024];
     loop {
         match crate::syscalls::read_fd(read_fd, &mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 let chunk = &buf[..n as usize];
-                if append_log_bytes(&mut output, &mut pending, chunk).is_err() {
-                    crate::syscalls::close(read_fd);
-                    return;
+                if !log_failed {
+                    if let Err(error) = append_log_bytes(&mut output, &mut pending, chunk) {
+                        report_log_failure(&mut output, &error);
+                        pending.clear();
+                        log_failed = true;
+                    }
                 }
                 if let Some(clients) = &attach {
                     broadcast(clients, chunk);
@@ -801,10 +805,24 @@ fn collect_timestamped(
             Err(_) => break,
         }
     }
-    if !pending.is_empty() {
-        let _ = write_timestamped_line(&mut output, &pending);
+    if !log_failed && !pending.is_empty() {
+        if let Err(error) = write_timestamped_line(&mut output, &pending) {
+            report_log_failure(&mut output, &error);
+        }
     }
     crate::syscalls::close(read_fd);
+}
+
+/// Best effort: the open inode may still be writable even when rotation failed.
+fn report_log_failure(output: &mut RotatingLog, error: &std::io::Error) {
+    let message = format!(
+        "\n{}\tzerun: console log capture failed: {error}; subsequent output is not recorded\n",
+        state::now_rfc3339_nanos()
+    );
+    if output.file.lock().is_ok() {
+        let _ = output.file.write_all(message.as_bytes());
+        let _ = output.file.unlock();
+    }
 }
 
 /// Append workload bytes to the timestamped line buffer, flushing complete
@@ -1178,6 +1196,56 @@ mod attach_tests {
             std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
             0o644
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn collector_drains_and_attaches_after_rotation_failure() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_log_dir("collector-rotation-failure");
+        let active = dir.join("console.log");
+        let outside = dir.join("outside");
+        std::fs::write(&outside, b"untouched").unwrap();
+        std::fs::write(&active, b"old\n").unwrap();
+        symlink(&outside, dir.join("console.log.1")).unwrap();
+        let log = RotatingLog::open(
+            &active,
+            LogOptions {
+                max_size: 1,
+                max_files: 3,
+            },
+        )
+        .unwrap();
+        let (read_fd, write_fd) = crate::syscalls::pipe2_cloexec().unwrap();
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let clients = Arc::new(Mutex::new(vec![server]));
+        let collector =
+            std::thread::spawn(move || collect_timestamped(read_fd, log, Some(clients)));
+        let payload = vec![b'x'; 128 * 1024];
+        let writer_payload = payload.clone();
+        let writer = std::thread::spawn(move || {
+            crate::syscalls::write_all_fd(write_fd, &writer_payload).unwrap();
+            crate::syscalls::close(write_fd);
+        });
+        let mut received = Vec::new();
+        while received.len() < payload.len() {
+            match read_attach_frame(&mut client).unwrap() {
+                AttachFrame::Data(chunk) => received.extend_from_slice(&chunk),
+                _ => panic!("unexpected attach status"),
+            }
+        }
+        writer.join().unwrap();
+        collector.join().unwrap();
+        assert_eq!(received, payload);
+        let archived = std::fs::read(dir.join("console.log.1")).unwrap();
+        assert!(archived
+            .windows(b"console log capture failed".len())
+            .any(|w| w == b"console log capture failed"));
+        assert_eq!(std::fs::read(outside).unwrap(), b"untouched");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
