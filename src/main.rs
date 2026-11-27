@@ -5906,6 +5906,17 @@ fn cmd_logs(args: &[String]) -> i32 {
     };
     let path = st.log_path_for(&store);
     let max_files = st.log_max_file.unwrap_or(1).clamp(1, logs::MAX_FILES);
+    let follow_guard = if follow {
+        match logs::follow_guard(&path) {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                eprintln!("zerun logs: cannot follow {}: {error}", path.display());
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
     // Stream the retained logs instead of materializing the whole rotation
     // budget. `--tail` retains only its requested raw lines before applying
     // the time filter; `--tail 0` can skip file contents entirely.
@@ -5934,11 +5945,11 @@ fn cmd_logs(args: &[String]) -> i32 {
         if let Err(e) = follow_log(
             &store,
             &st,
-            &path,
             max_files,
             cursor,
             timestamps,
             Some(&filter),
+            follow_guard.as_ref(),
         ) {
             eprintln!("zerun logs: follow: {e}");
             return 1;
@@ -5951,15 +5962,22 @@ fn cmd_logs(args: &[String]) -> i32 {
 fn follow_log(
     store: &Store,
     st: &ContainerState,
-    path: &Path,
     max_files: usize,
     mut seen: LogCursor,
     timestamps: bool,
     filter: Option<&LogTimeFilter>,
+    follow_guard: Option<&std::fs::File>,
 ) -> std::io::Result<()> {
+    let path = st.log_path_for(store);
     loop {
         if filter.is_some_and(LogTimeFilter::until_reached) {
             break;
+        }
+        if let Some(guard) = follow_guard {
+            if logs::follow_finished(guard)? {
+                drain_rotated_logs(&path, max_files, &mut seen, timestamps, filter)?;
+                break;
+            }
         }
         if !container_observable(store, st)? {
             let lock = state::ContainerOperationLock::try_acquire_if_available(store, &st.id)
@@ -5968,13 +5986,13 @@ fn follow_log(
                 // The reaper holds this lock through final log flushing. A
                 // concurrent start may have won it, so inspect state again.
                 if !container_observable(store, st)? {
-                    drain_rotated_logs(path, max_files, &mut seen, timestamps, filter)?;
+                    drain_rotated_logs(&path, max_files, &mut seen, timestamps, filter)?;
                     break;
                 }
             }
         }
         std::thread::sleep(Duration::from_millis(200));
-        drain_rotated_logs(path, max_files, &mut seen, timestamps, filter)?;
+        drain_rotated_logs(&path, max_files, &mut seen, timestamps, filter)?;
     }
     Ok(())
 }
@@ -9017,11 +9035,11 @@ mod tests {
                 .send(follow_log(
                     &worker_store,
                     &container,
-                    &path,
                     1,
                     LogCursor::new(),
                     false,
                     Some(&filter),
+                    None,
                 ))
                 .unwrap();
         });
@@ -9057,17 +9075,16 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel();
         let worker_store = store.clone();
         let worker_container = container.clone();
-        let worker_path = path.clone();
         let worker = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
             done_tx
                 .send(follow_log(
                     &worker_store,
                     &worker_container,
-                    &worker_path,
                     1,
                     LogCursor::new(),
                     false,
+                    None,
                     None,
                 ))
                 .unwrap();

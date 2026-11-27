@@ -109,6 +109,61 @@ fn validate_log_file(file: &std::fs::File) -> std::io::Result<()> {
     Ok(())
 }
 
+const FOLLOW_FINISHED: &str = ".logs-finished";
+
+/// Hold a shared lock while following, allowing bounded auto-removal handoff.
+pub fn follow_guard(path: &Path) -> std::io::Result<std::fs::File> {
+    let (pinned, _) = open_log_directory(path)?;
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(descriptor_path(&pinned))?;
+    directory.try_lock_shared().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "container logs are being removed",
+        ),
+        std::fs::TryLockError::Error(error) => error,
+    })?;
+    Ok(directory)
+}
+
+/// Publish that the collector has flushed all output before auto-removal.
+pub fn publish_follow_finished(directory: &std::fs::File) -> std::io::Result<()> {
+    crate::syscalls::create_file_at(directory, FOLLOW_FINISHED, 0o600).map(drop)
+}
+
+/// Check the auto-removal flush marker in the follower's pinned directory.
+pub fn follow_finished(directory: &std::fs::File) -> std::io::Result<bool> {
+    match crate::syscalls::open_log_file_at(directory, std::ffi::OsStr::new(FOLLOW_FINISHED)) {
+        Ok(file) => {
+            validate_log_file(&file)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Allow active followers a bounded interval to drain before deleting logs.
+/// On success the caller retains the exclusive lock until the file is dropped.
+pub fn wait_for_followers(
+    directory: &std::fs::File,
+    timeout: std::time::Duration,
+) -> std::io::Result<bool> {
+    let started = std::time::Instant::now();
+    loop {
+        match directory.try_lock() {
+            Ok(()) => return Ok(true),
+            Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < timeout => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+}
+
 /// Default detached-console rotation budget. Rotating by default keeps a
 /// chatty workload from exhausting a small VPS disk; `--log-max-size 0`
 /// explicitly disables rotation.
@@ -551,6 +606,51 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_remove_waits_for_followers_and_keeps_exclusive_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-follow-lock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("console.log");
+        let first = follow_guard(&path).unwrap();
+        let second = follow_guard(&path).unwrap();
+        let remover = std::fs::File::open(&root).unwrap();
+        assert!(!follow_finished(&first).unwrap());
+        publish_follow_finished(&remover).unwrap();
+        assert!(follow_finished(&first).unwrap());
+        assert!(!wait_for_followers(&remover, std::time::Duration::from_millis(30)).unwrap());
+        drop(first);
+        assert!(!wait_for_followers(&remover, std::time::Duration::from_millis(30)).unwrap());
+        drop(second);
+        assert!(wait_for_followers(&remover, std::time::Duration::from_secs(1)).unwrap());
+        assert_eq!(
+            follow_guard(&path).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(remover);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn follow_rejects_invalid_finished_marker() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!(
+            "zerun-follow-marker-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let guard = follow_guard(&root.join("console.log")).unwrap();
+        symlink("missing", root.join(FOLLOW_FINISHED)).unwrap();
+        assert!(follow_finished(&guard).is_err());
+        assert!(publish_follow_finished(&guard).is_err());
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn log_open_pins_parent_and_rejects_a_directory_symlink() {

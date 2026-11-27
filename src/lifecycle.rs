@@ -26,7 +26,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::fd::RawFd;
-use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -341,6 +341,16 @@ pub fn run_detached(
     // socket, then EOF.
     captured_log.release_attach(code);
     if remove_state {
+        match crate::logs::publish_follow_finished(&captured_log.directory) {
+            Ok(()) => {
+                if let Err(error) =
+                    crate::logs::wait_for_followers(&captured_log.directory, Duration::from_secs(2))
+                {
+                    eprintln!("zerun: warning: wait for log followers: {error}");
+                }
+            }
+            Err(error) => eprintln!("zerun: warning: signal log followers: {error}"),
+        }
         if let Some(st) = ContainerState::load(&store, &id) {
             crate::remove_anonymous_volumes(&store, &st.id, &st.anonymous_volumes);
         }
@@ -463,6 +473,7 @@ fn pending_restart_allowed(
 /// Background pipe -> timestamped console.log collector.
 struct CapturedLog {
     reader: Option<JoinHandle<()>>,
+    directory: File,
     /// Live-output fan-out for `zerun attach` (None when the socket could
     /// not be bound; attach then reports no socket instead of failing runs).
     attach: Option<AttachHub>,
@@ -471,6 +482,10 @@ struct CapturedLog {
 impl CapturedLog {
     fn install(log_path: &Path, previous_log_fd: RawFd, log_options: LogOptions) -> ZResult<Self> {
         let log_file = RotatingLog::open(log_path, log_options)?;
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(format!("/proc/self/fd/{}", log_file.directory.as_raw_fd()))?;
         let (read_fd, write_fd) = crate::syscalls::pipe2_cloexec()?;
 
         // Detached stdin has no terminal. stdout/stderr become the pipe read by
@@ -501,6 +516,7 @@ impl CapturedLog {
             .spawn(move || collect_timestamped(read_fd, log_file, attach_clients))?;
         Ok(Self {
             reader: Some(reader),
+            directory,
             attach,
         })
     }

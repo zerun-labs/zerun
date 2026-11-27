@@ -926,6 +926,18 @@ fi
 test "$("${zerun[@]}" logs --tail 1 "$partial_log_id")" = partial-log
 "${zerun[@]}" rm "$partial_log_id" >/dev/null
 
+# A follower must drain retained rotations and the final partial record before
+# automatic removal, even though the reaper holds the lifecycle lock.
+follow_rm_id=$("${zerun[@]}" run -d --rm --rootfs "$rootfs" --net none \
+  --log-max-size 60 --log-max-file 4 -- /bin/sh -c \
+  'sleep 1; printf "rotation-first\nrotation-second\nfinal-partial"')
+cleanup_ids+=("$follow_rm_id")
+follow_rm_output=$("${zerun[@]}" logs -f "$follow_rm_id")
+if [[ $follow_rm_output != $'rotation-first\nrotation-second\nfinal-partial' ]]; then
+  echo "follow missed output before automatic removal" >&2
+  exit 1
+fi
+
 # Automatic restart policies are evaluated by the same reaper. Bind a published
 # port so a retry also proves the previous proxy released its listener before
 # the next attempt starts.
