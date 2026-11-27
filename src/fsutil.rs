@@ -156,36 +156,52 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> ZResult<()> {
 /// document; the file and directory syncs make the replacement survive a
 /// sudden reboot on filesystems that honor fsync.
 pub fn atomic_write_mode(path: &Path, data: &[u8], mode: u32) -> ZResult<()> {
+    atomic_write_with_sequence(path, data, mode, || {
+        ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
+    })
+}
+
+fn atomic_write_with_sequence(
+    path: &Path,
+    data: &[u8],
+    mode: u32,
+    mut next_sequence: impl FnMut() -> u64,
+) -> ZResult<()> {
     let dir = path
         .parent()
         .ok_or_else(|| crate::zerr!("no parent for {}", path.display()))?;
     fs::create_dir_all(dir).map_err(|e| crate::zerr!("mkdir {}: {e}", dir.display()))?;
-    let sequence = ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(
-        ".tmp-{}-{sequence}-{}",
-        std::process::id(),
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("state")
-    ));
-    let result = (|| -> ZResult<()> {
-        let mut file = OpenOptions::new()
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state");
+    for _ in 0..128 {
+        let sequence = next_sequence();
+        let tmp = dir.join(format!(".tmp-{}-{sequence}-{name}", std::process::id()));
+        let mut file = match OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(mode)
             .open(&tmp)
-            .map_err(|e| crate::zerr!("create {}: {e}", tmp.display()))?;
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(crate::zerr!("create {}: {error}", tmp.display())),
+        };
+        let guard = TempFileGuard::new(tmp.clone());
         file.write_all(data)
             .map_err(|e| crate::zerr!("write {}: {e}", tmp.display()))?;
         file.sync_all()
             .map_err(|e| crate::zerr!("sync {}: {e}", tmp.display()))?;
         fs::rename(&tmp, path)
             .map_err(|e| crate::zerr!("rename {} -> {}: {e}", tmp.display(), path.display()))?;
-        sync_directory(dir)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+        let _ = guard.persist();
+        return sync_directory(dir);
     }
-    result
+    Err(crate::zerr!(
+        "cannot allocate a unique temporary file for {}",
+        path.display()
+    ))
 }
 
 /// Atomically write a state file within a pinned directory descriptor.
@@ -444,6 +460,46 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"second");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_preserves_colliding_temporary_entries() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-atomic-collision-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("state.json");
+        let candidate =
+            |sequence| dir.join(format!(".tmp-{}-{sequence}-state.json", std::process::id()));
+        fs::write(candidate(0), b"keep file").unwrap();
+        fs::create_dir(candidate(1)).unwrap();
+        fs::write(candidate(1).join("child"), b"keep directory").unwrap();
+        symlink("missing", candidate(2)).unwrap();
+        let mut sequence = 0;
+        atomic_write_with_sequence(&path, b"installed", 0o600, || {
+            let next = sequence;
+            sequence += 1;
+            next
+        })
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"installed");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read(candidate(0)).unwrap(), b"keep file");
+        assert_eq!(
+            fs::read(candidate(1).join("child")).unwrap(),
+            b"keep directory"
+        );
+        assert_eq!(fs::read_link(candidate(2)).unwrap(), Path::new("missing"));
+        assert!(atomic_write_with_sequence(&path, b"replacement", 0o600, || 0).is_err());
+        assert_eq!(fs::read(candidate(0)).unwrap(), b"keep file");
+        assert_eq!(fs::read(&path).unwrap(), b"installed");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
