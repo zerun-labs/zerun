@@ -9,20 +9,41 @@
 //! cannot participate in `--since`/`--until` selection because there is no
 //! trustworthy capture-time anchor.
 
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Open a console log without following a final symlink or blocking on a FIFO.
 pub fn open_console_log(path: &Path, create: bool, append: bool) -> std::io::Result<std::fs::File> {
-    let file = std::fs::OpenOptions::new()
+    let open = |path: &Path, create: bool| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .append(append)
+            .create(create)
+            .mode(0o600)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+    };
+    let file = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .append(append)
         .create(create)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            let pinned = secure_log_file(path)?;
+            // Reopen the same inode; resolving `path` again would allow it to
+            // change between permission repair and the writable open.
+            open(&descriptor_path(&pinned), false)?
+        }
+        Err(error) => return Err(error),
+    };
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -30,6 +51,29 @@ pub fn open_console_log(path: &Path, create: bool, append: bool) -> std::io::Res
         ));
     }
     Ok(file)
+}
+
+/// Secure a pinned regular log inode without requiring read or write access.
+pub fn secure_log_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "console log is not a regular file",
+        ));
+    }
+    std::fs::set_permissions(
+        descriptor_path(&file),
+        std::fs::Permissions::from_mode(0o600),
+    )?;
+    Ok(file)
+}
+
+fn descriptor_path(file: &std::fs::File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
 
 /// Open a retained log for reading without following links or blocking on a FIFO.

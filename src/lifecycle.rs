@@ -622,8 +622,8 @@ impl RotatingLog {
         // were enforced. Secure every retained inode after the rename pass.
         for index in 1..max_files {
             let archive = numbered_path(&self.active, index);
-            match secure_log_archive(&archive) {
-                Ok(()) => {}
+            match crate::logs::secure_log_file(&archive) {
+                Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
@@ -638,24 +638,6 @@ impl RotatingLog {
         self.needs_separator = false;
         Ok(())
     }
-}
-
-/// Secure the opened archive inode even when its current mode denies reads and writes.
-fn secure_log_archive(path: &Path) -> std::io::Result<()> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "console log archive is not a regular file",
-        ));
-    }
-    // O_PATH pins the inode without requiring read permission. chmod through
-    // procfs addresses that inode even if the archive name is replaced.
-    let descriptor_path = format!("/proc/self/fd/{}", file.as_raw_fd());
-    std::fs::set_permissions(descriptor_path, std::fs::Permissions::from_mode(0o600))
 }
 
 fn numbered_path(active: &Path, index: usize) -> std::path::PathBuf {
@@ -1183,6 +1165,22 @@ mod attach_tests {
         assert_eq!(
             std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
             0o644
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn active_console_log_recovers_owner_only_permissions() {
+        let dir = temp_log_dir("active-private-mode");
+        let active = dir.join("console.log");
+        std::fs::write(&active, b"old\n").unwrap();
+        std::fs::set_permissions(&active, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut log = crate::logs::open_console_log(&active, true, true).unwrap();
+        log.write_all(b"new\n").unwrap();
+        assert_eq!(std::fs::read(&active).unwrap(), b"old\nnew\n");
+        assert_eq!(
+            std::fs::metadata(&active).unwrap().permissions().mode() & 0o777,
+            0o600
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
