@@ -190,10 +190,9 @@ pub fn atomic_write_mode(path: &Path, data: &[u8], mode: u32) -> ZResult<()> {
 
 /// Atomically write a state file within a pinned directory descriptor.
 pub fn atomic_write_state_at(directory: &File, data: &[u8]) -> ZResult<()> {
-    let sequence = ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = format!(".tmp-{}-{sequence}-state.json", std::process::id());
-    let mut file = crate::syscalls::create_file_at(directory, &tmp, 0o600)
-        .map_err(|error| crate::zerr!("create temporary state file: {error}"))?;
+    let (tmp, mut file) = create_state_temp(directory, || {
+        ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
+    })?;
     let result = (|| -> ZResult<()> {
         file.write_all(data)
             .map_err(|error| crate::zerr!("write temporary state file: {error}"))?;
@@ -210,6 +209,26 @@ pub fn atomic_write_state_at(directory: &File, data: &[u8]) -> ZResult<()> {
         let _ = crate::syscalls::unlink_file_at(directory, &tmp);
     }
     result
+}
+
+fn create_state_temp(
+    directory: &File,
+    mut next_sequence: impl FnMut() -> u64,
+) -> ZResult<(String, File)> {
+    // A crashed process can leave a temporary file and its PID may be reused.
+    // Never remove an existing entry: it may belong to another writer.
+    for _ in 0..128 {
+        let sequence = next_sequence();
+        let name = format!(".tmp-{}-{sequence}-state.json", std::process::id());
+        match crate::syscalls::create_file_at(directory, &name, 0o600) {
+            Ok(file) => return Ok((name, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(crate::zerr!("create temporary state file: {error}")),
+        }
+    }
+    Err(crate::zerr!(
+        "cannot allocate a unique temporary state file"
+    ))
 }
 
 /// Flush directory-entry changes after installing or removing durable files.
@@ -451,6 +470,33 @@ mod tests {
             0o600
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_temp_allocation_skips_existing_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-state-temp-collision-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let directory = File::open(&root).unwrap();
+        let existing = format!(".tmp-{}-0-state.json", std::process::id());
+        fs::write(root.join(&existing), b"existing").unwrap();
+        let mut sequence = 0;
+        let (name, file) = create_state_temp(&directory, || {
+            let value = sequence;
+            sequence += 1;
+            value
+        })
+        .unwrap();
+        assert_eq!(name, format!(".tmp-{}-1-state.json", std::process::id()));
+        assert_eq!(fs::read(root.join(&existing)).unwrap(), b"existing");
+        drop(file);
+        let error = create_state_temp(&directory, || 0).unwrap_err().to_string();
+        assert!(error.contains("unique temporary state file"), "{error}");
+        assert_eq!(fs::read(root.join(&existing)).unwrap(), b"existing");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
