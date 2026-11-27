@@ -14,33 +14,21 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Open a console log without following a final symlink or blocking on a FIFO.
+/// Open a console log without following symlinks or blocking on a FIFO.
 pub fn open_console_log(path: &Path, create: bool, append: bool) -> std::io::Result<std::fs::File> {
-    let open = |path: &Path, create: bool| {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .append(append)
-            .create(create)
-            .mode(0o600)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)
-    };
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .append(append)
-        .create(create)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
+    let (directory, name) = open_log_directory(path)?;
+    let file = match crate::syscalls::open_log_writer_at(&directory, name, create, append) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            let pinned = secure_log_file(path)?;
-            // Reopen the same inode; resolving `path` again would allow it to
-            // change between permission repair and the writable open.
-            open(&descriptor_path(&pinned), false)?
+            let pinned = secure_log_file_at(&directory, name)?;
+            // Reopen the same inode; resolving the name again would allow it
+            // to change between permission repair and the writable open.
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .append(append)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(descriptor_path(&pinned))?
         }
         Err(error) => return Err(error),
     };
@@ -50,10 +38,15 @@ pub fn open_console_log(path: &Path, create: bool, append: bool) -> std::io::Res
 
 /// Secure a pinned regular log inode without requiring read or write access.
 pub fn secure_log_file(path: &Path) -> std::io::Result<std::fs::File> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
+    let (directory, name) = open_log_directory(path)?;
+    secure_log_file_at(&directory, name)
+}
+
+fn secure_log_file_at(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<std::fs::File> {
+    let file = crate::syscalls::open_log_path_at(directory, name)?;
     validate_log_file(&file)?;
     std::fs::set_permissions(
         descriptor_path(&file),
@@ -66,8 +59,7 @@ fn descriptor_path(file: &std::fs::File) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
 
-/// Open a retained log for reading without following links or blocking on a FIFO.
-pub fn open_console_log_reader(path: &Path) -> std::io::Result<std::fs::File> {
+fn open_log_directory(path: &Path) -> std::io::Result<(std::fs::File, &std::ffi::OsStr)> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -77,6 +69,12 @@ pub fn open_console_log_reader(path: &Path) -> std::io::Result<std::fs::File> {
         .read(true)
         .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(parent)?;
+    Ok((directory, name))
+}
+
+/// Open a retained log for reading without following links or blocking on a FIFO.
+pub fn open_console_log_reader(path: &Path) -> std::io::Result<std::fs::File> {
+    let (directory, name) = open_log_directory(path)?;
     let file = crate::syscalls::open_log_file_at(&directory, name)?;
     validate_log_file(&file)?;
     Ok(file)
@@ -545,7 +543,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn log_reader_pins_parent_and_rejects_a_directory_symlink() {
+    fn log_open_pins_parent_and_rejects_a_directory_symlink() {
         use std::io::Read;
         use std::os::unix::fs::symlink;
 
@@ -562,6 +560,11 @@ mod tests {
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(directory.join("console.log"), b"original").unwrap();
         std::fs::write(outside.join("console.log"), b"outside").unwrap();
+        std::fs::set_permissions(
+            outside.join("console.log"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
         let pinned = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -570,6 +573,20 @@ mod tests {
         std::fs::rename(&directory, &moved).unwrap();
         symlink(&outside, &directory).unwrap();
         assert!(open_console_log_reader(&directory.join("console.log")).is_err());
+        assert!(open_console_log(&directory.join("console.log"), true, false).is_err());
+        assert!(secure_log_file(&directory.join("console.log")).is_err());
+        assert_eq!(
+            std::fs::read(outside.join("console.log")).unwrap(),
+            b"outside"
+        );
+        assert_eq!(
+            std::fs::metadata(outside.join("console.log"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
         for invalid in ["", ".", "..", "../outside/console.log"] {
             assert_eq!(
                 crate::syscalls::open_log_file_at(&pinned, std::ffi::OsStr::new(invalid))
@@ -578,12 +595,20 @@ mod tests {
                 std::io::ErrorKind::InvalidInput
             );
         }
+        let mut writer = crate::syscalls::open_log_writer_at(
+            &pinned,
+            std::ffi::OsStr::new("console.log"),
+            true,
+            true,
+        )
+        .unwrap();
+        std::io::Write::write_all(&mut writer, b"-appended").unwrap();
         let mut file =
             crate::syscalls::open_log_file_at(&pinned, std::ffi::OsStr::new("console.log"))
                 .unwrap();
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
-        assert_eq!(bytes, b"original");
+        assert_eq!(bytes, b"original-appended");
         std::fs::remove_dir_all(root).unwrap();
     }
 

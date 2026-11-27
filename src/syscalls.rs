@@ -86,6 +86,35 @@ pub fn open_log_file_at(
     directory: &std::fs::File,
     name: &std::ffi::OsStr,
 ) -> std::io::Result<std::fs::File> {
+    open_log_entry_at(directory, name, libc::O_RDONLY)
+}
+
+/// Open or create a log for writing relative to a pinned directory.
+pub fn open_log_writer_at(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+    create: bool,
+    append: bool,
+) -> std::io::Result<std::fs::File> {
+    let flags = libc::O_RDWR
+        | if create { libc::O_CREAT } else { 0 }
+        | if append { libc::O_APPEND } else { 0 };
+    open_log_entry_at(directory, name, flags)
+}
+
+/// Pin a log entry without requiring read or write permissions.
+pub fn open_log_path_at(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<std::fs::File> {
+    open_log_entry_at(directory, name, libc::O_PATH)
+}
+
+fn open_log_entry_at(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+    flags: libc::c_int,
+) -> std::io::Result<std::fs::File> {
     use std::os::unix::ffi::OsStrExt;
 
     let bytes = name.as_bytes();
@@ -97,7 +126,8 @@ pub fn open_log_file_at(
         libc::openat(
             directory.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            0o600 as libc::mode_t,
         )
     };
     if fd < 0 {
