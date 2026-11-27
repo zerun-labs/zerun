@@ -10,7 +10,7 @@
 //! trustworthy capture-time anchor.
 
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -44,12 +44,7 @@ pub fn open_console_log(path: &Path, create: bool, append: bool) -> std::io::Res
         }
         Err(error) => return Err(error),
     };
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "console log is not a regular file",
-        ));
-    }
+    validate_log_file(&file)?;
     Ok(file)
 }
 
@@ -59,12 +54,7 @@ pub fn secure_log_file(path: &Path) -> std::io::Result<std::fs::File> {
         .read(true)
         .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "console log is not a regular file",
-        ));
-    }
+    validate_log_file(&file)?;
     std::fs::set_permissions(
         descriptor_path(&file),
         std::fs::Permissions::from_mode(0o600),
@@ -82,13 +72,27 @@ pub fn open_console_log_reader(path: &Path) -> std::io::Result<std::fs::File> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
-    if !file.metadata()?.is_file() {
+    validate_log_file(&file)?;
+    Ok(file)
+}
+
+fn validate_log_file(file: &std::fs::File) -> std::io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "console log is not a regular file",
         ));
     }
-    Ok(file)
+    // An unlinked inode can still be read safely after rotation; multiple
+    // links can make a log operation affect a file outside the state directory.
+    if metadata.nlink() > 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "console log has multiple hard links",
+        ));
+    }
+    Ok(())
 }
 
 /// Default detached-console rotation budget. Rotating by default keeps a
@@ -533,6 +537,23 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_accepts_inode_unlinked_during_rotation() {
+        let path = std::env::temp_dir().join(format!(
+            "zerun-unlinked-log-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(file.metadata().unwrap().nlink(), 0);
+        validate_log_file(&file).unwrap();
+    }
 
     const OLD: &[u8] = b"2026-01-01T00:00:00.100000000Z\told\n";
     const MIDDLE: &[u8] = b"2026-01-01T00:00:01.500000000Z\tmiddle\n";

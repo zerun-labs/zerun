@@ -1170,6 +1170,33 @@ mod attach_tests {
     }
 
     #[test]
+    fn console_log_rejects_hard_links_before_access_or_permission_repair() {
+        let dir = temp_log_dir("log-hard-link");
+        let active = dir.join("console.log");
+        let outside = dir.join("outside");
+        std::fs::write(&outside, b"preserve").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::hard_link(&outside, &active).unwrap();
+        assert!(crate::logs::open_console_log(&active, true, false).is_err());
+        assert!(crate::logs::open_console_log_reader(&active).is_err());
+        assert!(crate::logs::secure_log_file(&active).is_err());
+        assert!(RotatingLog::open(&active, LogOptions::default()).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"preserve");
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(crate::logs::open_console_log(&active, true, true).is_err());
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o000
+        );
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn active_console_log_recovers_owner_only_permissions() {
         let dir = temp_log_dir("active-private-mode");
         let active = dir.join("console.log");
