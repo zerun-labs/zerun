@@ -1493,6 +1493,7 @@ mod attach_tests {
             cgroup: None,
             metrics: None,
         };
+        std::fs::create_dir(ContainerState::dir(&store, id)).unwrap();
         state.save(&store).unwrap();
 
         let mut loaded = ContainerState::load(&store, id).unwrap();
@@ -1655,6 +1656,7 @@ mod shared_namespace_tests {
 
         let pid = crate::syscalls::process_id();
         let start_time = crate::procinfo::process_start_time(pid).unwrap();
+        std::fs::create_dir(ContainerState::dir(&store, "0123456789ab")).unwrap();
         running_state("0123456789ab", pid, start_time)
             .save(&store)
             .unwrap();
@@ -1682,6 +1684,7 @@ mod shared_namespace_tests {
 
         let pid = crate::syscalls::process_id();
         let start_time = crate::procinfo::process_start_time(pid).unwrap();
+        std::fs::create_dir(ContainerState::dir(&store, "0123456789ab")).unwrap();
         running_state("0123456789ab", pid, start_time)
             .save(&store)
             .unwrap();

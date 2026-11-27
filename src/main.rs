@@ -2655,8 +2655,13 @@ fn run_detached(
         }
     }
 
-    if let Err(e) = fsutil::mkdir_p_mode(&sdir, 0o700) {
-        eprintln!("zerun: {e}");
+    let secure_state_dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(&sdir)
+        .and_then(|directory| directory.set_permissions(std::fs::Permissions::from_mode(0o700)));
+    if let Err(e) = secure_state_dir {
+        eprintln!("zerun: secure state directory {}: {e}", sdir.display());
         if !resuming {
             cleanup_failed_detached_start(
                 store,
@@ -8893,6 +8898,7 @@ mod tests {
             "rootfs": ""
         }))
         .unwrap();
+        std::fs::create_dir(ContainerState::dir(&store, &container.id)).unwrap();
         container.save(&store).unwrap();
         let lock = state::ContainerOperationLock::try_acquire(&store, &container.id).unwrap();
         let (started_tx, started_rx) = mpsc::channel();

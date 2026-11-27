@@ -767,16 +767,8 @@ impl ContainerState {
             .ok_or_else(|| crate::zerr!("state path has no parent: {}", p.display()))?;
         // State includes the resolved environment and command line, which can
         // contain credentials or other operator-provided secrets.
-        match std::fs::create_dir(parent) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(crate::zerr!(
-                    "create state directory {}: {error}",
-                    parent.display()
-                ))
-            }
-        }
+        // New containers reserve this directory before the first save.
+        // Recreating a removed directory here could resurrect stale state.
         let directory = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -1493,6 +1485,7 @@ mod tests {
             .join("console.log")
             .display()
             .to_string();
+        std::fs::create_dir(ContainerState::dir(&store, &a.id)).unwrap();
         a.save(&store).unwrap();
         let state_path = ContainerState::path(&store, &a.id);
         assert!(state_path.exists());
@@ -1535,6 +1528,15 @@ mod tests {
             std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
             0o755
         );
+
+        let mut removed = a.clone();
+        removed.id = "aa5678".to_string();
+        let removed_dir = ContainerState::dir(&store, &removed.id);
+        std::fs::create_dir(&removed_dir).unwrap();
+        removed.save(&store).unwrap();
+        std::fs::remove_dir_all(&removed_dir).unwrap();
+        assert!(removed.save(&store).is_err());
+        assert!(!removed_dir.exists());
 
         let mut invalid = a.clone();
         invalid.id = "../outside".to_string();
