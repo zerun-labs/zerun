@@ -1388,6 +1388,24 @@ attach_output=$("${zerun[@]}" attach "$attach_id")
 grep -Fxq attach-ok <<<"$attach_output"
 "${zerun[@]}" rm "$attach_id" >/dev/null
 
+# One attach stream remains connected across automatic attempts and carries
+# the last workload exit status, not the first attempt's status as metadata.
+attach_restart_marker="zerun-attach-restart-$$"
+cleanup_paths+=("$rootfs/$attach_restart_marker")
+attach_restart_id=$("${zerun[@]}" run -d --restart=on-failure:1 --rootfs "$rootfs" \
+  --no-overlay --net none --init -- /bin/sh -c \
+  "sleep 1; if [ -f /$attach_restart_marker ]; then printf 'attach-restart-second\n'; exit 23; fi; touch /$attach_restart_marker; printf 'attach-restart-first\n'; exit 7")
+cleanup_ids+=("$attach_restart_id")
+set +e
+attach_restart_output=$("${zerun[@]}" attach "$attach_restart_id")
+attach_restart_status=$?
+set -e
+test "$attach_restart_status" -eq 23
+grep -Fxq attach-restart-first <<<"$attach_restart_output"
+grep -Fxq attach-restart-second <<<"$attach_restart_output"
+"${zerun[@]}" rm "$attach_restart_id" >/dev/null
+remove_cleanup_path "$rootfs/$attach_restart_marker"
+
 # The attach control frame must preserve non-zero exit codes even when --rm
 # removes the state record before the attaching CLI performs its fallback read.
 attach_rm_id=$("${zerun[@]}" run -d --rm --rootfs "$rootfs" --no-overlay --net none \
