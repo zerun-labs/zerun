@@ -14,9 +14,9 @@ pub const MAX_LABEL_FILE_BYTES: u64 = 1024 * 1024;
 /// label, stores only the first `=`, and rejects whitespace in the key.
 pub fn parse_cli(raw: &str) -> Result<(String, String), String> {
     let (key, value) = raw.split_once('=').unwrap_or((raw, ""));
-    validate_key(key).map_err(|error| format!("invalid label {raw:?}: {error}"))?;
+    validate_key(key).map_err(|error| format!("invalid label: {error}"))?;
     if value.contains('\0') {
-        return Err(format!("invalid label {raw:?}: value contains NUL"));
+        return Err("invalid label: value contains NUL".to_string());
     }
     Ok((key.to_string(), value.to_string()))
 }
@@ -73,7 +73,7 @@ fn validate_key(key: &str) -> Result<(), String> {
         return Err("name contains NUL".to_string());
     }
     if key.chars().any(char::is_whitespace) {
-        return Err(format!("name {key:?} contains whitespace"));
+        return Err("name contains whitespace".to_string());
     }
     Ok(())
 }
@@ -95,6 +95,20 @@ mod tests {
         for invalid in ["", "=value", "white space=value", "bad\0key=value"] {
             assert!(parse_cli(invalid).is_err(), "accepted {invalid:?}");
         }
+    }
+
+    #[test]
+    fn invalid_labels_do_not_expose_contents() {
+        for input in ["private key=private-value", "key=private-value\0"] {
+            let error = parse_cli(input).unwrap_err();
+            assert!(!error.contains("private"), "{error}");
+        }
+        let error = parse_file("ok=value\nprivate key=private-value\n").unwrap_err();
+        assert!(
+            error.contains("line 2") && error.contains("whitespace"),
+            "{error}"
+        );
+        assert!(!error.contains("private"), "{error}");
     }
 
     #[test]
