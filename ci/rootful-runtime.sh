@@ -4,6 +4,15 @@
 # lifecycle introspection, rootfs export/import, and the in-process published-port proxy.
 set -Eeuo pipefail
 
+# Many assertions are deliberately quiet; identify the failing line without
+# dumping commands or fixture data into CI logs. Expected failures use set +e.
+report_failure() {
+  if [[ $- == *e* ]]; then
+    printf 'rootful integration failed at line %s (status %s)\n' "$1" "$2" >&2
+  fi
+}
+trap 'report_failure "$LINENO" "$?"' ERR
+
 if [[ $# -ne 4 ]]; then
   echo "usage: $0 ZERUN_BIN ROOTFS DATA_ROOT RUNTIME_ROOT" >&2
   exit 2
