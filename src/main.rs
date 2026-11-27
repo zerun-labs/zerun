@@ -7774,12 +7774,36 @@ fn cmd_attach(args: &[String]) -> i32 {
     if let Some(code) = final_code {
         return code;
     }
-    // A reaper crash may close the socket before sending its final control
-    // frame. In that case, use the state record if it was persisted.
-    match state::ContainerState::load(&store, &st.id) {
-        Some(final_state) => final_state.exit_code.unwrap_or(0),
-        None => 0,
+    match attach_exit_after_eof(&store, &st) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("zerun attach: {error}");
+            1
+        }
     }
+}
+
+/// An interrupted attach stream is successful only with a persisted terminal
+/// status for the same workload attempt.
+fn attach_exit_after_eof(store: &Store, attached: &ContainerState) -> Result<i32, String> {
+    let final_state = ContainerState::load_checked(store, &attached.id)
+        .map_err(|error| format!("cannot read container state after attach closed: {error}"))?
+        .ok_or_else(|| {
+            "attach stream closed without an exit status; container state is missing".to_string()
+        })?;
+    if final_state.status != state::Status::Exited
+        || final_state.restart_pending
+        || final_state.pid != attached.pid
+        || final_state.pid_start_time != attached.pid_start_time
+        || final_state.started != attached.started
+    {
+        return Err(
+            "attach stream closed without an exit status for this container attempt".to_string(),
+        );
+    }
+    final_state.exit_code.ok_or_else(|| {
+        "attach stream closed without an exit status; container state has no exit code".to_string()
+    })
 }
 
 #[derive(Debug, Default)]
@@ -8951,6 +8975,43 @@ mod tests {
         );
         waiter.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attach_eof_requires_terminal_status_for_same_attempt() {
+        let root = std::env::temp_dir().join(format!("zerun-attach-eof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.join("data"), root.join("run"));
+        store.ensure_dirs().unwrap();
+        let mut container: ContainerState = serde_json::from_value(serde_json::json!({
+            "version": 1, "id": "0123456789ab", "image": "rootfs:test",
+            "status": "running", "pid": 123, "pid_start_time": 456,
+            "started": "2026-01-01T00:00:00Z", "created": "2026-01-01T00:00:00Z",
+            "rootless": false, "net": "none", "ports": [], "cmd": [], "env": [],
+            "log": "", "rootfs": ""
+        }))
+        .unwrap();
+        std::fs::create_dir(ContainerState::dir(&store, &container.id)).unwrap();
+        let attached = container.clone();
+        container.exit_code = Some(0);
+        container.save(&store).unwrap();
+        assert!(attach_exit_after_eof(&store, &attached).is_err());
+        container.status = state::Status::Exited;
+        container.exit_code = None;
+        container.save(&store).unwrap();
+        assert!(attach_exit_after_eof(&store, &attached).is_err());
+        container.exit_code = Some(42);
+        container.save(&store).unwrap();
+        assert_eq!(attach_exit_after_eof(&store, &attached).unwrap(), 42);
+        container.restart_pending = true;
+        container.save(&store).unwrap();
+        assert!(attach_exit_after_eof(&store, &attached).is_err());
+        container.restart_pending = false;
+        container.pid_start_time = Some(457);
+        container.save(&store).unwrap();
+        assert!(attach_exit_after_eof(&store, &attached).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(attach_exit_after_eof(&store, &attached).is_err());
     }
 
     #[test]
