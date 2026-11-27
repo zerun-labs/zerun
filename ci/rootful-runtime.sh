@@ -1237,6 +1237,41 @@ path_container=$("${zerun[@]}" run -d --net none \
 cleanup_ids+=("$path_container")
 path_output=$("${zerun[@]}" exec "$path_container" path-probe)
 test "$path_output" = path-search-ok
+
+# Legacy exec inherits arbitrary Unix environment bytes, while image exec only
+# receives them when explicitly requested via a bare -e override.
+raw_env_container=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none --init -- /bin/sleep 30)
+cleanup_ids+=("$raw_env_container")
+"${privileged[@]}" python3 - "$binary" "$data_root" "$runtime_root" "$raw_env_container" "$path_container" <<'PY_EOF'
+import os
+import subprocess
+import sys
+
+binary, data_root, runtime_root, legacy_id, image_id = sys.argv[1:]
+env = os.environb.copy()
+env[b"ZERUN_DATA_ROOT"] = os.fsencode(data_root)
+env[b"ZERUN_RUNTIME_ROOT"] = os.fsencode(runtime_root)
+env[b"ZERUN_RAW_VALUE"] = b"raw-\xff-value"
+env[b"ZERUN_RAW_\xff_KEY"] = b"present"
+env[b"ZERUN_OVERRIDE"] = b"old-\xff-value"
+for mode, container in (("legacy", legacy_id), ("image", image_id)):
+    result = subprocess.run(
+        [binary, "exec", "-e", "ZERUN_RAW_VALUE", "-e", "ZERUN_OVERRIDE=new-value",
+         container, "/bin/busybox", "env"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit(f"{mode} exec failed with status {result.returncode}")
+    entries = result.stdout.splitlines()
+    if b"ZERUN_RAW_VALUE=raw-\xff-value" not in entries:
+        raise SystemExit(f"{mode} exec lost non-UTF-8 passthrough value")
+    if b"ZERUN_OVERRIDE=new-value" not in entries:
+        raise SystemExit(f"{mode} exec did not replace inherited value")
+    has_raw_key = b"ZERUN_RAW_\xff_KEY=present" in entries
+    if has_raw_key != (mode == "legacy"):
+        raise SystemExit(f"{mode} exec inherited an unexpected environment")
+PY_EOF
+"${zerun[@]}" rm -f "$raw_env_container" >/dev/null
 path_output=$("${zerun[@]}" exec -w /path-fixture/second -e PATH=:/missing "$path_container" path-probe)
 test "$path_output" = path-search-ok
 set +e

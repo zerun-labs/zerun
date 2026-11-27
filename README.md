@@ -532,6 +532,10 @@ is fail-closed: an unreadable or malformed `state.json` makes lifecycle commands
 inventory-dependent image GC report the damaged record instead of silently ignoring it.
 `doctor` reports the same state-store check.
 
+For image containers, `exec` uses the recorded container environment; `exec -e NAME`
+passes the caller's value through. For legacy `--rootfs` containers, `exec` inherits
+the caller's environment. These paths preserve non-UTF-8 environment bytes.
+
 `-dt` allocates a PTY for a detached workload, so terminal-aware services retain
 line-buffered output and `TERM` defaults. Detached PTYs start at a conventional 24x80
 geometry; output-only foreground PTYs mirror and follow the caller terminal's resize

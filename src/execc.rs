@@ -24,6 +24,7 @@ use crate::error::ZResult;
 use crate::pty::{self, PtyPair};
 use crate::state::{ContainerState, Status};
 use crate::workload;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::Path;
@@ -661,12 +662,16 @@ fn worker(
 
     // Environment: the container's recorded env (image mode) or the caller's
     // inherited env (legacy rootfs mode), plus `-e` overrides.
-    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut pairs: Vec<(OsString, OsString)> = Vec::new();
     if state.env.is_empty() {
-        pairs.extend(std::env::vars());
+        pairs.extend(std::env::vars_os());
     } else {
         match crate::state_env(&state.env) {
-            Ok(entries) => pairs.extend(entries),
+            Ok(entries) => pairs.extend(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value.into())),
+            ),
             Err(error) => {
                 eprintln!("zerun exec: {error}");
                 return 1;
@@ -679,19 +684,19 @@ fn worker(
             return 1;
         }
         match kv.split_once('=') {
-            Some((k, v)) => upsert(&mut pairs, k, v),
+            Some((k, v)) => upsert(&mut pairs, k, OsStr::new(v)),
             None => {
                 // `-e NAME` passes the host value through (docker semantics).
-                if let Ok(v) = std::env::var(kv) {
+                if let Some(v) = std::env::var_os(kv) {
                     upsert(&mut pairs, kv, &v);
                 }
             }
         }
     }
-    if tty_slave >= 0 && workload::env_value(&pairs, "TERM").is_none() {
+    if tty_slave >= 0 && !pairs.iter().any(|(key, _)| key == "TERM") {
         pairs.push((
-            "TERM".to_string(),
-            std::env::var("TERM").unwrap_or_else(|_| "xterm".to_string()),
+            "TERM".into(),
+            std::env::var_os("TERM").unwrap_or_else(|| "xterm".into()),
         ));
     }
 
@@ -837,11 +842,11 @@ fn join_cgroup(procs: &File, pid: u32) -> std::io::Result<()> {
     procs.write_all(pid.to_string().as_bytes())
 }
 
-fn upsert(env: &mut Vec<(String, String)>, key: &str, value: &str) {
+fn upsert(env: &mut Vec<(OsString, OsString)>, key: &str, value: &OsStr) {
     if let Some(slot) = env.iter_mut().find(|(k, _)| k == key) {
-        slot.1 = value.to_string();
+        slot.1 = value.to_os_string();
     } else {
-        env.push((key.to_string(), value.to_string()));
+        env.push((key.into(), value.to_os_string()));
     }
 }
 
