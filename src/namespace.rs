@@ -943,13 +943,10 @@ fn supervisor_main(
                 syscalls::exit_process(1);
             }
         }
-        match child_main(spec, ipc, identity) {
-            Ok(()) => syscalls::exit_process(1),
-            Err(error) => {
-                eprintln!("zerun: child failed: {error}");
-                syscalls::exit_process(1);
-            }
-        }
+        // child_main reports setup failures through the error pipe; only the
+        // runtime parent should print them, avoiding interleaved diagnostics.
+        let _ = child_main(spec, ipc, identity);
+        syscalls::exit_process(1);
     }
 
     syscalls::close(ipc.start_gate_r);

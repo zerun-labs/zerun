@@ -278,13 +278,20 @@ grep -F 'requires a private network namespace' <<<"$host_sysctl_output" >/dev/nu
 # A failed direct exec must stay on the error pipe until execve succeeds or
 # reports an error. Closing it before exec makes the parent mistake a dead
 # workload for a successful start.
-set +e
-exec_failure_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay -- \
-  /definitely-missing-zerun-command 2>&1)
-exec_failure_status=$?
-set -e
-test "$exec_failure_status" -eq 1
-grep -F "container setup failed: execve failed:" <<<"$exec_failure_output" >/dev/null
+for attempt in {1..10}; do
+  set +e
+  exec_failure_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay -- \
+    /definitely-missing-zerun-command 2>&1)
+  exec_failure_status=$?
+  set -e
+  if [[ $exec_failure_status -ne 1 ]] ||
+    [[ $(grep -Fc 'container setup failed: execve failed:' <<<"$exec_failure_output") -ne 1 ]] ||
+    [[ $exec_failure_output == *'zerun: child failed:'* ]]; then
+    printf 'direct exec failure attempt %s returned status %s:\n%s\n' \
+      "$attempt" "$exec_failure_status" "$exec_failure_output" >&2
+    exit 1
+  fi
+done
 
 # Mini-init forks the workload instead of exec'ing it, but a workload exec
 # failure must still reach the runtime parent rather than looking like a
