@@ -9,6 +9,9 @@ use crate::seccomp::{self, SeccompMode};
 use crate::syscalls;
 use crate::trace;
 use std::collections::BTreeSet;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 
 /// Linux capability numbers (stable ABI; the libc crate does not expose them).
 pub(crate) mod cap {
@@ -360,10 +363,9 @@ fn resolve_user_spec(raw: &str) -> ZResult<ResolvedUser> {
         return Err(crate::zerr!("invalid --user '{raw}' (empty user)"));
     }
 
-    let uid = match parse_id(user_part) {
-        Some(id) => id,
-        None => lookup_user_uid_gid(user_part)
-            .map(|(uid, _)| uid)
+    let (uid, primary_gid) = match parse_id(user_part) {
+        Some(id) => (id, id),
+        None => lookup_user_uid_gid(user_part)?
             .ok_or_else(|| crate::zerr!("unknown user '{user_part}' in container /etc/passwd"))?,
     };
     let gid = match group_part {
@@ -373,19 +375,12 @@ fn resolve_user_spec(raw: &str) -> ZResult<ResolvedUser> {
             }
             match parse_id(group) {
                 Some(id) => id,
-                None => lookup_group_gid(group).ok_or_else(|| {
+                None => lookup_group_gid(group)?.ok_or_else(|| {
                     crate::zerr!("unknown group '{group}' in container /etc/group")
                 })?,
             }
         }
-        None => match parse_id(user_part) {
-            Some(id) => id,
-            None => lookup_user_uid_gid(user_part)
-                .map(|(_, gid)| gid)
-                .ok_or_else(|| {
-                    crate::zerr!("unknown user '{user_part}' in container /etc/passwd")
-                })?,
-        },
+        None => primary_gid,
     };
     Ok(ResolvedUser { uid, gid })
 }
@@ -448,9 +443,12 @@ pub fn resolve_group_additions(specs: &[String], rootless: bool) -> ZResult<Vec<
     }
     let mut groups = BTreeSet::new();
     for spec in specs {
-        let gid = parse_id(spec)
-            .or_else(|| lookup_group_gid(spec))
-            .ok_or_else(|| crate::zerr!("unknown --group-add '{spec}' in container /etc/group"))?;
+        let gid = match parse_id(spec) {
+            Some(gid) => gid,
+            None => lookup_group_gid(spec)?.ok_or_else(|| {
+                crate::zerr!("unknown --group-add '{spec}' in container /etc/group")
+            })?,
+        };
         groups.insert(gid);
     }
     Ok(groups.into_iter().collect())
@@ -463,26 +461,70 @@ fn parse_id(value: &str) -> Option<u32> {
     value.parse().ok()
 }
 
-fn lookup_user_uid_gid(name: &str) -> Option<(u32, u32)> {
-    let text = std::fs::read_to_string("/etc/passwd").ok()?;
-    for line in text.lines() {
-        let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() >= 4 && fields[0] == name {
-            return Some((fields[2].parse().ok()?, fields[3].parse().ok()?));
-        }
+// Account databases come from the container image. Bound reads and avoid
+// blocking on FIFOs or reading devices while still allowing regular symlinks.
+const MAX_ACCOUNT_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+fn read_account_file(path: &Path) -> ZResult<Option<String>> {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(crate::zerr!("open {}: {error}", path.display())),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| crate::zerr!("inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(crate::zerr!("{} is not a regular file", path.display()));
     }
-    None
+    let mut bytes = Vec::new();
+    file.take(MAX_ACCOUNT_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| crate::zerr!("read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > MAX_ACCOUNT_FILE_BYTES {
+        return Err(crate::zerr!(
+            "{} exceeds the {} byte limit",
+            path.display(),
+            MAX_ACCOUNT_FILE_BYTES
+        ));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| crate::zerr!("{} is not valid UTF-8", path.display()))
 }
 
-fn lookup_group_gid(name: &str) -> Option<u32> {
-    let text = std::fs::read_to_string("/etc/group").ok()?;
+fn lookup_user_uid_gid(name: &str) -> ZResult<Option<(u32, u32)>> {
+    let Some(text) = read_account_file(Path::new("/etc/passwd"))? else {
+        return Ok(None);
+    };
     for line in text.lines() {
-        let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() >= 3 && fields[0] == name {
-            return fields[2].parse().ok();
+        let mut fields = line.split(':');
+        if fields.next() == Some(name) {
+            let _ = fields.next();
+            let uid = fields.next().and_then(|value| value.parse().ok());
+            let gid = fields.next().and_then(|value| value.parse().ok());
+            return Ok(uid.zip(gid));
         }
     }
-    None
+    Ok(None)
+}
+
+fn lookup_group_gid(name: &str) -> ZResult<Option<u32>> {
+    let Some(text) = read_account_file(Path::new("/etc/group"))? else {
+        return Ok(None);
+    };
+    for line in text.lines() {
+        let mut fields = line.split(':');
+        if fields.next() == Some(name) {
+            let _ = fields.next();
+            return Ok(fields.next().and_then(|value| value.parse().ok()));
+        }
+    }
+    Ok(None)
 }
 
 /// PR_SET_NO_NEW_PRIVS=1: setuid/setgid bits and file capabilities no longer
@@ -523,6 +565,54 @@ fn keep_mask(keep: &CapabilitySet) -> (u32, u32) {
 #[cfg(test)]
 mod user_tests {
     use super::*;
+
+    #[test]
+    fn account_files_are_bounded_and_must_be_regular() {
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-account-file-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("passwd");
+        assert!(read_account_file(&path).unwrap().is_none());
+        std::fs::write(&path, b"alice:x:42:43::/:/bin/sh\n").unwrap();
+        assert!(read_account_file(&path)
+            .unwrap()
+            .unwrap()
+            .starts_with("alice:"));
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(read_account_file(&link).unwrap().is_some());
+        std::fs::write(&path, [0xff]).unwrap();
+        assert!(read_account_file(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("UTF-8"));
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_ACCOUNT_FILE_BYTES + 1)
+            .unwrap();
+        assert!(read_account_file(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("limit"));
+        assert!(read_account_file(Path::new("/dev/null"))
+            .unwrap_err()
+            .to_string()
+            .contains("regular file"));
+        let fifo = dir.join("fifo");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        assert!(read_account_file(&fifo)
+            .unwrap_err()
+            .to_string()
+            .contains("regular file"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn numeric_users_default_gid_to_uid() {

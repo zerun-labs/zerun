@@ -388,6 +388,8 @@ is retained by manual `start`/`restart`. `--restart` may also be changed on an e
 container. Changing the policy to `no` while the reaper is between attempts cancels the
 pending retry. Resource limits return to their launch-time values after `restart`.
 
+Named users and groups are resolved against the container's account files. Each file
+must be a regular UTF-8 file no larger than 8 MiB; numeric IDs do not require them.
 `--group-add` replaces the inherited supplementary group list, whether the workload
 runs as root or another user. Names are resolved against the container's `/etc/group`
 after `pivot_root`; numeric gids need no group file. Rootless containers deny `setgroups`

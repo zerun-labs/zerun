@@ -641,6 +641,45 @@ group_add_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay 
   --user testuser --group-add testgroup --group-add 4344 -- /bin/busybox id -G)
 grep -qw 4343 <<<"$group_add_output"
 grep -qw 4344 <<<"$group_add_output"
+named_user_id=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+  --user testuser -- /bin/busybox id -u)
+test "$named_user_id" = 4242
+named_user_gid=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+  --user testuser -- /bin/busybox id -g)
+test "$named_user_gid" = 4344
+named_user_container=$("${zerun[@]}" run -d --rootfs "$rootfs" --net none --no-overlay \
+  --user testuser --init -- /bin/sleep 30)
+cleanup_ids+=("$named_user_container")
+test "$("${zerun[@]}" exec "$named_user_container" /bin/busybox id -u)" = 4242
+"${zerun[@]}" stop "$named_user_container" >/dev/null
+"${zerun[@]}" start "$named_user_container" >/dev/null
+test "$("${zerun[@]}" exec "$named_user_container" /bin/busybox id -u)" = 4242
+"${zerun[@]}" rm -f "$named_user_container" >/dev/null
+
+# Untrusted account databases must not consume unbounded memory during named
+# identity resolution; numeric identities must not need either file.
+account_file=$(mktemp)
+cleanup_paths+=("$account_file")
+truncate -s 8388609 "$account_file"
+for account_case in user group; do
+  if [[ $account_case == user ]]; then
+    account_args=(--user testuser -v "$account_file:/etc/passwd:ro")
+  else
+    account_args=(--group-add testgroup -v "$account_file:/etc/group:ro")
+  fi
+  set +e
+  account_output=$("${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay \
+    "${account_args[@]}" -- /bin/busybox true 2>&1)
+  account_status=$?
+  set -e
+  if [[ $account_status -ne 1 || $account_output != *'exceeds the 8388608 byte limit'* ]]; then
+    printf 'unexpected %s account file result (status %s):\n%s\n' \
+      "$account_case" "$account_status" "$account_output" >&2
+    exit 1
+  fi
+done
+"${zerun[@]}" run --rootfs "$rootfs" --net none --no-overlay --user 0:0 --group-add 0 \
+  -v "$account_file:/etc/passwd:ro" -v "$account_file:/etc/group:ro" -- /bin/busybox true
 
 # The default writable path must use overlayfs (or the documented rootless
 # fallback) and allow writes without modifying the source rootfs.

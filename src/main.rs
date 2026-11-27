@@ -1945,7 +1945,7 @@ fn cmd_run_inner(args: &[String], resume: Option<ContainerState>, report_id: boo
             rootfs,
             None,
             a.workdir.clone(),
-            None,
+            a.user.clone(),
             a.stop_signal.unwrap_or(signal::DEFAULT_STOP_SIGNAL),
             a.stop_timeout.unwrap_or(state::DEFAULT_STOP_TIMEOUT_SECS),
             argv,
