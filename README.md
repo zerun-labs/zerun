@@ -12,6 +12,18 @@ binary with no daemon**.
 > behavior. Maintainer-local design and development context are intentionally excluded from
 > the distributed repository.
 
+## Contents
+
+- [Status](#status) and [continuous integration](#continuous-integration)
+- [Install](#install), [build](#build), and [quick start](#quick-start)
+- [Run options](#run-options), [namespace sharing](#namespace-sharing), and
+  [resource and security settings](#resource-and-security-settings)
+- [Private registries](#private-registries), [named volumes](#named-volumes), and
+  [offline image transfer](#offline-image-transfer-save--load)
+- [Detached lifecycle](#detached-lifecycle), [systemd integration](#systemd-integration),
+  and [legacy rootfs mode](#legacy-rootfs-mode)
+- [Benchmark](#benchmark), [architecture](#architecture), and [license](#license)
+
 ## Status
 
 Milestone-based development status:
@@ -159,7 +171,7 @@ Cross targets (edge devices): `aarch64-unknown-linux-musl`, `armv7-unknown-linux
 
 ## Quick start
 
-### Image mode (M3, recommended)
+### Image mode
 
 ```bash
 cargo build --release
@@ -203,10 +215,12 @@ first non-whitespace character is `#` are ignored, and values are literal (no sh
 expansion). Later files override earlier files, then `-e` overrides both. Files are
 limited to 1 MiB each and are only accepted in image mode.
 
+### Run options
+
 Run options (current subset):
 
 ```
--d, --detach         run in the background (print id once started; see M5 section)
+-d, --detach         run in the background (print id once started; see detached lifecycle)
 --name NAME          name the container (ps/stop/rm/logs/exec accept it)
 --cidfile FILE       write the new container id to FILE (must not already exist)
 --rm                 remove state + writable layer automatically on exit
@@ -324,6 +338,8 @@ Run options (current subset):
                     --ipc host or --ipc none)
 ```
 
+### Namespace sharing
+
 `--network container:TARGET` is rootful-only and resolves `TARGET` to the concrete ID of a
 currently running detached container. The joining container owns no veth or IPAM lease. A running
 container stays in the namespace it joined; after the target restarts, restart the joining
@@ -349,6 +365,8 @@ manual start or automatic retry reopens the persisted target ID and joins its th
 namespace, failing closed when the target is not running. `exec` joins the joining container's
 captured IPC namespace. IPC sharing is security-sensitive because both containers can observe and,
 subject to credentials and capabilities, operate on the same IPC objects.
+
+### Resource and security settings
 
 Cgroup flags bound aggregate container resource use. `--ulimit` additionally
 sets POSIX per-process limits; supported types match Docker (`core`, `cpu`,
@@ -381,6 +399,8 @@ bridge/loopback setup (which allows per-interface keys such as
 `net.ipv4.conf.eth0.*`) and before `/proc/sys` is remounted read-only for the
 workload. Detached restart and generated service units preserve the same
 settings.
+
+### Registry mirrors
 
 `ZERUN_REGISTRY_MIRRORS` (comma-separated), a zerun config file
 (`/etc/zerun/config.toml` with `[registry] mirrors = [...]`, overridable via
@@ -460,7 +480,7 @@ index — so imported images are immediately runnable with `zerun run IMAGE`. Th
 registry or daemon involved anywhere in the path.
 
 
-### Detached lifecycle (M5)
+### Detached lifecycle
 
 ```bash
 # Run in the background (prints the container id once the workload has started)
@@ -616,7 +636,7 @@ records (use `-a` to include exited and created records).
 `--filter container=web`, `--filter image=alpine`, and `--filter exitCode=0` selectors are
 ANDed; `--since`/`--until` accept RFC3339 UTC times and first replay matching history.
 
-### systemd integration (M6)
+### systemd integration
 
 Generate a declarative systemd unit from the same arguments you would pass to `run`.
 The unit runs a foreground container, so systemd supervises Zerun and failed workloads
@@ -640,7 +660,7 @@ generate the unit as that user, install it under `~/.config/systemd/user/`, and 
 owns lifecycle and restart semantics. A zero stop timeout becomes systemd's smallest
 practical positive timeout (`1ms`), because systemd otherwise treats zero as "wait forever".
 
-### Legacy rootfs mode (M1/M2)
+### Legacy rootfs mode
 
 Run a command inside a plain unpacked rootfs directory (no image engine):
 
