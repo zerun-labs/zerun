@@ -81,6 +81,31 @@ pub fn open_state_file_at(directory: &std::fs::File) -> std::io::Result<std::fs:
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
+/// Open one log entry relative to a pinned directory without following symlinks.
+pub fn open_log_file_at(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    let name = CString::new(bytes).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
 /// Create an exclusive file inside an already opened directory.
 pub fn create_file_at(
     directory: &std::fs::File,

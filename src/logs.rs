@@ -68,10 +68,16 @@ fn descriptor_path(file: &std::fs::File) -> PathBuf {
 
 /// Open a retained log for reading without following links or blocking on a FIFO.
 pub fn open_console_log_reader(path: &Path) -> std::io::Result<std::fs::File> {
-    let file = std::fs::OpenOptions::new()
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path.file_name().ok_or(std::io::ErrorKind::InvalidInput)?;
+    let directory = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(parent)?;
+    let file = crate::syscalls::open_log_file_at(&directory, name)?;
     validate_log_file(&file)?;
     Ok(file)
 }
@@ -537,6 +543,49 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_reader_pins_parent_and_rejects_a_directory_symlink() {
+        use std::io::Read;
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "zerun-log-parent-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let directory = root.join("container");
+        let moved = root.join("moved");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(directory.join("console.log"), b"original").unwrap();
+        std::fs::write(outside.join("console.log"), b"outside").unwrap();
+        let pinned = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&directory)
+            .unwrap();
+        std::fs::rename(&directory, &moved).unwrap();
+        symlink(&outside, &directory).unwrap();
+        assert!(open_console_log_reader(&directory.join("console.log")).is_err());
+        for invalid in ["", ".", "..", "../outside/console.log"] {
+            assert_eq!(
+                crate::syscalls::open_log_file_at(&pinned, std::ffi::OsStr::new(invalid))
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
+        let mut file =
+            crate::syscalls::open_log_file_at(&pinned, std::ffi::OsStr::new("console.log"))
+                .unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"original");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn validation_accepts_inode_unlinked_during_rotation() {
