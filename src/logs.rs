@@ -221,7 +221,7 @@ fn now_nanos() -> i128 {
 
 fn parse_time(value: &str, now: i128) -> Result<i128, ()> {
     if let Some(relative) = parse_duration(value) {
-        return Ok(now - relative);
+        return now.checked_sub(relative).ok_or(());
     }
     if let Some(epoch) = parse_unix_seconds(value) {
         return Ok(epoch);
@@ -245,9 +245,12 @@ fn parse_unix_seconds(value: &str) -> Option<i128> {
         None => (value, 0),
     };
     let seconds = whole.parse::<i128>().ok()?;
-    seconds
-        .checked_mul(1_000_000_000)?
-        .checked_add(fraction_nanos)
+    let nanos = seconds.checked_mul(1_000_000_000)?;
+    if value.starts_with('-') {
+        nanos.checked_sub(fraction_nanos)
+    } else {
+        nanos.checked_add(fraction_nanos)
+    }
 }
 
 /// Parse the subset of Go duration syntax useful for log selection.
@@ -488,6 +491,24 @@ mod tests {
         assert_eq!(parse_duration("-2s"), Some(-2_000_000_000));
         assert_eq!(parse_duration("1d"), None);
         assert_eq!(parse_duration("1"), None);
+    }
+
+    #[test]
+    fn parses_signed_fractional_unix_seconds() {
+        assert_eq!(parse_unix_seconds("-0.5"), Some(-500_000_000));
+        assert_eq!(parse_unix_seconds("-1.25"), Some(-1_250_000_000));
+        assert_eq!(parse_unix_seconds("+1.25"), Some(1_250_000_000));
+        assert_eq!(parse_unix_seconds("-0.0000000009"), Some(0));
+        let selected = filter(Some("-0.5"), Some("-0.5"));
+        assert!(selected.contains_rfc3339("1969-12-31T23:59:59.5Z"));
+        assert!(!selected.contains_rfc3339("1970-01-01T00:00:00.5Z"));
+    }
+
+    #[test]
+    fn rejects_relative_time_overflow() {
+        let extreme = format!("-{}ns", i128::MAX);
+        assert!(parse_time(&extreme, 1).is_err());
+        assert!(LogTimeFilter::parse(Some(&extreme), None).is_err());
     }
 
     #[test]
