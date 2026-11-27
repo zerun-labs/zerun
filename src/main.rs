@@ -5931,7 +5931,7 @@ fn cmd_logs(args: &[String]) -> i32 {
     // A fixed --until is an end boundary: future times still follow until the
     // wall clock reaches them; a past time only shows the historical window.
     if follow {
-        follow_log(
+        if let Err(e) = follow_log(
             &store,
             &st,
             &path,
@@ -5939,7 +5939,10 @@ fn cmd_logs(args: &[String]) -> i32 {
             cursor,
             timestamps,
             Some(&filter),
-        );
+        ) {
+            eprintln!("zerun logs: follow: {e}");
+            return 1;
+        }
     }
     0
 }
@@ -5953,18 +5956,19 @@ fn follow_log(
     mut seen: LogCursor,
     timestamps: bool,
     filter: Option<&LogTimeFilter>,
-) {
+) -> std::io::Result<()> {
     loop {
         if filter.is_some_and(LogTimeFilter::until_reached) {
             break;
         }
         if !container_observable(store, st) {
-            drain_rotated_logs(path, max_files, &mut seen, timestamps, filter);
+            drain_rotated_logs(path, max_files, &mut seen, timestamps, filter)?;
             break;
         }
         std::thread::sleep(Duration::from_millis(200));
-        drain_rotated_logs(path, max_files, &mut seen, timestamps, filter);
+        drain_rotated_logs(path, max_files, &mut seen, timestamps, filter)?;
     }
+    Ok(())
 }
 
 type LogCursor = std::collections::HashMap<(u64, u64), u64>;
@@ -5994,7 +5998,7 @@ where
     let mut read_any = false;
     let mut tail_lines = tail.map(|_| VecDeque::<Vec<u8>>::new());
     for log_path in logs::log_paths(path, max_files) {
-        let mut file = match std::fs::File::open(&log_path) {
+        let mut file = match logs::open_console_log_reader(&log_path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
@@ -6053,7 +6057,7 @@ fn drain_rotated_logs(
     seen: &mut LogCursor,
     timestamps: bool,
     filter: Option<&LogTimeFilter>,
-) {
+) -> std::io::Result<()> {
     use std::io::{BufRead, BufReader, Read, Seek, Take};
     use std::os::unix::fs::MetadataExt;
 
@@ -6063,12 +6067,17 @@ fn drain_rotated_logs(
     for log_path in &paths {
         // Identify the open file, not the path: rotation can replace a path
         // between a metadata lookup and opening it.
-        let Ok(mut file) = std::fs::File::open(log_path) else {
-            continue;
+        let mut file = match logs::open_console_log_reader(log_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("{}: {error}", log_path.display()),
+                ))
+            }
         };
-        let Ok(meta) = logs::snapshot_metadata(&file) else {
-            continue;
-        };
+        let meta = logs::snapshot_metadata(&file)?;
         let id = (meta.dev(), meta.ino());
         present.insert(id);
         let pos = seen.get(&id).copied().unwrap_or(0);
@@ -6076,14 +6085,11 @@ fn drain_rotated_logs(
         if len <= pos {
             continue;
         }
-        if file.seek(std::io::SeekFrom::Start(pos)).is_err() {
-            continue;
-        }
+        file.seek(std::io::SeekFrom::Start(pos))?;
         let mut reader: Take<BufReader<std::fs::File>> =
             BufReader::new(file).take(len.saturating_sub(pos));
         let mut line = Vec::new();
         let mut consumed = pos;
-        let mut failed = false;
         loop {
             line.clear();
             match reader.read_until(b'\n', &mut line) {
@@ -6095,17 +6101,17 @@ fn drain_rotated_logs(
                     }
                 }
                 Err(error) => {
-                    eprintln!("zerun logs: follow {}: {error}", log_path.display());
-                    failed = true;
-                    break;
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!("{}: {error}", log_path.display()),
+                    ));
                 }
             }
         }
-        if !failed {
-            seen.insert(id, consumed);
-        }
+        seen.insert(id, consumed);
     }
     seen.retain(|id, _| present.contains(id));
+    Ok(())
 }
 
 fn container_observable(store: &Store, st: &ContainerState) -> bool {
@@ -8943,6 +8949,45 @@ mod tests {
     }
 
     #[test]
+    fn log_readers_reject_symlinks_and_non_regular_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!("zerun-log-invalid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let active = dir.join("console.log");
+        let archive = dir.join("console.log.1");
+        let outside = dir.join("outside");
+        std::fs::write(&outside, b"secret\n").unwrap();
+        std::fs::write(&active, b"valid\n").unwrap();
+        symlink(&outside, &archive).unwrap();
+        let filter = LogTimeFilter::parse(None, None).unwrap();
+        let mut output = Vec::new();
+        assert!(stream_log_snapshot(&active, 2, None, &filter, |line| output
+            .extend_from_slice(line))
+        .is_err());
+        assert!(output.is_empty());
+        assert!(
+            drain_rotated_logs(&active, 2, &mut LogCursor::new(), false, Some(&filter)).is_err()
+        );
+
+        std::fs::remove_file(&archive).unwrap();
+        std::fs::remove_file(&active).unwrap();
+        symlink(&outside, &active).unwrap();
+        assert!(stream_log_snapshot(&active, 1, None, &filter, |_| {}).is_err());
+        assert!(
+            drain_rotated_logs(&active, 1, &mut LogCursor::new(), false, Some(&filter)).is_err()
+        );
+        std::fs::remove_file(&active).unwrap();
+        std::fs::create_dir(&active).unwrap();
+        assert_eq!(
+            logs::open_console_log_reader(&active).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn log_snapshot_streams_archives_in_order_and_tracks_positions() {
         let dir = std::env::temp_dir().join(format!("zerun-log-snapshot-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -9080,12 +9125,12 @@ mod tests {
         std::fs::write(&active, b"new\n").unwrap();
         let new_meta = std::fs::metadata(&active).unwrap();
         let new_id = (new_meta.dev(), new_meta.ino());
-        drain_rotated_logs(&active, 2, &mut cursor, false, Some(&filter));
+        drain_rotated_logs(&active, 2, &mut cursor, false, Some(&filter)).unwrap();
         assert_eq!(cursor.get(&old_id), Some(&9));
         assert_eq!(cursor.get(&new_id), Some(&4));
 
         std::fs::remove_file(&archive).unwrap();
-        drain_rotated_logs(&active, 2, &mut cursor, false, Some(&filter));
+        drain_rotated_logs(&active, 2, &mut cursor, false, Some(&filter)).unwrap();
         assert_eq!(cursor.len(), 1);
         assert_eq!(cursor.get(&new_id), Some(&4));
         let _ = std::fs::remove_dir_all(&dir);

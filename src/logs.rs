@@ -32,6 +32,21 @@ pub fn open_console_log(path: &Path, create: bool, append: bool) -> std::io::Res
     Ok(file)
 }
 
+/// Open a retained log for reading without following links or blocking on a FIFO.
+pub fn open_console_log_reader(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "console log is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 /// Default detached-console rotation budget. Rotating by default keeps a
 /// chatty workload from exhausting a small VPS disk; `--log-max-size 0`
 /// explicitly disables rotation.

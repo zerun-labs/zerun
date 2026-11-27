@@ -595,7 +595,8 @@ unpublished `PORT/PROTOCOL` entries in `ps`; restarting a container retains them
 raw lines before applying the time window. Log files are streamed in chronological
 order, so only the requested `--tail` lines are retained in memory. Untimestamped legacy
 logs are displayed normally but cannot be selected by time. `--until` ends follow mode at
-that boundary; `--since` remains fixed while following. An unterminated line is split into 64 KiB
+that boundary; `--since` remains fixed while following. Log files must be regular files,
+and `logs` reports an error if a retained file is a symlink or cannot be read. An unterminated line is split into 64 KiB
 timestamped records in `console.log`, so a workload cannot make the reaper buffer an
 unbounded line; `attach` still receives the original bytes unchanged. When a container is
 started again after ending with an unterminated line, a newline separates that line from the
