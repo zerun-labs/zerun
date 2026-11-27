@@ -676,13 +676,24 @@ impl ContainerState {
             return Ok(None);
         }
         let p = Self::path(store, id);
-        // Open without following links or blocking on a FIFO. Only an absent
-        // file represents a reservation; any other file type is corruption.
-        let mut file = match OpenOptions::new()
+        // Pin the ID directory before opening its state file. This prevents
+        // following a substituted directory symlink between validation and use.
+        let directory_path = Self::dir(store, id);
+        let directory = match OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-            .open(&p)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&directory_path)
         {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(crate::zerr!(
+                    "read container state directory {}: {error}",
+                    directory_path.display()
+                ))
+            }
+        };
+        let mut file = match syscalls::open_state_file_at(&directory) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
@@ -1575,6 +1586,16 @@ mod tests {
             .to_string()
             .contains("not a directory"));
         assert!(resolve(&store, "abc123").is_err());
+        assert!(ContainerState::load_checked(&store, "abc123").is_err());
+        std::fs::remove_file(&path).unwrap();
+        let redirected = root.join("redirected");
+        std::fs::create_dir(&redirected).unwrap();
+        std::fs::write(redirected.join("state.json"), b"not json").unwrap();
+        std::os::unix::fs::symlink(&redirected, &path).unwrap();
+        let error = ContainerState::load_checked(&store, "abc123")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("state directory"), "{error}");
         std::fs::remove_dir_all(root).unwrap();
     }
 

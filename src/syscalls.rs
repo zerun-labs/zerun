@@ -65,6 +65,22 @@ pub fn flock(fd: RawFd, operation: c_int) -> ZResult<()> {
     Ok(())
 }
 
+/// Open a file relative to a pinned directory, without following its final symlink.
+pub fn open_state_file_at(directory: &std::fs::File) -> std::io::Result<std::fs::File> {
+    let name = c"state.json";
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
 /// Read the system clock tick frequency used by `/proc/<pid>/stat`.
 pub fn clock_ticks_per_second() -> u64 {
     let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
