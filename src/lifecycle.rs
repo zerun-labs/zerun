@@ -754,6 +754,20 @@ fn open_attach_socket(directory: &File) -> std::io::Result<File> {
     Ok(file)
 }
 
+/// Connect to a verified attach socket without resolving its name twice.
+pub fn connect_attach_socket(path: &Path) -> std::io::Result<UnixStream> {
+    let (directory, name) = crate::logs::open_log_directory(path)?;
+    if name != std::ffi::OsStr::new("attach.sock") {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    let socket = open_attach_socket(&directory)?;
+    connect_pinned_socket(&socket)
+}
+
+fn connect_pinned_socket(socket: &File) -> std::io::Result<UnixStream> {
+    UnixStream::connect(format!("/proc/self/fd/{}", socket.as_raw_fd()))
+}
+
 fn remove_attach_socket_if_same(directory: &File, expected: (u64, u64)) {
     if let Ok(socket) = open_attach_socket(directory) {
         if let Ok(metadata) = socket.metadata() {
@@ -1162,6 +1176,36 @@ mod attach_tests {
         hub.close_all(0);
         assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn attach_client_rejects_symlinked_paths_and_connects_pinned_socket() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_log_dir("attach-client-pinned");
+        let directory = root.join("container");
+        let outside = root.join("outside");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let path = directory.join("attach.sock");
+        let external = outside.join("attach.sock");
+        let original_listener = UnixListener::bind(&path).unwrap();
+        let _external_listener = UnixListener::bind(&external).unwrap();
+        let (pinned_dir, _) = crate::logs::open_log_directory(&path).unwrap();
+        let pinned_socket = open_attach_socket(&pinned_dir).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        symlink(&external, &path).unwrap();
+        assert!(connect_attach_socket(&path).is_err());
+        let _client = connect_pinned_socket(&pinned_socket).unwrap();
+        original_listener.set_nonblocking(true).unwrap();
+        let (_server, _) = original_listener.accept().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&external, &path).unwrap();
+        assert!(connect_attach_socket(&path).is_err());
+        let alias = root.join("alias");
+        symlink(&outside, &alias).unwrap();
+        assert!(connect_attach_socket(&alias.join("attach.sock")).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

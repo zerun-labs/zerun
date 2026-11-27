@@ -7728,17 +7728,17 @@ fn cmd_attach(args: &[String]) -> i32 {
         return 1;
     }
     let sock_path = st.log_path_for(&store).with_file_name("attach.sock");
-    if !sock_path.exists() {
-        eprintln!(
-            "zerun attach: container {} has no attach socket (older reaper or not running)",
-            display_name(&st)
-        );
-        return 1;
-    }
-    let mut stream = match std::os::unix::net::UnixStream::connect(&sock_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("zerun attach: connect {}: {e}", sock_path.display());
+    let mut stream = match lifecycle::connect_attach_socket(&sock_path) {
+        Ok(stream) => stream,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "zerun attach: container {} has no attach socket (older reaper or not running)",
+                display_name(&st)
+            );
+            return 1;
+        }
+        Err(error) => {
+            eprintln!("zerun attach: connect {}: {error}", sock_path.display());
             return 1;
         }
     };
