@@ -26,7 +26,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::fd::RawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -524,40 +524,62 @@ impl CapturedLog {
 
 /// Bounded writer for the active console log.
 ///
-/// Rotation is performed by the collector thread, so there is no cross-process
-/// file lock. `max_files` counts the active file and all numbered archives.
+/// Rotation is performed by the collector thread. Record writes are locked
+/// against log readers. `max_files` counts the active file and all archives.
 struct RotatingLog {
     active: std::path::PathBuf,
     file: File,
     written: u64,
+    needs_separator: bool,
     options: LogOptions,
 }
 
 impl RotatingLog {
     fn open(active: &Path, options: LogOptions) -> std::io::Result<Self> {
-        let file = OpenOptions::new().append(true).open(active)?;
+        let file = OpenOptions::new().read(true).append(true).open(active)?;
         // Logs may contain application secrets. Tighten files created by older
         // versions as well as newly-created files before the collector writes.
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         let written = file.metadata()?.len();
+        let needs_separator = if written == 0 {
+            false
+        } else {
+            let mut last_byte = [0u8; 1];
+            if file.read_at(&mut last_byte, written - 1)? != 1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "console log changed while opening",
+                ));
+            }
+            last_byte[0] != b'\n'
+        };
         Ok(Self {
             active: active.to_path_buf(),
             file,
             written,
+            needs_separator,
             options,
         })
     }
 
     fn write_record(&mut self, timestamp: &[u8], line: &[u8]) -> std::io::Result<()> {
         let record_len = timestamp.len().saturating_add(1).saturating_add(line.len()) as u64;
+        let separator_len = u64::from(self.needs_separator);
         if self.options.max_size > 0
             && self.written > 0
-            && self.written.saturating_add(record_len) > self.options.max_size
+            && self
+                .written
+                .saturating_add(separator_len)
+                .saturating_add(record_len)
+                > self.options.max_size
         {
             self.rotate()?;
         }
         self.file.lock()?;
         let write_result = (|| {
+            if self.needs_separator {
+                self.file.write_all(b"\n")?;
+            }
             self.file.write_all(timestamp)?;
             self.file.write_all(b"\t")?;
             self.file.write_all(line)
@@ -565,7 +587,11 @@ impl RotatingLog {
         let unlock_result = self.file.unlock();
         write_result?;
         unlock_result?;
-        self.written = self.written.saturating_add(record_len);
+        self.written = self
+            .written
+            .saturating_add(u64::from(self.needs_separator))
+            .saturating_add(record_len);
+        self.needs_separator = false;
         Ok(())
     }
 
@@ -610,6 +636,7 @@ impl RotatingLog {
             .open(&self.active)?;
         drop(std::mem::replace(&mut self.file, replacement));
         self.written = 0;
+        self.needs_separator = false;
         Ok(())
     }
 }
@@ -1225,6 +1252,117 @@ mod attach_tests {
         assert_eq!(
             std::fs::read(&active).unwrap(),
             b"2026-01-01T00:00:00.000000000Z\thello\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopened_log_separates_unterminated_record_before_next_write() {
+        let dir = temp_log_dir("restart-partial");
+        let active = dir.join("console.log");
+        std::fs::write(&active, b"").unwrap();
+        let options = LogOptions {
+            max_size: 0,
+            max_files: 1,
+        };
+        let mut first = RotatingLog::open(&active, options).unwrap();
+        first
+            .write_record(b"2026-01-01T00:00:00.000000000Z", b"first")
+            .unwrap();
+        drop(first);
+        let before_restart = std::fs::read(&active).unwrap();
+        let mut second = RotatingLog::open(&active, options).unwrap();
+        assert_eq!(std::fs::read(&active).unwrap(), before_restart);
+        second
+            .write_record(b"2026-01-01T00:00:01.000000000Z", b"second\n")
+            .unwrap();
+        drop(second);
+
+        let stored = std::fs::read(&active).unwrap();
+        assert_eq!(
+            crate::logs::strip_log_timestamps(&stored),
+            b"first\nsecond\n"
+        );
+        let filter = crate::logs::LogTimeFilter::parse(Some("2026-01-01T00:00:01Z"), None).unwrap();
+        let selected = crate::logs::filter_log_lines(&stored, Some(&filter));
+        assert_eq!(crate::logs::strip_log_timestamps(&selected), b"second\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopened_terminated_log_does_not_add_a_blank_line() {
+        let dir = temp_log_dir("restart-complete");
+        let active = dir.join("console.log");
+        std::fs::write(&active, b"legacy\n").unwrap();
+        let mut log = RotatingLog::open(
+            &active,
+            LogOptions {
+                max_size: 0,
+                max_files: 1,
+            },
+        )
+        .unwrap();
+        log.write_record(b"2026-01-01T00:00:00.000000000Z", b"new\n")
+            .unwrap();
+        drop(log);
+        assert_eq!(
+            crate::logs::strip_log_timestamps(&std::fs::read(&active).unwrap()),
+            b"legacy\nnew\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopening_partial_log_rotates_without_inserting_a_separator() {
+        let dir = temp_log_dir("restart-partial-rotate");
+        let active = dir.join("console.log");
+        let old_record = b"2026-01-01T00:00:00.000000000Z\tfirst";
+        let new_record = b"2026-01-01T00:00:01.000000000Z\tsecond\n";
+        std::fs::write(&active, old_record).unwrap();
+        let mut log = RotatingLog::open(
+            &active,
+            LogOptions {
+                max_size: (old_record.len() + new_record.len()) as u64,
+                max_files: 2,
+            },
+        )
+        .unwrap();
+        log.write_record(b"2026-01-01T00:00:01.000000000Z", b"second\n")
+            .unwrap();
+        drop(log);
+        assert_eq!(
+            std::fs::read(dir.join("console.log.1")).unwrap(),
+            old_record
+        );
+        assert_eq!(std::fs::read(&active).unwrap(), new_record);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopened_legacy_partial_line_is_separated() {
+        let dir = temp_log_dir("restart-legacy-partial");
+        let active = dir.join("console.log");
+        std::fs::write(&active, b"legacy").unwrap();
+        let mut log = RotatingLog::open(
+            &active,
+            LogOptions {
+                max_size: 0,
+                max_files: 1,
+            },
+        )
+        .unwrap();
+        log.write_record(b"2026-01-01T00:00:00.000000000Z", b"new\n")
+            .unwrap();
+        drop(log);
+        let stored = std::fs::read(&active).unwrap();
+        assert_eq!(crate::logs::strip_log_timestamps(&stored), b"legacy\nnew\n");
+        let filter = crate::logs::LogTimeFilter::parse(Some("2026-01-01T00:00:00Z"), None).unwrap();
+        assert_eq!(
+            crate::logs::strip_log_timestamps(&crate::logs::filter_log_lines(
+                &stored,
+                Some(&filter)
+            )),
+            b"new\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

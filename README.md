@@ -587,7 +587,9 @@ order, so only the requested `--tail` lines are retained in memory. Untimestampe
 logs are displayed normally but cannot be selected by time. `--until` ends follow mode at
 that boundary; `--since` remains fixed while following. An unterminated line is split into 64 KiB
 timestamped records in `console.log`, so a workload cannot make the reaper buffer an
-unbounded line; `attach` still receives the original bytes unchanged.
+unbounded line; `attach` still receives the original bytes unchanged. When a container is
+started again after ending with an unterminated line, a newline separates that line from the
+next log record if both occupy the same file.
 `prune` removes every retained exited container and its writable layer. It reconciles stale
 Running records first, never touches live containers, and requires `--force` when stdin is
 not a terminal. `--images` additionally runs the image-store garbage collector for unreachable
