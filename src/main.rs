@@ -5988,6 +5988,10 @@ where
         let id = (meta.dev(), meta.ino());
         let snapshot_len = meta.len();
         read_any = true;
+        // A path can be renamed into another slot while this snapshot is read.
+        if cursor.contains_key(&id) {
+            continue;
+        }
         if tail == Some(0) {
             cursor.insert(id, snapshot_len);
             continue;
@@ -6037,7 +6041,12 @@ fn drain_rotated_logs(
     let paths = logs::log_paths(path, max_files);
     let mut present = std::collections::HashSet::with_capacity(paths.len());
     for log_path in &paths {
-        let Ok(meta) = std::fs::metadata(log_path) else {
+        // Identify the open file, not the path: rotation can replace a path
+        // between a metadata lookup and opening it.
+        let Ok(mut file) = std::fs::File::open(log_path) else {
+            continue;
+        };
+        let Ok(meta) = file.metadata() else {
             continue;
         };
         let id = (meta.dev(), meta.ino());
@@ -6047,9 +6056,6 @@ fn drain_rotated_logs(
         if len <= pos {
             continue;
         }
-        let Ok(mut file) = std::fs::File::open(log_path) else {
-            continue;
-        };
         if file.seek(std::io::SeekFrom::Start(pos)).is_err() {
             continue;
         }
@@ -8886,6 +8892,70 @@ mod tests {
         assert!(bytes.is_empty());
         assert_eq!(cursor.len(), 3);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_snapshot_deduplicates_inode_renamed_during_read() {
+        let dir =
+            std::env::temp_dir().join(format!("zerun-log-snapshot-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let active = dir.join("console.log");
+        let archive = dir.join("console.log.1");
+        std::fs::write(&archive, b"first\nsecond\n").unwrap();
+        let filter = LogTimeFilter::parse(None, None).unwrap();
+        let mut output = Vec::new();
+        let mut renamed = false;
+        let (cursor, read_any) = stream_log_snapshot(&active, 2, None, &filter, |line| {
+            output.extend_from_slice(line);
+            if !renamed {
+                std::fs::rename(&archive, &active).unwrap();
+                renamed = true;
+            }
+        })
+        .unwrap();
+        assert!(read_any);
+        assert_eq!(output, b"first\nsecond\n");
+        assert_eq!(cursor.len(), 1);
+        assert_eq!(cursor.values().next(), Some(&13));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_follow_tracks_open_inodes_across_rotation() {
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = std::env::temp_dir().join(format!("zerun-log-follow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let active = dir.join("console.log");
+        let archive = dir.join("console.log.1");
+        std::fs::write(&active, b"old\n").unwrap();
+        let filter = LogTimeFilter::parse(Some("3000-01-01T00:00:00Z"), None).unwrap();
+        let (mut cursor, _) = stream_log_snapshot(&active, 2, None, &filter, |_| {}).unwrap();
+        let old_meta = std::fs::metadata(&active).unwrap();
+        let old_id = (old_meta.dev(), old_meta.ino());
+
+        std::fs::rename(&active, &archive).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&archive)
+            .unwrap()
+            .write_all(b"more\n")
+            .unwrap();
+        std::fs::write(&active, b"new\n").unwrap();
+        let new_meta = std::fs::metadata(&active).unwrap();
+        let new_id = (new_meta.dev(), new_meta.ino());
+        drain_rotated_logs(&active, 2, &mut cursor, false, Some(&filter));
+        assert_eq!(cursor.get(&old_id), Some(&9));
+        assert_eq!(cursor.get(&new_id), Some(&4));
+
+        std::fs::remove_file(&archive).unwrap();
+        drain_rotated_logs(&active, 2, &mut cursor, false, Some(&filter));
+        assert_eq!(cursor.len(), 1);
+        assert_eq!(cursor.get(&new_id), Some(&4));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
