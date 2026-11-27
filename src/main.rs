@@ -3819,7 +3819,7 @@ fn build_image_env(
     for (key, value) in env_file {
         upsert_env(&mut env, key.clone(), value.clone());
     }
-    for o in overrides {
+    for (index, o) in overrides.iter().enumerate() {
         workload::validate_env_spec(o).map_err(|e| format!("invalid --env: {e}"))?;
         match o.split_once('=') {
             Some((k, v)) => upsert_env(&mut env, k.to_string(), v.to_string()),
@@ -3827,9 +3827,15 @@ fn build_image_env(
                 // `-e NAME` passes the host value through (docker semantics).
                 match std::env::var(o) {
                     Ok(v) => upsert_env(&mut env, o.to_string(), v),
-                    Err(_) => eprintln!(
+                    Err(std::env::VarError::NotPresent) => eprintln!(
                         "zerun: warning: -e {o}: variable is not set in the host environment, skipping"
                     ),
+                    Err(std::env::VarError::NotUnicode(_)) => {
+                        return Err(format!(
+                            "--env entry {}: host value is not valid UTF-8 and cannot be stored",
+                            index + 1
+                        ));
+                    }
                 }
             }
         }

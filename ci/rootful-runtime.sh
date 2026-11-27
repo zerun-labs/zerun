@@ -1201,6 +1201,40 @@ grep -Eq '^sha256:[0-9a-f]{64}$' <<<"$import_digest"
 import_output=$("${zerun[@]}" run --net none ci-import:test /bin/sh -c 'cat /run/m7-file')
 grep -Fxq overlay-data <<<"$import_output"
 
+# Image state stores UTF-8 environment values. An explicitly requested host
+# value that cannot be represented must fail instead of being silently skipped.
+"${privileged[@]}" python3 - "$binary" "$data_root" "$runtime_root" <<'PY_EOF'
+import os
+import subprocess
+import sys
+
+binary, data_root, runtime_root = sys.argv[1:]
+env = os.environb.copy()
+env[b"ZERUN_DATA_ROOT"] = os.fsencode(data_root)
+env[b"ZERUN_RUNTIME_ROOT"] = os.fsencode(runtime_root)
+name = b"ZERUN_PASSTHROUGH_TEST"
+command = [binary, "run", "--net", "none", "--cidfile", data_root + "/bad-env.cid",
+           "-e", name.decode(), "ci-import:test", "/bin/sh", "-c", "printf started"]
+env[name] = b"private-\xff-value"
+result = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+if result.returncode == 0 or b"UTF-8" not in result.stderr:
+    raise SystemExit("non-UTF-8 image environment value was not rejected clearly")
+if b"private-" in result.stderr or b"started" in result.stdout:
+    raise SystemExit("invalid image environment value was exposed or workload started")
+if os.path.exists(data_root + "/bad-env.cid"):
+    raise SystemExit("failed image environment validation left a cidfile")
+env[name] = b"valid-value"
+command = [binary, "run", "--net", "none", "-e", name.decode(), "ci-import:test",
+           "/bin/sh", "-c", 'printf "%s" "$ZERUN_PASSTHROUGH_TEST"']
+result = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+if result.returncode != 0 or result.stdout != b"valid-value":
+    raise SystemExit("valid image environment passthrough failed")
+del env[name]
+result = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+if result.returncode != 0 or b"not set" not in result.stderr:
+    raise SystemExit("unset image environment passthrough behavior changed")
+PY_EOF
+
 # PATH lookup must skip a non-executable candidate and try the next directory.
 # Test direct and mini-init image launches as well as exec into a running image.
 path_fixture=$(mktemp -d)

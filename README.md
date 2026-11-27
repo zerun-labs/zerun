@@ -213,9 +213,10 @@ the built-in mini-init, and
 Environment files contain one `NAME=VALUE` per line; blank lines and lines whose
 first non-whitespace character is `#` are ignored, and values are literal (no shell
 expansion). Later files override earlier files, then `-e` overrides both. Files are
-limited to 1 MiB each and are only accepted in image mode. Bare command names are
-searched using the container environment's `PATH`; an empty entry refers to the
-working directory. The same lookup applies to `exec`.
+limited to 1 MiB each and are only accepted in image mode. A bare `run -e NAME`
+passes through a host value; the value must be UTF-8 so it can be stored for restart.
+Bare command names are searched using the container environment's `PATH`; an empty
+entry refers to the working directory. The same lookup applies to `exec`.
 
 ### Run options
 
