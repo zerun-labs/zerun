@@ -110,18 +110,67 @@ pub fn open_log_path_at(
     open_log_entry_at(directory, name, libc::O_PATH)
 }
 
+/// Exclusively create a replacement log in a pinned directory.
+pub fn create_log_file_at(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<std::fs::File> {
+    open_log_entry_at(
+        directory,
+        name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+    )
+}
+
+/// Rename a log entry within a pinned directory.
+pub fn rename_log_file_at(
+    directory: &std::fs::File,
+    from: &std::ffi::OsStr,
+    to: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    let from = log_entry_name(from)?;
+    let to = log_entry_name(to)?;
+    if unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            from.as_ptr(),
+            directory.as_raw_fd(),
+            to.as_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Remove a log entry from a pinned directory.
+pub fn unlink_log_file_at(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    let name = log_entry_name(name)?;
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn log_entry_name(name: &std::ffi::OsStr) -> std::io::Result<CString> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    CString::new(bytes).map_err(|_| std::io::ErrorKind::InvalidInput.into())
+}
+
 fn open_log_entry_at(
     directory: &std::fs::File,
     name: &std::ffi::OsStr,
     flags: libc::c_int,
 ) -> std::io::Result<std::fs::File> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let bytes = name.as_bytes();
-    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
-        return Err(std::io::ErrorKind::InvalidInput.into());
-    }
-    let name = CString::new(bytes).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+    let name = log_entry_name(name)?;
     let fd = unsafe {
         libc::openat(
             directory.as_raw_fd(),

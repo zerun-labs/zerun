@@ -22,11 +22,11 @@ use crate::namespace::{run_container_with_report, NetMode, RunSpec};
 use crate::state::PidMode;
 use crate::state::{self, ContainerState, IpcMode, Status};
 use crate::store::{ContainerFs, Store};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::fd::RawFd;
-use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -527,7 +527,8 @@ impl CapturedLog {
 /// Rotation is performed by the collector thread. Record writes are locked
 /// against log readers. `max_files` counts the active file and all archives.
 struct RotatingLog {
-    active: std::path::PathBuf,
+    directory: File,
+    active: std::ffi::OsString,
     file: File,
     written: u64,
     needs_separator: bool,
@@ -536,7 +537,9 @@ struct RotatingLog {
 
 impl RotatingLog {
     fn open(active: &Path, options: LogOptions) -> std::io::Result<Self> {
-        let file = crate::logs::open_console_log(active, false, true)?;
+        let (directory, name) = crate::logs::open_log_directory(active)?;
+        let name = name.to_os_string();
+        let file = crate::logs::open_console_log_at(&directory, &name, false, true)?;
         // Logs may contain application secrets. Tighten files created by older
         // versions as well as newly-created files before the collector writes.
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
@@ -554,7 +557,8 @@ impl RotatingLog {
             last_byte[0] != b'\n'
         };
         Ok(Self {
-            active: active.to_path_buf(),
+            directory,
+            active: name,
             file,
             written,
             needs_separator,
@@ -604,35 +608,39 @@ impl RotatingLog {
             for index in (1..max_files - 1).rev() {
                 let from = numbered_path(&self.active, index);
                 let to = numbered_path(&self.active, index + 1);
-                match std::fs::rename(&from, &to) {
+                match crate::syscalls::rename_log_file_at(&self.directory, &from, &to) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e),
                 }
             }
-            match std::fs::rename(&self.active, numbered_path(&self.active, 1)) {
+            match crate::syscalls::rename_log_file_at(
+                &self.directory,
+                &self.active,
+                &numbered_path(&self.active, 1),
+            ) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
         } else {
-            let _ = std::fs::remove_file(&self.active);
+            match crate::syscalls::unlink_log_file_at(&self.directory, &self.active) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
         // Existing archives may have been created before private log files
         // were enforced. Secure every retained inode after the rename pass.
         for index in 1..max_files {
             let archive = numbered_path(&self.active, index);
-            match crate::logs::secure_log_file(&archive) {
+            match crate::logs::secure_log_file_at(&self.directory, &archive) {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
         }
-        let replacement = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&self.active)?;
+        let replacement = crate::syscalls::create_log_file_at(&self.directory, &self.active)?;
         drop(std::mem::replace(&mut self.file, replacement));
         self.written = 0;
         self.needs_separator = false;
@@ -640,10 +648,10 @@ impl RotatingLog {
     }
 }
 
-fn numbered_path(active: &Path, index: usize) -> std::path::PathBuf {
-    let mut name = active.as_os_str().to_os_string();
+fn numbered_path(active: &std::ffi::OsStr, index: usize) -> std::ffi::OsString {
+    let mut name = active.to_os_string();
     name.push(format!(".{index}"));
-    std::path::PathBuf::from(name)
+    name
 }
 
 /// Fan-out hub for `zerun attach` clients over a per-container unix socket.
@@ -1314,6 +1322,60 @@ mod attach_tests {
             .any(|w| w == b"console log capture failed"));
         assert_eq!(std::fs::read(outside).unwrap(), b"untouched");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rotation_stays_in_pinned_directory_after_path_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_log_dir("rotation-pinned-directory");
+        for max_files in [1, 3] {
+            let directory = root.join(format!("container-{max_files}"));
+            let moved = root.join(format!("moved-{max_files}"));
+            let outside = root.join(format!("outside-{max_files}"));
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            let active = directory.join("console.log");
+            let external_log = outside.join("console.log");
+            let external_archive = outside.join("console.log.1");
+            std::fs::write(&active, b"original\n").unwrap();
+            std::fs::write(&external_log, b"external\n").unwrap();
+            std::fs::write(&external_archive, b"archive\n").unwrap();
+            std::fs::set_permissions(&external_archive, std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+            let mut log = RotatingLog::open(
+                &active,
+                LogOptions {
+                    max_size: 1,
+                    max_files,
+                },
+            )
+            .unwrap();
+            std::fs::rename(&directory, &moved).unwrap();
+            symlink(&outside, &directory).unwrap();
+            log.write_record(b"time", b"next\n").unwrap();
+            assert_eq!(std::fs::read(&external_log).unwrap(), b"external\n");
+            assert_eq!(std::fs::read(&external_archive).unwrap(), b"archive\n");
+            assert_eq!(
+                std::fs::metadata(&external_archive)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644
+            );
+            assert_eq!(
+                std::fs::read(moved.join("console.log")).unwrap(),
+                b"time\tnext\n"
+            );
+            if max_files > 1 {
+                assert_eq!(
+                    std::fs::read(moved.join("console.log.1")).unwrap(),
+                    b"original\n"
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

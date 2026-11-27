@@ -17,10 +17,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Open a console log without following symlinks or blocking on a FIFO.
 pub fn open_console_log(path: &Path, create: bool, append: bool) -> std::io::Result<std::fs::File> {
     let (directory, name) = open_log_directory(path)?;
-    let file = match crate::syscalls::open_log_writer_at(&directory, name, create, append) {
+    open_console_log_at(&directory, name, create, append)
+}
+
+pub fn open_console_log_at(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+    create: bool,
+    append: bool,
+) -> std::io::Result<std::fs::File> {
+    let file = match crate::syscalls::open_log_writer_at(directory, name, create, append) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            let pinned = secure_log_file_at(&directory, name)?;
+            let pinned = secure_log_file_at(directory, name)?;
             // Reopen the same inode; resolving the name again would allow it
             // to change between permission repair and the writable open.
             std::fs::OpenOptions::new()
@@ -37,12 +46,13 @@ pub fn open_console_log(path: &Path, create: bool, append: bool) -> std::io::Res
 }
 
 /// Secure a pinned regular log inode without requiring read or write access.
+#[cfg(test)]
 pub fn secure_log_file(path: &Path) -> std::io::Result<std::fs::File> {
     let (directory, name) = open_log_directory(path)?;
     secure_log_file_at(&directory, name)
 }
 
-fn secure_log_file_at(
+pub fn secure_log_file_at(
     directory: &std::fs::File,
     name: &std::ffi::OsStr,
 ) -> std::io::Result<std::fs::File> {
@@ -59,7 +69,7 @@ fn descriptor_path(file: &std::fs::File) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
 
-fn open_log_directory(path: &Path) -> std::io::Result<(std::fs::File, &std::ffi::OsStr)> {
+pub fn open_log_directory(path: &Path) -> std::io::Result<(std::fs::File, &std::ffi::OsStr)> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
