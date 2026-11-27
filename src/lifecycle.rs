@@ -764,6 +764,42 @@ pub fn connect_attach_socket(path: &Path) -> std::io::Result<UnixStream> {
     connect_pinned_socket(&socket)
 }
 
+/// Verify a connected attach peer against the reaper identity in the state record.
+pub fn verify_attach_peer(
+    stream: &UnixStream,
+    expected_pid: Option<i32>,
+    expected_start_time: Option<u64>,
+) -> std::io::Result<()> {
+    let peer_pid = crate::syscalls::unix_peer_pid(stream.as_raw_fd())?;
+    match expected_pid {
+        Some(pid) if pid > 0 && pid == peer_pid => {
+            if expected_start_time.is_some_and(|expected| {
+                crate::procinfo::process_start_time(peer_pid) != Some(expected)
+            }) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "attach peer start time does not match reaper",
+                ));
+            }
+        }
+        Some(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "attach peer PID does not match reaper",
+            ))
+        }
+        None if expected_start_time.is_some() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "reaper start time has no PID",
+            ))
+        }
+        // Older container records did not persist a reaper identity.
+        None => {}
+    }
+    Ok(())
+}
+
 fn connect_pinned_socket(socket: &File) -> std::io::Result<UnixStream> {
     UnixStream::connect(format!("/proc/self/fd/{}", socket.as_raw_fd()))
 }
@@ -1206,6 +1242,21 @@ mod attach_tests {
         symlink(&outside, &alias).unwrap();
         assert!(connect_attach_socket(&alias.join("attach.sock")).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn attach_peer_credentials_match_recorded_reaper_identity() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let pid = crate::syscalls::process_id();
+        let start = crate::procinfo::process_start_time(pid).unwrap();
+        assert!(verify_attach_peer(&client, Some(pid), Some(start)).is_ok());
+        assert!(verify_attach_peer(&client, Some(pid), None).is_ok());
+        assert!(verify_attach_peer(&client, None, None).is_ok());
+        assert!(verify_attach_peer(&client, Some(0), Some(start)).is_err());
+        assert!(verify_attach_peer(&client, Some(pid.saturating_add(1)), Some(start)).is_err());
+        assert!(verify_attach_peer(&client, Some(pid), Some(start.saturating_add(1))).is_err());
+        assert!(verify_attach_peer(&client, None, Some(start)).is_err());
+        drop(server);
     }
 
     #[test]

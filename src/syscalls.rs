@@ -1349,6 +1349,35 @@ pub fn read_fd(fd: RawFd, buf: &mut [u8]) -> ZResult<isize> {
     }
 }
 
+/// Return the PID of the process that created the connected Unix socket peer.
+pub fn unix_peer_pid(fd: RawFd) -> std::io::Result<libc::pid_t> {
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut credentials as *mut libc::ucred as *mut c_void,
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if length as usize != std::mem::size_of::<libc::ucred>() || credentials.pid <= 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid Unix peer credentials",
+        ));
+    }
+    Ok(credentials.pid)
+}
+
 /// Probe whether a non-blocking stream socket still has a connected peer.
 ///
 /// `recv(MSG_PEEK)` observes EOF without consuming application data. A socket

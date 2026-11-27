@@ -633,7 +633,10 @@ Detached state and console logs are stored owner-only because state contains the
 command line and environment. When the workload exits, a final control frame closes the stream
 and the attach command returns the container's exit code without mixing runtime metadata into
 output. Up to 32 clients may attach to one container; disconnected clients are pruned as new
-connections arrive so the reaper's descriptor and memory use stay bounded.
+connections arrive so the reaper's descriptor and memory use stay bounded. When a container
+record includes the reaper identity, `attach` verifies the socket peer against that identity
+before displaying output. Legacy records without a reaper identity retain compatibility without
+this check.
 `exec -i` forwards stdin, `exec -t` allocates a PTY, and `exec -it` combines them;
 without `-i`, the command receives `/dev/null` as stdin.
 `commit` produces a single-layer OCI image from the container's host-side overlay

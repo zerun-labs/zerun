@@ -7742,6 +7742,11 @@ fn cmd_attach(args: &[String]) -> i32 {
             return 1;
         }
     };
+    if let Err(error) = lifecycle::verify_attach_peer(&stream, st.reaper_pid, st.reaper_start_time)
+    {
+        eprintln!("zerun attach: reject {}: {error}", sock_path.display());
+        return 1;
+    }
     use std::io::Write as _;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
