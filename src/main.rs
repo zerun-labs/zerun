@@ -5034,22 +5034,26 @@ fn wait_one(store: &Store, target: &str) -> Result<i32, String> {
                 "container {name} state disappeared before its exit code was recorded (is it --rm?)"
             ));
         };
-        if st.status == state::Status::Exited {
-            if !st.restart_pending {
-                return Ok(st.exit_code.unwrap_or(-1));
-            }
+        if st.status == state::Status::Exited && st.restart_pending {
             // An automatic retry is in progress while the reaper is alive.
-            // If that reaper disappeared, reconcile the stored attempt and
-            // preserve its exit code instead of waiting forever.
+            // If it disappeared, reconcile before considering the attempt final.
             reconcile_stale_state(store, &mut st)?;
-            if st.status == state::Status::Exited && !st.restart_pending {
-                return Ok(st.exit_code.unwrap_or(-1));
-            }
         }
         if st.status == state::Status::Running && !st.pid_alive() {
             reconcile_stale_state(store, &mut st)?;
-            if st.status == state::Status::Exited && !st.restart_pending {
-                return Ok(st.exit_code.unwrap_or(-1));
+        }
+        if st.status == state::Status::Exited && !st.restart_pending {
+            // The reaper writes terminal state before finishing log and attach
+            // cleanup, and keeps this lock until that cleanup is complete.
+            // Recheck after acquiring it in case a manual start won the race.
+            let _lock = state::ContainerOperationLock::acquire_blocking(store, &id)?;
+            let current = state::ContainerState::load(store, &id).ok_or_else(|| {
+                format!(
+                    "container {name} state disappeared before its exit code was recorded (is it --rm?)"
+                )
+            })?;
+            if current.status == state::Status::Exited && !current.restart_pending {
+                return Ok(current.exit_code.unwrap_or(-1));
             }
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -8852,6 +8856,73 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert!(parse_run_args(&malformed).is_err());
+    }
+
+    #[test]
+    fn wait_rechecks_terminal_state_after_cleanup_lock() {
+        use std::sync::mpsc;
+
+        let dir = std::env::temp_dir().join(format!("zerun-wait-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::at(dir.join("data"), dir.join("run"));
+        store.ensure_dirs().unwrap();
+        let mut container: ContainerState = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "id": "0123456789ab",
+            "image": "rootfs:test",
+            "status": "exited",
+            "exit_code": 7,
+            "created": "2026-01-01T00:00:00Z",
+            "rootless": false,
+            "net": "none",
+            "ports": [],
+            "cmd": [],
+            "env": [],
+            "log": "",
+            "rootfs": ""
+        }))
+        .unwrap();
+        container.save(&store).unwrap();
+        let lock = state::ContainerOperationLock::try_acquire(&store, &container.id).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let wait_store = store.clone();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(wait_one(&wait_store, "0123456789ab"))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        // Model a manual start winning the operation lock before the waiter.
+        container.status = state::Status::Running;
+        container.pid = Some(std::process::id() as i32);
+        container.exit_code = None;
+        container.save(&store).unwrap();
+        drop(lock);
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        let lock = state::ContainerOperationLock::try_acquire(&store, &container.id).unwrap();
+        container.status = state::Status::Exited;
+        container.exit_code = Some(42);
+        container.save(&store).unwrap();
+        drop(lock);
+        assert_eq!(
+            result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+            42
+        );
+        waiter.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

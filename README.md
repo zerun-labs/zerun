@@ -566,7 +566,8 @@ run.
 unlimited), `always` retries every exit, and `unless-stopped` retries every exit until a
 manual stop. Retries use a bounded 100 ms-to-1 s backoff, and `ps` reports the transient
 state as `Restarting`. `wait` and `logs -f` follow the policy across attempts, so they
-return only after a terminal exit or a manual stop. `stop`, `kill` when it terminates the
+return only after a terminal exit or a manual stop. Before `wait` returns, the reaper also
+finishes collecting the container's log output. `stop`, `kill` when it terminates the
 workload, and `rm -f` suppress pending automatic restarts; a later manual `start`
 reactivates the persisted policy. Because Zerun has no daemon or boot-time state loader,
 `always` and `unless-stopped` have the same effect for the lifetime of the per-container

@@ -249,6 +249,14 @@ impl ContainerOperationLock {
         Ok(Self { file })
     }
 
+    /// Wait for a lifecycle operation to finish without imposing a timeout.
+    pub fn acquire_blocking(store: &Store, id: &str) -> Result<Self, String> {
+        let file = Self::open(store, id)?;
+        file.lock()
+            .map_err(|e| format!("lock container {id} for a lifecycle operation: {e}"))?;
+        Ok(Self { file })
+    }
+
     /// Acquire a lifecycle lock, waiting briefly for a reaper handoff.
     ///
     /// Operators issue `stop`/`kill`/`rm` while an automatic restart may be

@@ -843,15 +843,11 @@ cleanup_ids+=("$partial_log_id")
 test "$("${zerun[@]}" logs "$partial_log_id")" = partial-log
 "${zerun[@]}" start "$partial_log_id" >/dev/null
 "${zerun[@]}" wait "$partial_log_id" >/dev/null
-for attempt in $(seq 1 50); do
-  partial_logs=$("${zerun[@]}" logs --since 1970-01-01T00:00:00Z "$partial_log_id")
-  [[ $partial_logs == $'partial-log\npartial-log' ]] && break
-  if (( attempt == 50 )); then
-    echo "restarted container did not retain separate partial log records" >&2
-    exit 1
-  fi
-  sleep 0.1
-done
+partial_logs=$("${zerun[@]}" logs --since 1970-01-01T00:00:00Z "$partial_log_id")
+if [[ $partial_logs != $'partial-log\npartial-log' ]]; then
+  echo "wait returned before separate partial log records were available" >&2
+  exit 1
+fi
 test "$("${zerun[@]}" logs --tail 1 "$partial_log_id")" = partial-log
 "${zerun[@]}" rm "$partial_log_id" >/dev/null
 
