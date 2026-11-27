@@ -7689,9 +7689,15 @@ fn cmd_events(args: &[String]) -> i32 {
             let Some(event) = event.first() else {
                 continue;
             };
-            let _ = writeln!(out, "{}", events::format_event(event));
+            if let Err(error) = writeln!(out, "{}", events::format_event(event)) {
+                eprintln!("zerun events: write output: {error}");
+                return 1;
+            }
         }
-        let _ = out.flush();
+        if let Err(error) = out.flush() {
+            eprintln!("zerun events: flush output: {error}");
+            return 1;
+        }
         if time_filter.until_reached() {
             break;
         }

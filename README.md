@@ -661,6 +661,7 @@ records (use `-a` to include exited and created records).
 `events` follows lifecycle changes without a daemon. Repeated `--filter action=die`,
 `--filter container=web`, `--filter image=alpine`, and `--filter exitCode=0` selectors are
 ANDed; `--since`/`--until` accept RFC3339 UTC times and first replay matching history.
+The event stream exits with an error if it cannot write its output.
 
 ### systemd integration
 

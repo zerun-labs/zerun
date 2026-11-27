@@ -1249,6 +1249,17 @@ events_output=$("${zerun[@]}" events --filter "container=$m7_id" --until "$event
 grep -q 'container create' <<<"$events_output"
 grep -q 'container start' <<<"$events_output"
 
+# A broken event output must terminate an unbounded subscription promptly.
+set +e
+events_write_error=$(timeout 10 "${zerun[@]}" events --filter "container=$m7_id" \
+  --since 1970-01-01T00:00:00Z 2>&1 >/dev/full)
+events_write_status=$?
+set -e
+if (( events_write_status != 1 )) || [[ $events_write_error != *'zerun events: write output:'* ]]; then
+  echo "events did not report its output failure" >&2
+  exit 1
+fi
+
 cp_source="/tmp/zerun-cp-source-${BASHPID}"
 cp_copy="/tmp/zerun-cp-copy-${BASHPID}"
 export_tar="/tmp/zerun-export-${BASHPID}.tar"
