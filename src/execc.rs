@@ -665,21 +665,17 @@ fn worker(
     if state.env.is_empty() {
         pairs.extend(std::env::vars());
     } else {
-        for kv in &state.env {
-            let Some((k, v)) = kv.split_once('=') else {
-                eprintln!("zerun exec: invalid environment entry in state: '{kv}'");
-                return 1;
-            };
-            if let Err(e) = workload::validate_env_pair(k, v) {
-                eprintln!("zerun exec: invalid environment entry in state: '{kv}': {e}");
+        match crate::state_env(&state.env) {
+            Ok(entries) => pairs.extend(entries),
+            Err(error) => {
+                eprintln!("zerun exec: {error}");
                 return 1;
             }
-            pairs.push((k.to_string(), v.to_string()));
         }
     }
     for kv in env_extra {
         if let Err(e) = workload::validate_env_spec(kv) {
-            eprintln!("zerun exec: invalid environment entry '{kv}': {e}");
+            eprintln!("zerun exec: invalid environment entry: {e}");
             return 1;
         }
         match kv.split_once('=') {

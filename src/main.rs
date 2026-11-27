@@ -1347,12 +1347,16 @@ fn materialize_image_volumes(
 fn state_env(entries: &[String]) -> Result<Vec<(String, String)>, String> {
     entries
         .iter()
-        .map(|entry| {
-            let (key, value) = entry
-                .split_once('=')
-                .ok_or_else(|| format!("invalid environment entry in state: '{entry}'"))?;
+        .enumerate()
+        .map(|(index, entry)| {
+            let (key, value) = entry.split_once('=').ok_or_else(|| {
+                format!(
+                    "invalid environment entry {} in state: expected NAME=VALUE",
+                    index + 1
+                )
+            })?;
             workload::validate_env_pair(key, value)
-                .map_err(|e| format!("invalid environment entry in state: '{entry}': {e}"))?;
+                .map_err(|e| format!("invalid environment entry {} in state: {e}", index + 1))?;
             Ok((key.to_string(), value.to_string()))
         })
         .collect()
@@ -3795,14 +3799,15 @@ fn build_image_env(
     tty: bool,
 ) -> Result<Vec<(String, String)>, String> {
     let mut env: Vec<(String, String)> = Vec::new();
-    for entry in cfg_env {
+    for (index, entry) in cfg_env.iter().enumerate() {
         let Some((k, v)) = entry.split_once('=') else {
             return Err(format!(
-                "image contains malformed environment entry '{entry}'"
+                "invalid image environment entry {}: expected NAME=VALUE",
+                index + 1
             ));
         };
         workload::validate_env_pair(k, v)
-            .map_err(|e| format!("invalid image environment entry '{entry}': {e}"))?;
+            .map_err(|e| format!("invalid image environment entry {}: {e}", index + 1))?;
         upsert_env(&mut env, k.to_string(), v.to_string());
     }
     if workload::env_value(&env, "PATH").is_none() {
@@ -3815,7 +3820,7 @@ fn build_image_env(
         upsert_env(&mut env, key.clone(), value.clone());
     }
     for o in overrides {
-        workload::validate_env_spec(o).map_err(|e| format!("invalid --env '{o}': {e}"))?;
+        workload::validate_env_spec(o).map_err(|e| format!("invalid --env: {e}"))?;
         match o.split_once('=') {
             Some((k, v)) => upsert_env(&mut env, k.to_string(), v.to_string()),
             None => {
@@ -7782,7 +7787,7 @@ fn parse_exec_args(args: &[String]) -> Result<ParsedExec, String> {
             "-e" | "--env" => {
                 let value = next_value(args, &mut i, arg)?;
                 workload::validate_env_spec(&value)
-                    .map_err(|error| format!("invalid --env '{value}': {error}"))?;
+                    .map_err(|error| format!("invalid --env: {error}"))?;
                 parsed.env.push(value);
             }
             "--env-file" => {
@@ -10115,6 +10120,43 @@ mod tests {
         assert!(
             build_image_env(&["OK=bad\0value".to_string()], &[], &[], None, "id", false).is_err()
         );
+    }
+
+    #[test]
+    fn environment_errors_do_not_expose_entries() {
+        let malformed = "example-private-value";
+        let invalid_value = "KEY=example-private-value\0";
+        let image_errors = [
+            build_image_env(&[malformed.to_string()], &[], &[], None, "id", false).unwrap_err(),
+            build_image_env(&[invalid_value.to_string()], &[], &[], None, "id", false).unwrap_err(),
+        ];
+        for error in image_errors {
+            assert!(error.contains("entry 1"), "{error}");
+            assert!(!error.contains(malformed), "{error}");
+        }
+        for entry in [malformed, invalid_value] {
+            let error = state_env(&["GOOD=value".into(), entry.into()]).unwrap_err();
+            assert!(error.contains("entry 2"), "{error}");
+            assert!(!error.contains(malformed), "{error}");
+        }
+        let bad_override = "=example-private-value";
+        let run_error = parse_run_args(&["-e".into(), bad_override.into(), "image".into()])
+            .err()
+            .unwrap();
+        let exec_error = parse_exec_args(&[
+            "-e".into(),
+            bad_override.into(),
+            "container".into(),
+            "cmd".into(),
+        ])
+        .err()
+        .unwrap();
+        let image_error =
+            build_image_env(&[], &[], &[bad_override.into()], None, "id", false).unwrap_err();
+        for error in [run_error, exec_error, image_error] {
+            assert!(error.contains("empty"), "{error}");
+            assert!(!error.contains(malformed), "{error}");
+        }
     }
 
     #[test]

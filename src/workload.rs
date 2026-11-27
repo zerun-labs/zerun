@@ -32,7 +32,7 @@ pub fn validate_env_key(key: &str) -> ZResult<()> {
 pub fn validate_env_pair(key: &str, value: &str) -> ZResult<()> {
     validate_env_key(key)?;
     if value.contains('\0') {
-        return Err(crate::zerr!("environment variable '{key}' contains NUL"));
+        return Err(crate::zerr!("environment variable value contains NUL"));
     }
     Ok(())
 }
@@ -123,9 +123,7 @@ fn parse_env_file(text: &str) -> Result<Vec<(String, String)>, String> {
             continue;
         }
         let Some((raw_key, value)) = line.split_once('=') else {
-            return Err(format!(
-                "line {line_number}: expected NAME=VALUE, found {line:?}"
-            ));
+            return Err(format!("line {line_number}: expected NAME=VALUE"));
         };
         let key = raw_key.trim_matches([' ', '\t']);
         if key.is_empty() {
@@ -210,12 +208,14 @@ mod tests {
 
     #[test]
     fn env_file_parser_rejects_malformed_entries_with_line_numbers() {
-        let error = parse_env_file("A=1\nnot-an-assignment\n").unwrap_err();
+        let error = parse_env_file("A=1\nexample-private-value\n").unwrap_err();
         assert!(error.contains("line 2"), "{error}");
+        assert!(!error.contains("example-private-value"), "{error}");
         let error = parse_env_file("A=1\n BAD KEY=value\n").unwrap_err();
         assert!(error.contains("line 2"), "{error}");
-        let error = parse_env_file("A=bad\0value\n").unwrap_err();
-        assert!(error.contains("line 1"), "{error}");
+        let error = parse_env_file("example-private-key=bad\0value\n").unwrap_err();
+        assert!(error.contains("line 1") && error.contains("NUL"), "{error}");
+        assert!(!error.contains("example-private-key"), "{error}");
         assert!(parse_env_file("=value\n").is_err());
     }
 
