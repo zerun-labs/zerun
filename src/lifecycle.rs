@@ -536,7 +536,7 @@ struct RotatingLog {
 
 impl RotatingLog {
     fn open(active: &Path, options: LogOptions) -> std::io::Result<Self> {
-        let file = OpenOptions::new().read(true).append(true).open(active)?;
+        let file = crate::logs::open_console_log(active, false, true)?;
         // Logs may contain application secrets. Tighten files created by older
         // versions as well as newly-created files before the collector writes.
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
@@ -622,15 +622,16 @@ impl RotatingLog {
         // were enforced. Secure every retained inode after the rename pass.
         for index in 1..max_files {
             let archive = numbered_path(&self.active, index);
-            match std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o600)) {
+            match crate::logs::open_console_log(&archive, false, false)
+                .and_then(|file| file.set_permissions(std::fs::Permissions::from_mode(0o600)))
+            {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
         }
         let replacement = OpenOptions::new()
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .write(true)
             .mode(0o600)
             .open(&self.active)?;
@@ -1129,6 +1130,55 @@ mod attach_tests {
         server.set_nonblocking(true).unwrap();
         assert!(register_attach_client(&mut clients, server));
         assert_eq!(clients.len(), MAX_ATTACH_CLIENTS);
+    }
+
+    #[test]
+    fn console_log_writes_reject_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_log_dir("log-symlink");
+        let active = dir.join("console.log");
+        let outside = dir.join("outside");
+        std::fs::write(&outside, b"preserve").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&outside, &active).unwrap();
+        assert!(crate::logs::open_console_log(&active, true, true).is_err());
+        assert!(crate::logs::open_console_log(&active, true, false).is_err());
+        assert!(RotatingLog::open(&active, LogOptions::default()).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"preserve");
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rotation_does_not_chmod_symlink_archive_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_log_dir("archive-symlink");
+        let active = dir.join("console.log");
+        let outside = dir.join("outside");
+        std::fs::write(&outside, b"preserve").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&active, b"old\n").unwrap();
+        symlink(&outside, dir.join("console.log.1")).unwrap();
+        let mut log = RotatingLog::open(
+            &active,
+            LogOptions {
+                max_size: 1,
+                max_files: 3,
+            },
+        )
+        .unwrap();
+        assert!(log.write_record(b"time", b"new\n").is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"preserve");
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

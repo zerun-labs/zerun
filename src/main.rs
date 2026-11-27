@@ -2678,20 +2678,7 @@ fn run_detached(
         .as_ref()
         .map(|st| st.log_path_for(store))
         .unwrap_or_else(|| sdir.join("console.log"));
-    let log_fd = match if resuming {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&log_path)
-    } else {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&log_path)
-    } {
+    let log_fd = match logs::open_console_log(&log_path, true, resuming) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("zerun: open {}: {e}", log_path.display());
@@ -2707,6 +2694,19 @@ fn run_detached(
             return 1;
         }
     };
+    if !resuming {
+        if let Err(e) = log_fd.set_len(0) {
+            eprintln!("zerun: truncate {}: {e}", log_path.display());
+            cleanup_failed_detached_start(
+                store,
+                &id,
+                container_fs.as_ref(),
+                &info.anonymous_volumes,
+                &sdir,
+            );
+            return 1;
+        }
+    }
     if let Err(e) = log_fd.set_permissions(std::fs::Permissions::from_mode(0o600)) {
         eprintln!("zerun: secure {}: {e}", log_path.display());
         if !resuming {

@@ -9,8 +9,28 @@
 //! cannot participate in `--since`/`--until` selection because there is no
 //! trustworthy capture-time anchor.
 
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Open a console log without following a final symlink or blocking on a FIFO.
+pub fn open_console_log(path: &Path, create: bool, append: bool) -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .append(append)
+        .create(create)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "console log is not a regular file",
+        ));
+    }
+    Ok(file)
+}
 
 /// Default detached-console rotation budget. Rotating by default keeps a
 /// chatty workload from exhausting a small VPS disk; `--log-max-size 0`
