@@ -8984,6 +8984,55 @@ mod tests {
     }
 
     #[test]
+    fn log_follow_until_remains_responsive_during_terminal_cleanup() {
+        let root =
+            std::env::temp_dir().join(format!("zerun-follow-until-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.join("data"), root.join("run"));
+        store.ensure_dirs().unwrap();
+        let container: ContainerState = serde_json::from_value(serde_json::json!({
+            "version": 1, "id": "0123456789ab", "image": "rootfs:test",
+            "status": "exited", "exit_code": 0, "created": "2026-01-01T00:00:00Z",
+            "rootless": false, "net": "none", "ports": [], "cmd": [], "env": [],
+            "log": "", "rootfs": ""
+        }))
+        .unwrap();
+        let dir = ContainerState::dir(&store, &container.id);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("console.log");
+        std::fs::write(&path, b"").unwrap();
+        container.save(&store).unwrap();
+        let lock = state::ContainerOperationLock::try_acquire(&store, &container.id).unwrap();
+        let until = (SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 2)
+        .to_string();
+        let filter = LogTimeFilter::parse(None, Some(&until)).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_store = store.clone();
+        let worker = std::thread::spawn(move || {
+            done_tx
+                .send(follow_log(
+                    &worker_store,
+                    &container,
+                    &path,
+                    1,
+                    LogCursor::new(),
+                    false,
+                    Some(&filter),
+                ))
+                .unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(4));
+        drop(lock);
+        worker.join().unwrap();
+        result.unwrap().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn log_follow_waits_for_terminal_cleanup_and_rechecks_state() {
         use std::sync::mpsc;
 
