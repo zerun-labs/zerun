@@ -188,6 +188,30 @@ pub fn atomic_write_mode(path: &Path, data: &[u8], mode: u32) -> ZResult<()> {
     result
 }
 
+/// Atomically write a state file within a pinned directory descriptor.
+pub fn atomic_write_state_at(directory: &File, data: &[u8]) -> ZResult<()> {
+    let sequence = ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = format!(".tmp-{}-{sequence}-state.json", std::process::id());
+    let mut file = crate::syscalls::create_file_at(directory, &tmp, 0o600)
+        .map_err(|error| crate::zerr!("create temporary state file: {error}"))?;
+    let result = (|| -> ZResult<()> {
+        file.write_all(data)
+            .map_err(|error| crate::zerr!("write temporary state file: {error}"))?;
+        file.sync_all()
+            .map_err(|error| crate::zerr!("sync temporary state file: {error}"))?;
+        crate::syscalls::rename_file_at(directory, &tmp, "state.json")
+            .map_err(|error| crate::zerr!("install state file: {error}"))?;
+        directory
+            .sync_all()
+            .map_err(|error| crate::zerr!("sync state directory: {error}"))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = crate::syscalls::unlink_file_at(directory, &tmp);
+    }
+    result
+}
+
 /// Flush directory-entry changes after installing or removing durable files.
 pub fn sync_directory(dir: &Path) -> ZResult<()> {
     File::open(dir)
@@ -427,6 +451,26 @@ mod tests {
             0o600
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_write_stays_in_pinned_directory_after_rename() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-state-write-pin-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let original = root.join("original");
+        let moved = root.join("moved");
+        fs::create_dir(&original).unwrap();
+        let directory = File::open(&original).unwrap();
+        fs::rename(&original, &moved).unwrap();
+        fs::create_dir(&original).unwrap();
+        atomic_write_state_at(&directory, b"state").unwrap();
+        assert_eq!(fs::read(moved.join("state.json")).unwrap(), b"state");
+        assert!(!original.join("state.json").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

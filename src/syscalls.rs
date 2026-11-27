@@ -81,6 +81,54 @@ pub fn open_state_file_at(directory: &std::fs::File) -> std::io::Result<std::fs:
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
+/// Create an exclusive file inside an already opened directory.
+pub fn create_file_at(
+    directory: &std::fs::File,
+    name: &str,
+    mode: u32,
+) -> std::io::Result<std::fs::File> {
+    let name = CString::new(name).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            mode as libc::mode_t,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Atomically replace a directory entry with another entry in the same directory.
+pub fn rename_file_at(directory: &std::fs::File, from: &str, to: &str) -> std::io::Result<()> {
+    let from = CString::new(from).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+    let to = CString::new(to).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+    if unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            from.as_ptr(),
+            directory.as_raw_fd(),
+            to.as_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Remove a temporary file from a pinned directory.
+pub fn unlink_file_at(directory: &std::fs::File, name: &str) -> std::io::Result<()> {
+    let name = CString::new(name).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Read the system clock tick frequency used by `/proc/<pid>/stat`.
 pub fn clock_ticks_per_second() -> u64 {
     let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };

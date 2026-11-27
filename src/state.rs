@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::net::Ipv4Addr;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -767,8 +767,25 @@ impl ContainerState {
             .ok_or_else(|| crate::zerr!("state path has no parent: {}", p.display()))?;
         // State includes the resolved environment and command line, which can
         // contain credentials or other operator-provided secrets.
-        fsutil::mkdir_p_mode(parent, 0o700)?;
-        fsutil::atomic_write_mode(&p, &json, 0o600)
+        match std::fs::create_dir(parent) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(crate::zerr!(
+                    "create state directory {}: {error}",
+                    parent.display()
+                ))
+            }
+        }
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(parent)
+            .map_err(|error| crate::zerr!("open state directory {}: {error}", parent.display()))?;
+        directory
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| crate::zerr!("chmod state directory {}: {error}", parent.display()))?;
+        fsutil::atomic_write_state_at(&directory, &json)
     }
 
     /// Human-friendly status line for `ze ps`.
@@ -1504,6 +1521,20 @@ mod tests {
         tampered["id"] = serde_json::Value::String("fedcba987654".to_string());
         std::fs::write(&state_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
         assert!(ContainerState::load(&store, &a.id).is_none());
+
+        let outside = dir.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut redirected = a.clone();
+        redirected.id = "ff1234".to_string();
+        std::os::unix::fs::symlink(&outside, ContainerState::dir(&store, &redirected.id)).unwrap();
+        assert!(redirected.save(&store).is_err());
+        assert!(!outside.join("state.json").exists());
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
 
         let mut invalid = a.clone();
         invalid.id = "../outside".to_string();
