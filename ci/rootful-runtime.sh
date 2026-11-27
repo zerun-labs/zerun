@@ -926,6 +926,32 @@ fi
 test "$("${zerun[@]}" logs --tail 1 "$partial_log_id")" = partial-log
 "${zerun[@]}" rm "$partial_log_id" >/dev/null
 
+# Both replay and live follow must report stdout failures instead of silently
+# discarding logs. /dev/full fails every write with ENOSPC.
+write_error_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --net none \
+  -- /bin/sh -c 'printf "initial-output\n"; sleep 2; printf "follow-output\n"; sleep 2')
+cleanup_ids+=("$write_error_id")
+for _ in {1..50}; do
+  if "${zerun[@]}" logs "$write_error_id" 2>/dev/null | grep -q initial-output; then
+    break
+  fi
+  sleep 0.05
+done
+if "${zerun[@]}" logs "$write_error_id" >/dev/full 2>/dev/null; then
+  echo "logs replay ignored stdout failure" >&2
+  exit 1
+fi
+set +e
+timeout 10 "${zerun[@]}" logs -f --tail 0 "$write_error_id" >/dev/full 2>/dev/null
+write_error_status=$?
+set -e
+if (( write_error_status == 0 || write_error_status == 124 )); then
+  echo "logs follow ignored stdout failure or timed out" >&2
+  exit 1
+fi
+"${zerun[@]}" wait "$write_error_id" >/dev/null
+"${zerun[@]}" rm "$write_error_id" >/dev/null
+
 # A follower must drain retained rotations and the final partial record before
 # automatic removal, even though the reaper holds the lifecycle lock.
 follow_rm_id=$("${zerun[@]}" run -d --rm --rootfs "$rootfs" --net none \

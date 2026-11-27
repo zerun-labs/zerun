@@ -5926,7 +5926,7 @@ fn cmd_logs(args: &[String]) -> i32 {
         Ok(snapshot) => snapshot,
         Err(e) => {
             eprintln!(
-                "zerun logs: cannot read log files for container {}: {e}",
+                "zerun logs: cannot stream log files for container {}: {e}",
                 display_name(&st)
             );
             return 1;
@@ -6014,7 +6014,7 @@ fn stream_log_snapshot<F>(
     mut emit: F,
 ) -> std::io::Result<(LogCursor, bool)>
 where
-    F: FnMut(&[u8]),
+    F: FnMut(&[u8]) -> std::io::Result<()>,
 {
     use std::collections::VecDeque;
     use std::io::{BufRead, BufReader, Read, Seek, Take};
@@ -6061,7 +6061,7 @@ where
                     lines.pop_front();
                 }
             } else if logs::log_line_matches(&line, filter) {
-                emit(&line);
+                emit(&line)?;
             }
         }
         cursor.insert(id, snapshot_len);
@@ -6070,7 +6070,7 @@ where
     if let Some(lines) = tail_lines {
         for line in lines {
             if logs::log_line_matches(&line, filter) {
-                emit(&line);
+                emit(&line)?;
             }
         }
     }
@@ -6123,7 +6123,7 @@ fn drain_rotated_logs(
                 Ok(n) => {
                     consumed = consumed.saturating_add(n as u64);
                     if filter.is_none_or(|filter| logs::log_line_matches(&line, &filter)) {
-                        write_log_output(&line, timestamps);
+                        write_log_output(&line, timestamps)?;
                     }
                 }
                 Err(error) => {
@@ -8069,19 +8069,15 @@ fn wait_pid_gone(state: &state::ContainerState, timeout: Duration) -> bool {
 /// `console.log` stores timestamps at capture time. Docker-style default
 /// output omits them, while `-t` displays the recorded timestamps verbatim.
 /// Legacy logs without the known prefix pass through unchanged.
-fn write_log_output(data: &[u8], timestamps: bool) {
-    if timestamps {
-        write_stdout(data);
-    } else {
-        write_stdout(&logs::strip_log_timestamps(data));
-    }
-}
-
-fn write_stdout(data: &[u8]) {
+fn write_log_output(data: &[u8], timestamps: bool) -> std::io::Result<()> {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
-    let _ = out.write_all(data);
-    let _ = out.flush();
+    if timestamps {
+        out.write_all(data)?;
+    } else {
+        out.write_all(&logs::strip_log_timestamps(data))?;
+    }
+    out.flush()
 }
 
 /// Human-friendly age of an RFC3339 UTC timestamp ("5 minutes").
@@ -9168,8 +9164,10 @@ mod tests {
         symlink(&outside, &archive).unwrap();
         let filter = LogTimeFilter::parse(None, None).unwrap();
         let mut output = Vec::new();
-        assert!(stream_log_snapshot(&active, 2, None, &filter, |line| output
-            .extend_from_slice(line))
+        assert!(stream_log_snapshot(&active, 2, None, &filter, |line| {
+            output.extend_from_slice(line);
+            Ok(())
+        })
         .is_err());
         assert!(output.is_empty());
         assert!(
@@ -9179,7 +9177,7 @@ mod tests {
         std::fs::remove_file(&archive).unwrap();
         std::fs::remove_file(&active).unwrap();
         symlink(&outside, &active).unwrap();
-        assert!(stream_log_snapshot(&active, 1, None, &filter, |_| {}).is_err());
+        assert!(stream_log_snapshot(&active, 1, None, &filter, |_| Ok(())).is_err());
         assert!(
             drain_rotated_logs(&active, 1, &mut LogCursor::new(), false, Some(&filter)).is_err()
         );
@@ -9205,7 +9203,8 @@ mod tests {
 
         let mut bytes = Vec::new();
         let (cursor, read_any) = stream_log_snapshot(&active, 3, None, &filter, |line| {
-            bytes.extend_from_slice(line)
+            bytes.extend_from_slice(line);
+            Ok(())
         })
         .unwrap();
         assert!(read_any);
@@ -9215,7 +9214,8 @@ mod tests {
 
         let mut bytes = Vec::new();
         let (_, read_any) = stream_log_snapshot(&active, 3, Some(2), &filter, |line| {
-            bytes.extend_from_slice(line)
+            bytes.extend_from_slice(line);
+            Ok(())
         })
         .unwrap();
         assert!(read_any);
@@ -9223,7 +9223,8 @@ mod tests {
 
         let mut bytes = Vec::new();
         let (cursor, read_any) = stream_log_snapshot(&active, 3, Some(0), &filter, |line| {
-            bytes.extend_from_slice(line)
+            bytes.extend_from_slice(line);
+            Ok(())
         })
         .unwrap();
         assert!(read_any);
@@ -9231,6 +9232,31 @@ mod tests {
         assert_eq!(cursor.len(), 3);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_snapshot_propagates_output_errors() {
+        let dir =
+            std::env::temp_dir().join(format!("zerun-log-write-error-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let active = dir.join("console.log");
+        std::fs::write(&active, b"first\nsecond\n").unwrap();
+        let filter = LogTimeFilter::parse(None, None).unwrap();
+        for tail in [None, Some(1)] {
+            let mut calls = 0;
+            let error = stream_log_snapshot(&active, 1, tail, &filter, |_| {
+                calls += 1;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "output failed",
+                ))
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+            assert_eq!(calls, 1);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -9251,6 +9277,7 @@ mod tests {
                 std::fs::rename(&archive, &active).unwrap();
                 renamed = true;
             }
+            Ok(())
         })
         .unwrap();
         assert!(read_any);
@@ -9285,7 +9312,8 @@ mod tests {
             started_tx.send(()).unwrap();
             let mut output = Vec::new();
             let result = stream_log_snapshot(&snapshot_path, 1, None, &filter, |line| {
-                output.extend_from_slice(line)
+                output.extend_from_slice(line);
+                Ok(())
             });
             result_tx.send((result, output)).unwrap();
         });
@@ -9316,7 +9344,7 @@ mod tests {
         let archive = dir.join("console.log.1");
         std::fs::write(&active, b"old\n").unwrap();
         let filter = LogTimeFilter::parse(Some("3000-01-01T00:00:00Z"), None).unwrap();
-        let (mut cursor, _) = stream_log_snapshot(&active, 2, None, &filter, |_| {}).unwrap();
+        let (mut cursor, _) = stream_log_snapshot(&active, 2, None, &filter, |_| Ok(())).unwrap();
         let old_meta = std::fs::metadata(&active).unwrap();
         let old_id = (old_meta.dev(), old_meta.ino());
 

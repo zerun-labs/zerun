@@ -598,9 +598,10 @@ logs are displayed normally but cannot be selected by time. `--until` ends follo
 that boundary; `--since` remains fixed while following. For detached `--rm` containers,
 the reaper gives active followers up to two seconds to drain the retained logs after the
 final flush before removing them. Slow or blocked followers may miss output after that
-interval, and records already displaced by rotation cannot be recovered. Log files must be regular files,
-and `logs` reports an error if a retained file is a symlink, has multiple hard links, or
-cannot be read. An unterminated line is split into 64 KiB
+interval, and records already displaced by rotation cannot be recovered. Log files must
+be regular files. `logs` reports an error when a retained file is a symlink, has multiple
+hard links, or cannot be read, or when output cannot be written. An unterminated line is
+split into 64 KiB
 timestamped records in `console.log`, so a workload cannot make the reaper buffer an
 unbounded line; `attach` still receives the original bytes unchanged. When a container is
 started again after ending with an unterminated line, a newline separates that line from the
