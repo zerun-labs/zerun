@@ -334,7 +334,11 @@ fn epoch_nanos_from_rfc3339(value: &str) -> Result<i128, ()> {
         return Err(());
     }
     let num = |range: std::ops::Range<usize>| -> Result<i64, ()> {
-        std::str::from_utf8(&b[range])
+        let digits = &b[range];
+        if !digits.iter().all(u8::is_ascii_digit) {
+            return Err(());
+        }
+        std::str::from_utf8(digits)
             .map_err(|_| ())?
             .parse()
             .map_err(|_| ())
@@ -481,6 +485,23 @@ mod tests {
         let offset = epoch_nanos_from_rfc3339("2026-01-01T01:00:01.500+01:00").unwrap();
         assert_eq!(utc, 1_767_225_601_500_000_000);
         assert_eq!(utc, offset);
+    }
+
+    #[test]
+    fn rejects_signed_rfc3339_components() {
+        for timestamp in [
+            "+026-01-01T00:00:00Z",
+            "2026-+1-01T00:00:00Z",
+            "2026-01-+1T00:00:00Z",
+            "2026-01-01T-1:00:00Z",
+            "2026-01-01T00:-1:00Z",
+            "2026-01-01T00:00:-1Z",
+            "2026-01-01T00:00:00+-1:00",
+            "2026-01-01T00:00:00+00:-1",
+        ] {
+            assert!(epoch_nanos_from_rfc3339(timestamp).is_err(), "{timestamp}");
+            assert!(LogTimeFilter::parse(Some(timestamp), None).is_err());
+        }
     }
 
     #[test]
