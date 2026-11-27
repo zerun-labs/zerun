@@ -26,7 +26,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::fd::RawFd;
-use std::os::unix::fs::{FileExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -486,7 +486,7 @@ impl CapturedLog {
         // Live attach socket next to console.log; a failed bind degrades to
         // log-only operation (attach reports the missing socket clearly).
         let sock_path = log_path.with_file_name("attach.sock");
-        let attach = match AttachHub::bind(&sock_path) {
+        let attach = match AttachHub::bind(&log_file.directory, &sock_path) {
             Ok(hub) => Some(hub),
             Err(e) => {
                 eprintln!("zerun: attach socket unavailable: {e}");
@@ -661,19 +661,36 @@ fn numbered_path(active: &std::ffi::OsStr, index: usize) -> std::ffi::OsString {
 /// frame carrying the exit status, so workload bytes are never metadata.
 struct AttachHub {
     clients: Arc<Mutex<Vec<UnixStream>>>,
-    sock_path: std::path::PathBuf,
+    directory: File,
+    socket_id: (u64, u64),
 }
 
 impl AttachHub {
-    fn bind(sock_path: &Path) -> ZResult<AttachHub> {
-        let _ = std::fs::remove_file(sock_path); // stale socket from a crash
-        let listener = UnixListener::bind(sock_path)
+    fn bind(directory: &File, sock_path: &Path) -> ZResult<AttachHub> {
+        let directory = directory.try_clone()?;
+        let name = std::ffi::OsStr::new("attach.sock");
+        match open_attach_socket(&directory) {
+            Ok(_) => crate::syscalls::unlink_log_file_at(&directory, name)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(crate::zerr!("inspect {}: {error}", sock_path.display())),
+        }
+        let pinned_path = format!("/proc/self/fd/{}/attach.sock", directory.as_raw_fd());
+        let listener = UnixListener::bind(&pinned_path)
             .map_err(|e| crate::zerr!("bind {}: {e}", sock_path.display()))?;
-        // Owner-only: the socket streams container output.
-        let _ = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o600));
+        let socket = open_attach_socket(&directory)?;
+        let metadata = socket.metadata()?;
+        let socket_id = (metadata.dev(), metadata.ino());
+        // The pinned socket inode remains the chmod target if its name changes.
+        if let Err(error) = std::fs::set_permissions(
+            format!("/proc/self/fd/{}", socket.as_raw_fd()),
+            std::fs::Permissions::from_mode(0o600),
+        ) {
+            remove_attach_socket_if_same(&directory, socket_id);
+            return Err(error.into());
+        }
         let clients: Arc<Mutex<Vec<UnixStream>>> = Arc::default();
         let worker_clients = Arc::clone(&clients);
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("zerun-attach".to_string())
             .spawn(move || {
                 // Blocks on accept until the reaper process exits; the
@@ -700,10 +717,15 @@ impl AttachHub {
                         Err(_) => break,
                     }
                 }
-            })?;
+            });
+        if let Err(error) = worker {
+            remove_attach_socket_if_same(&directory, socket_id);
+            return Err(error.into());
+        }
         Ok(AttachHub {
             clients,
-            sock_path: sock_path.to_path_buf(),
+            directory,
+            socket_id,
         })
     }
 
@@ -716,7 +738,32 @@ impl AttachHub {
                 let _ = client.write_all(&frame);
             }
         }
-        let _ = std::fs::remove_file(&self.sock_path);
+        remove_attach_socket_if_same(&self.directory, self.socket_id);
+    }
+}
+
+fn open_attach_socket(directory: &File) -> std::io::Result<File> {
+    let file = crate::syscalls::open_log_path_at(directory, std::ffi::OsStr::new("attach.sock"))?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_socket() || metadata.nlink() > 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "attach path is not a uniquely linked socket",
+        ));
+    }
+    Ok(file)
+}
+
+fn remove_attach_socket_if_same(directory: &File, expected: (u64, u64)) {
+    if let Ok(socket) = open_attach_socket(directory) {
+        if let Ok(metadata) = socket.metadata() {
+            if (metadata.dev(), metadata.ino()) == expected {
+                let _ = crate::syscalls::unlink_log_file_at(
+                    directory,
+                    std::ffi::OsStr::new("attach.sock"),
+                );
+            }
+        }
     }
 }
 
@@ -1073,6 +1120,51 @@ mod attach_tests {
     }
 
     #[test]
+    fn attach_socket_stays_in_pinned_directory_after_path_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_log_dir("attach-pinned-directory");
+        let directory = root.join("container");
+        let moved = root.join("moved");
+        let outside = root.join("outside");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let external = outside.join("attach.sock");
+        std::fs::write(&external, b"preserve").unwrap();
+        std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (pinned, _) = crate::logs::open_log_directory(&directory.join("console.log")).unwrap();
+        std::fs::rename(&directory, &moved).unwrap();
+        symlink(&outside, &directory).unwrap();
+        let hub = AttachHub::bind(&pinned, &directory.join("attach.sock")).unwrap();
+        let _client = UnixStream::connect(moved.join("attach.sock")).unwrap();
+        hub.close_all(0);
+        assert!(!moved.join("attach.sock").exists());
+        assert_eq!(std::fs::read(&external).unwrap(), b"preserve");
+        assert_eq!(
+            std::fs::metadata(&external).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn attach_socket_does_not_remove_non_socket_or_replacement() {
+        let directory = temp_log_dir("attach-replaced-file");
+        let path = directory.join("attach.sock");
+        let (pinned, _) = crate::logs::open_log_directory(&directory.join("console.log")).unwrap();
+        std::fs::write(&path, b"preserve").unwrap();
+        assert!(AttachHub::bind(&pinned, &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"preserve");
+        std::fs::remove_file(&path).unwrap();
+        let hub = AttachHub::bind(&pinned, &path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        hub.close_all(0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn attach_data_frames_preserve_arbitrary_workload_bytes() {
         let (server, mut client) = UnixStream::pair().unwrap();
         let clients = Arc::new(Mutex::new(vec![server]));
@@ -1091,15 +1183,18 @@ mod attach_tests {
     #[test]
     fn attach_control_frame_carries_the_exit_status() {
         let (server, mut client) = UnixStream::pair().unwrap();
+        let directory = temp_log_dir("attach-control");
         let hub = AttachHub {
             clients: Arc::new(Mutex::new(vec![server])),
-            sock_path: std::path::PathBuf::from("/nonexistent/zerun-test.sock"),
+            directory: File::open(&directory).unwrap(),
+            socket_id: (0, 0),
         };
         hub.close_all(7);
         assert_eq!(
             read_attach_frame(&mut client).unwrap(),
             AttachFrame::Exit(7)
         );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
