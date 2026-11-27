@@ -73,6 +73,19 @@ pub fn log_paths(active: &Path, max_files: usize) -> Vec<PathBuf> {
     paths
 }
 
+/// Capture a boundary between complete records written by the log collector.
+///
+/// The shared lock is held only for metadata, so slow log consumers do not
+/// block the collector while they read or display the captured bytes.
+pub fn snapshot_metadata(file: &std::fs::File) -> std::io::Result<std::fs::Metadata> {
+    file.lock_shared()?;
+    let metadata = file.metadata();
+    let unlock = file.unlock();
+    let metadata = metadata?;
+    unlock?;
+    Ok(metadata)
+}
+
 /// Inclusive nanosecond range used by `zerun logs --since/--until`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogTimeFilter {

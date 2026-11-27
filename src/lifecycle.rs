@@ -556,9 +556,15 @@ impl RotatingLog {
         {
             self.rotate()?;
         }
-        self.file.write_all(timestamp)?;
-        self.file.write_all(b"\t")?;
-        self.file.write_all(line)?;
+        self.file.lock()?;
+        let write_result = (|| {
+            self.file.write_all(timestamp)?;
+            self.file.write_all(b"\t")?;
+            self.file.write_all(line)
+        })();
+        let unlock_result = self.file.unlock();
+        write_result?;
+        unlock_result?;
         self.written = self.written.saturating_add(record_len);
         Ok(())
     }
@@ -1176,6 +1182,50 @@ mod attach_tests {
         assert!(bytes.windows(b"third".len()).any(|w| w == b"third"));
         assert!(!bytes.windows(b"second".len()).any(|w| w == b"second"));
         assert!(!dir.join("console.log.1").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotating_log_waits_for_snapshot_metadata_reader() {
+        use std::sync::mpsc;
+
+        let dir = temp_log_dir("record-lock");
+        let active = dir.join("console.log");
+        std::fs::write(&active, b"").unwrap();
+        let reader = File::open(&active).unwrap();
+        reader.lock_shared().unwrap();
+        let mut log = RotatingLog::open(
+            &active,
+            LogOptions {
+                max_size: 0,
+                max_files: 1,
+            },
+        )
+        .unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx
+                .send(log.write_record(b"2026-01-01T00:00:00.000000000Z", b"hello\n"))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(reader.metadata().unwrap().len(), 0);
+        reader.unlock().unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+        assert_eq!(
+            std::fs::read(&active).unwrap(),
+            b"2026-01-01T00:00:00.000000000Z\thello\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

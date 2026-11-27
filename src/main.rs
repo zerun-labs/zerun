@@ -5984,7 +5984,7 @@ where
                 ));
             }
         };
-        let meta = file.metadata()?;
+        let meta = logs::snapshot_metadata(&file)?;
         let id = (meta.dev(), meta.ino());
         let snapshot_len = meta.len();
         read_any = true;
@@ -6046,7 +6046,7 @@ fn drain_rotated_logs(
         let Ok(mut file) = std::fs::File::open(log_path) else {
             continue;
         };
-        let Ok(meta) = file.metadata() else {
+        let Ok(meta) = logs::snapshot_metadata(&file) else {
             continue;
         };
         let id = (meta.dev(), meta.ino());
@@ -8919,6 +8919,50 @@ mod tests {
         assert_eq!(output, b"first\nsecond\n");
         assert_eq!(cursor.len(), 1);
         assert_eq!(cursor.values().next(), Some(&13));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_snapshot_waits_for_complete_record() {
+        use std::io::Write;
+        use std::sync::mpsc;
+
+        let dir = std::env::temp_dir().join(format!("zerun-log-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let active = dir.join("console.log");
+        let mut writer = std::fs::OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(&active)
+            .unwrap();
+        writer.lock().unwrap();
+        writer.write_all(b"2026-01-01T00:00:").unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let snapshot_path = active.clone();
+        let reader = std::thread::spawn(move || {
+            let filter = LogTimeFilter::parse(Some("2026-01-01T00:00:00Z"), None).unwrap();
+            started_tx.send(()).unwrap();
+            let mut output = Vec::new();
+            let result = stream_log_snapshot(&snapshot_path, 1, None, &filter, |line| {
+                output.extend_from_slice(line)
+            });
+            result_tx.send((result, output)).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        writer.write_all(b"00.000000000Z\thello\n").unwrap();
+        writer.unlock().unwrap();
+        let (result, output) = result_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (cursor, _) = result.unwrap();
+        assert_eq!(output, b"2026-01-01T00:00:00.000000000Z\thello\n");
+        assert_eq!(cursor.values().next(), Some(&(output.len() as u64)));
+        reader.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
