@@ -213,7 +213,9 @@ the built-in mini-init, and
 Environment files contain one `NAME=VALUE` per line; blank lines and lines whose
 first non-whitespace character is `#` are ignored, and values are literal (no shell
 expansion). Later files override earlier files, then `-e` overrides both. Files are
-limited to 1 MiB each and are only accepted in image mode.
+limited to 1 MiB each and are only accepted in image mode. Bare command names are
+searched using the container environment's `PATH`; an empty entry refers to the
+working directory. The same lookup applies to `exec`.
 
 ### Run options
 

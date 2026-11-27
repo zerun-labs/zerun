@@ -1230,10 +1230,9 @@ fn child_stage(
     //    reaps orphans, forwards signals, and _exit()s with the workload code.
     trace::mark("child:exec:begin");
     let env = exec_environment(spec);
-    let argv = crate::workload::resolve_argv(env.as_deref(), &spec.argv);
     if spec.use_init {
         let code = crate::mini_init::run_with_error_pipe(
-            &argv,
+            &spec.argv,
             env.as_deref(),
             spec.hostname.as_deref(),
             &spec.id,
@@ -1243,8 +1242,8 @@ fn child_stage(
     }
 
     use std::os::unix::process::CommandExt;
-    let mut cmd = std::process::Command::new(&argv[0]);
-    cmd.args(argv.iter().skip(1));
+    let mut cmd = std::process::Command::new(&spec.argv[0]);
+    cmd.args(spec.argv.iter().skip(1));
     crate::workload::apply_env(&mut cmd, env.as_deref(), spec.hostname.as_deref(), &spec.id);
     let err = cmd.exec(); // only returns on failure
     Err(crate::zerr!("execve failed: {err}"))

@@ -699,14 +699,6 @@ fn worker(
         ));
     }
 
-    // Resolve a bare argv[0] against the container PATH; entries already
-    // containing '/' are used as-is. The resolved absolute path is passed to
-    // exec directly, so PATH lookup never depends on the exec-time environ.
-    let mut resolved = argv.to_vec();
-    if let Some(first) = resolved.first_mut() {
-        *first = workload::resolve_argv0(first, &pairs);
-    }
-
     // Older records predate per-container capability state and safely fall
     // back to the default set. Exact recorded sets include the empty set, so
     // `exec` cannot silently regain capabilities that `run --cap-drop ALL`
@@ -766,15 +758,15 @@ fn worker(
     }
 
     use std::os::unix::process::CommandExt;
-    let mut cmd = std::process::Command::new(&resolved[0]);
-    cmd.args(resolved.iter().skip(1));
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(argv.iter().skip(1));
     cmd.env_clear();
     for (k, v) in &pairs {
         cmd.env(k, v);
     }
 
     let err = cmd.exec(); // only returns on failure
-    eprintln!("zerun exec: execve {} failed: {err}", resolved[0]);
+    eprintln!("zerun exec: execve {} failed: {err}", argv[0]);
     1
 }
 

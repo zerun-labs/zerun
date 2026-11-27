@@ -1200,6 +1200,56 @@ import_digest=$("${zerun[@]}" import -m ci-m7 "$export_tar" ci-import:test)
 grep -Eq '^sha256:[0-9a-f]{64}$' <<<"$import_digest"
 import_output=$("${zerun[@]}" run --net none ci-import:test /bin/sh -c 'cat /run/m7-file')
 grep -Fxq overlay-data <<<"$import_output"
+
+# PATH lookup must skip a non-executable candidate and try the next directory.
+# Test direct and mini-init image launches as well as exec into a running image.
+path_fixture=$(mktemp -d)
+cleanup_dirs+=("$path_fixture")
+mkdir "$path_fixture/first" "$path_fixture/second"
+printf '#!/bin/sh\nprintf path-search-ok\n' >"$path_fixture/first/path-probe"
+printf '#!/bin/sh\nprintf path-search-ok\n' >"$path_fixture/second/path-probe"
+chmod 644 "$path_fixture/first/path-probe"
+chmod 755 "$path_fixture/second/path-probe"
+path_value=/path-fixture/first:/path-fixture/second
+for init_option in direct init; do
+  init_args=()
+  [[ $init_option != init ]] || init_args=(--init)
+  path_output=$("${zerun[@]}" run --net none "${init_args[@]}" \
+    -v "$path_fixture:/path-fixture:ro" -e "PATH=$path_value" ci-import:test path-probe)
+  test "$path_output" = path-search-ok
+  path_output=$("${zerun[@]}" run --net none "${init_args[@]}" \
+    -v "$path_fixture:/path-fixture:ro" -w /path-fixture/second \
+    -e PATH=:/missing ci-import:test path-probe)
+  test "$path_output" = path-search-ok
+  set +e
+  path_missing_output=$("${zerun[@]}" run --net none "${init_args[@]}" \
+    -e PATH=/missing ci-import:test sh -c true 2>&1)
+  path_missing_status=$?
+  set -e
+  if [[ $path_missing_status -ne 1 || $path_missing_output != *'No such file or directory'* ]]; then
+    printf 'unexpected PATH search result (status %s):\n%s\n' \
+      "$path_missing_status" "$path_missing_output" >&2
+    exit 1
+  fi
+done
+path_container=$("${zerun[@]}" run -d --net none \
+  -v "$path_fixture:/path-fixture:ro" -e "PATH=$path_value" ci-import:test /bin/sleep 30)
+cleanup_ids+=("$path_container")
+path_output=$("${zerun[@]}" exec "$path_container" path-probe)
+test "$path_output" = path-search-ok
+path_output=$("${zerun[@]}" exec -w /path-fixture/second -e PATH=:/missing "$path_container" path-probe)
+test "$path_output" = path-search-ok
+set +e
+path_missing_output=$("${zerun[@]}" exec -e PATH=/missing "$path_container" sh -c true 2>&1)
+path_missing_status=$?
+set -e
+if [[ $path_missing_status -ne 1 || $path_missing_output != *'No such file or directory'* ]]; then
+  printf 'unexpected exec PATH search result (status %s):\n%s\n' \
+    "$path_missing_status" "$path_missing_output" >&2
+  exit 1
+fi
+"${zerun[@]}" rm -f "$path_container" >/dev/null
+
 echo "rootful-m7-ok"
 
 # Attach must stream the reaper's live output and return the workload exit code.
