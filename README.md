@@ -327,7 +327,7 @@ Run options (current subset):
                      expose a character or block device (repeatable; default target is
                      HOST and default permissions are rwm). Rootful runs always use a
                      deny-by-default cgroup v2 device allowlist; --device extends it. Rootless
-                     runs support full rwm only
+                     runs support full rwm only and require open_tree/move_mount on the host
 --no-overlay        pivot directly into the rootfs (no writable upper layer)
 --tmpfs-upper       keep the overlay writable layer in tmpfs (not committable)
 --read-only         remount the container root read-only before exec

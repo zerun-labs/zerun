@@ -333,9 +333,8 @@ jobs:
             ZERUN_RUNTIME_ROOT="$runtime"
             "$binary")
 
-          # Explicit rootless devices bind the pre-opened host inode through
-          # /proc/self/fd; full rwm is the only request that can be represented
-          # without changing the host node's mode.
+          # Rootless devices use detached mounts captured before pivot; full rwm
+          # is the only request representable without changing the host node.
           if ! "${zerun[@]}" run --rootfs "$rootfs" --no-overlay --net none \
             --device /dev/null:/dev/zerun-null:rwm -- \
             /bin/sh -c 'test -c /dev/zerun-null &&
@@ -349,6 +348,19 @@ jobs:
             echo "rootless explicit device marker is missing" >&2
             exit 97
           fi
+          # Sharing the host PID namespace can make mounting a fresh procfs
+          # impossible in the user namespace. Devices must still work, including
+          # a target on /tmp, which is mounted after pivot.
+          if ! "${zerun[@]}" run --rootfs "$rootfs" --no-overlay --net none --pid host \
+            --device /dev/null:/dev/zerun-null:rwm \
+            --device /dev/zero:/tmp/zerun-zero:rwm -- \
+            /bin/sh -c 'test -c /dev/null && test -c /dev/zerun-null &&
+              test -c /tmp/zerun-zero && printf "rootless-device-hostpid-ok\n"' \
+            >"$base/rootless-device-hostpid.out" 2>"$base/rootless-device-hostpid.err"; then
+            cat "$base/rootless-device-hostpid.out" "$base/rootless-device-hostpid.err" >&2
+            exit 99
+          fi
+          grep -Fx rootless-device-hostpid-ok "$base/rootless-device-hostpid.out"
           set +e
           "${zerun[@]}" run --rootfs "$rootfs" --no-overlay --net none \
             --device /dev/null:r -- /bin/sh -c ':' \

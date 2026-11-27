@@ -14,7 +14,7 @@ use libc::{
 };
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -213,7 +213,7 @@ impl DevicePermissions {
 ///
 /// `source` is canonicalized to validate the actual device, while `target`
 /// and `raw` retain the operator-visible request. Rootful runs recreate the
-/// node with `mknod`; rootless runs bind an O_PATH handle opened before pivot.
+/// node with `mknod`; rootless runs attach a detached mount captured before pivot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceMount {
     pub source: PathBuf,
@@ -661,10 +661,10 @@ pub struct RootfsConfig<'a> {
     pub volumes: &'a [BindMount],
     /// Explicit `--device` requests, installed after the private `/dev` tmpfs.
     pub devices: &'a [DeviceMount],
-    /// O_PATH handles for rootless host devices opened before pivot_root.
-    pub device_sources: &'a [Option<File>],
-    /// O_PATH handles for explicit rootless `--device` sources.
-    pub requested_device_sources: &'a [File],
+    /// Detached mount clones for rootless host devices, captured before pivot_root.
+    pub device_sources: &'a [Option<OwnedFd>],
+    /// Detached mount clones for explicit rootless `--device` sources.
+    pub requested_device_sources: &'a [OwnedFd],
     /// Detached clone of the host `/dev/shm` mount for `--ipc host`.
     pub host_shm: Option<RawFd>,
     /// Mount a private `/dev/shm` tmpfs. False for `--ipc none`, which keeps a
@@ -1026,16 +1026,15 @@ fn require_or_warn(rootless: bool, r: ZResult<()>, what: &str) -> ZResult<()> {
 /// Open host device handles before pivot_root hides the initial `/dev`.
 ///
 /// Rootless containers cannot reliably create device nodes with `mknod`; the
-/// handles are later exposed through `/proc/self/fd/*` after the private `/dev`
-/// tmpfs is mounted. Missing or inaccessible devices are a degraded-host
-/// warning, not a rootless setup failure.
-pub fn open_rootless_device_sources(rootless: bool) -> Vec<Option<File>> {
+/// detached mounts are attached after the private `/dev` tmpfs is mounted.
+/// Missing or inaccessible devices are a degraded-host warning.
+pub fn open_rootless_device_sources(rootless: bool) -> Vec<Option<OwnedFd>> {
     if !rootless {
         return Vec::new();
     }
     DEVICE_NODES
         .iter()
-        .map(|(path, _, _)| match open_device_source(Path::new(path)) {
+        .map(|(path, _, _)| match clone_device_source(Path::new(path)) {
             Ok(source) => Some(source),
             Err(error) => {
                 eprintln!("zerun: warn: cannot open rootless host device {path}: {error}");
@@ -1047,19 +1046,19 @@ pub fn open_rootless_device_sources(rootless: bool) -> Vec<Option<File>> {
 
 /// Open explicit rootless `--device` sources before pivot_root. Rootless
 /// namespaces cannot recreate device nodes with `mknod`, so they bind the
-/// original host inode through `/proc/self/fd` after the private `/dev` tmpfs
+/// original host inode via a detached mount after the private `/dev` tmpfs
 /// exists. Rootful launches recreate nodes from their major/minor pair instead.
 pub fn open_requested_device_sources(
     rootless: bool,
     devices: &[DeviceMount],
-) -> ZResult<Vec<File>> {
+) -> ZResult<Vec<OwnedFd>> {
     if !rootless {
         return Ok(Vec::new());
     }
     devices
         .iter()
         .map(|device| {
-            open_device_source(&device.source).map_err(|error| {
+            clone_device_source(&device.source).map_err(|error| {
                 crate::zerr!("open --device source {}: {error}", device.source.display())
             })
         })
@@ -1075,18 +1074,17 @@ pub fn clone_host_shm_mount() -> ZResult<std::os::fd::OwnedFd> {
 
 /// Minimal /dev device nodes and conventional symlinks.
 /// rootful: mknod character devices; rootless (non-initial user ns): bind the
-/// pre-opened host whitelist devices through procfs fd magic links.
+/// pre-cloned host whitelist device mounts.
 fn populate_dev(
     rootless: bool,
-    device_sources: &[Option<File>],
+    device_sources: &[Option<OwnedFd>],
     devices: &[DeviceMount],
-    requested_device_sources: &[File],
+    requested_device_sources: &[OwnedFd],
 ) -> ZResult<()> {
     for (index, &(path, maj, min)) in DEVICE_NODES.iter().enumerate() {
         if rootless {
             // Create an empty file on tmpfs as the mount point, then bind the
-            // actual host device opened before pivot_root. Binding `path` to
-            // itself here would only expose the empty mount-point file.
+            // detached host device mount captured before pivot_root.
             if let Err(error) = std::fs::write(path, b"") {
                 eprintln!("zerun: warn: cannot create rootless device mount point {path}: {error}");
                 continue;
@@ -1094,10 +1092,9 @@ fn populate_dev(
             let Some(source) = device_sources.get(index).and_then(Option::as_ref) else {
                 continue;
             };
-            let source_path = format!("/proc/self/fd/{}", source.as_raw_fd());
             require_or_warn(
                 true,
-                syscalls::mount(Some(&source_path), path, None, MS_BIND, None),
+                syscalls::move_mount(source.as_raw_fd(), path),
                 &format!("bind rootless device {path}"),
             )?;
         } else {
@@ -1153,14 +1150,7 @@ fn populate_dev(
                     device.target.display()
                 )
             })?;
-            let source_path = format!("/proc/self/fd/{}", source.as_raw_fd());
-            syscalls::mount(
-                Some(&source_path),
-                target.to_string_lossy(),
-                None,
-                MS_BIND,
-                None,
-            )?;
+            syscalls::move_mount(source.as_raw_fd(), &target)?;
         } else {
             if existing.is_some() {
                 return Err(crate::zerr!(
@@ -1209,6 +1199,12 @@ fn device_node_mode(permissions: DevicePermissions) -> libc::mode_t {
         mode |= 0o222;
     }
     mode
+}
+
+fn clone_device_source(path: &Path) -> ZResult<OwnedFd> {
+    let source = open_device_source(path)?;
+    let fd_path = format!("/proc/self/fd/{}", source.as_raw_fd());
+    syscalls::open_tree_clone(fd_path)
 }
 
 fn open_device_source(path: &Path) -> std::io::Result<File> {
