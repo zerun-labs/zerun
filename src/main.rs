@@ -7387,16 +7387,11 @@ fn export_to_file(
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("export.tar");
-    let sequence = EXPORT_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let temporary = parent.join(format!(".{name}.tmp-{}-{sequence}", std::process::id()));
-    fsutil::remove_dir_all_quiet(&temporary);
+    let (temporary, mut file) = create_export_temp(parent, name, || {
+        EXPORT_TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    })?;
     let guard = fsutil::TempFileGuard::new(temporary.clone());
     use std::io::Write as _;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|e| crate::zerr!("create {}: {e}", temporary.display()))?;
     archive_tree(&mut file, root, mounts)?;
     file.flush()
         .map_err(|e| crate::zerr!("flush {}: {e}", temporary.display()))?;
@@ -7407,6 +7402,30 @@ fn export_to_file(
     let _ = guard.persist();
     fsutil::sync_directory(parent)?;
     Ok(())
+}
+
+/// Create a staging file without deleting entries left by other writers.
+fn create_export_temp(
+    parent: &Path,
+    name: &str,
+    mut next_sequence: impl FnMut() -> u64,
+) -> crate::error::ZResult<(PathBuf, std::fs::File)> {
+    for _ in 0..128 {
+        let sequence = next_sequence();
+        let path = parent.join(format!(".{name}.tmp-{}-{sequence}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(crate::zerr!("create {}: {error}", path.display())),
+        }
+    }
+    Err(crate::zerr!(
+        "cannot create export staging file: too many name collisions"
+    ))
 }
 
 /// Mount points below the container root, read from `/proc/<pid>/mountinfo`.
@@ -8487,6 +8506,44 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_staging_preserves_colliding_entries() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!(
+            "zerun-export-collision-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let candidate =
+            |sequence| dir.join(format!(".result.tar.tmp-{}-{sequence}", std::process::id()));
+        std::fs::write(candidate(0), b"keep file").unwrap();
+        std::fs::create_dir(candidate(1)).unwrap();
+        std::fs::write(candidate(1).join("child"), b"keep directory").unwrap();
+        symlink("missing", candidate(2)).unwrap();
+        let mut sequence = 0;
+        let (path, file) = create_export_temp(&dir, "result.tar", || {
+            let next = sequence;
+            sequence += 1;
+            next
+        })
+        .unwrap();
+        assert_eq!(path, candidate(3));
+        assert_eq!(std::fs::read(candidate(0)).unwrap(), b"keep file");
+        assert_eq!(
+            std::fs::read(candidate(1).join("child")).unwrap(),
+            b"keep directory"
+        );
+        assert_eq!(
+            std::fs::read_link(candidate(2)).unwrap(),
+            Path::new("missing")
+        );
+        drop(file);
+        assert!(create_export_temp(&dir, "result.tar", || 0).is_err());
+        assert_eq!(std::fs::read(candidate(0)).unwrap(), b"keep file");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
