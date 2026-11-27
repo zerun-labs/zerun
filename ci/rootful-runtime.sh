@@ -19,6 +19,7 @@ for path in "$binary" "$rootfs"; do
 done
 
 if (( EUID == 0 )); then
+  privileged=()
   zerun=(env
     ZERUN_DATA_ROOT="$data_root"
     ZERUN_RUNTIME_ROOT="$runtime_root"
@@ -28,6 +29,7 @@ else
     echo "rootful runtime tests require sudo when not already running as root" >&2
     exit 1
   }
+  privileged=(sudo)
   zerun=(sudo env
     ZERUN_DATA_ROOT="$data_root"
     ZERUN_RUNTIME_ROOT="$runtime_root"
@@ -41,6 +43,9 @@ cleanup_ids=()
 cleanup_pids=()
 cleanup_paths=()
 cleanup_dirs=()
+shared_net_target_state=
+shared_net_target_state_backup=
+shared_net_target_state_backup_ready=false
 remove_cleanup_path() {
   if (( EUID == 0 )); then
     rm -f -- "$1"
@@ -91,6 +96,15 @@ signal_rootful_process() {
   fi
 }
 cleanup() {
+  if [[ -n $shared_net_target_state_backup ]] && $shared_net_target_state_backup_ready; then
+    if ! "${privileged[@]}" cp -p -- "$shared_net_target_state_backup" "$shared_net_target_state"; then
+      echo "failed to restore container state; backup retained at $shared_net_target_state_backup" >&2
+    else
+      remove_cleanup_path "$shared_net_target_state_backup" || true
+    fi
+  elif [[ -n $shared_net_target_state_backup ]]; then
+    remove_cleanup_path "$shared_net_target_state_backup" || true
+  fi
   for pid in "${cleanup_pids[@]}"; do
     runtime_pid=$(find_zerun_process "$pid" 2>/dev/null || true)
     if [[ -n $runtime_pid ]]; then
@@ -1310,6 +1324,36 @@ shared_net_joined_ip=$("${zerun[@]}" exec "$shared_net_id" \
   /bin/busybox grep -o '10[.]88[.]0[.][0-9][0-9]*' /etc/hosts | /bin/busybox head -n 1)
 test "$shared_net_joined_ip" = "$shared_net_target_ip"
 "${zerun[@]}" stop --time 2 "$shared_net_id" >/dev/null
+
+# A malformed target record must remain distinguishable from a target that was
+# removed. Restarting the joiner must fail closed with the parsing error rather
+# than silently treating the target as a normal absence.
+shared_net_target_state="$runtime_root/containers/$shared_net_target/state.json"
+shared_net_target_state_backup=$(mktemp "${TMPDIR:-/tmp}/zerun-shared-net-target-state.XXXXXXXX")
+if ! "${privileged[@]}" cp -p -- "$shared_net_target_state" "$shared_net_target_state_backup"; then
+  remove_cleanup_path "$shared_net_target_state_backup"
+  shared_net_target_state_backup=
+  exit 1
+fi
+shared_net_target_state_backup_ready=true
+printf '{not valid json\n' | "${privileged[@]}" tee "$shared_net_target_state" >/dev/null
+if corrupt_shared_target_output=$("${zerun[@]}" start "$shared_net_id" 2>&1); then
+  corrupt_shared_target_status=0
+else
+  corrupt_shared_target_status=$?
+fi
+"${privileged[@]}" cp -p -- "$shared_net_target_state_backup" "$shared_net_target_state"
+remove_cleanup_path "$shared_net_target_state_backup"
+shared_net_target_state_backup=
+shared_net_target_state_backup_ready=false
+if (( corrupt_shared_target_status == 0 )); then
+  echo "shared-network joiner started with a corrupted target state" >&2
+  exit 1
+fi
+grep -F "parse container state" <<<"$corrupt_shared_target_output" >/dev/null
+grep -F "$shared_net_target" <<<"$corrupt_shared_target_output" >/dev/null
+echo "rootful-shared-net-corrupt-target-ok"
+
 "${zerun[@]}" rm "$shared_net_id" >/dev/null
 "${zerun[@]}" stop --time 2 "$shared_net_target" >/dev/null
 "${zerun[@]}" rm "$shared_net_target" >/dev/null
