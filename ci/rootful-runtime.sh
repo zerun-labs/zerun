@@ -164,6 +164,16 @@ if corrupt_prune_output=$("${zerun[@]}" prune -f --images 2>&1); then
   exit 1
 fi
 grep -F "parse container state" <<<"$corrupt_prune_output" >/dev/null
+remove_cleanup_path "$corrupt_state_dir/state.json"
+mkfifo "$corrupt_state_dir/state.json"
+set +e
+fifo_output=$(timeout 10 "${zerun[@]}" prune -f --images 2>&1)
+fifo_status=$?
+set -e
+if [[ $fifo_status -eq 0 || $fifo_status -eq 124 || $fifo_output != *'not a regular file'* ]]; then
+  printf 'invalid FIFO state result (status %s):\n%s\n' "$fifo_status" "$fifo_output" >&2
+  exit 1
+fi
 remove_cleanup_dir "$corrupt_state_dir"
 echo "rootful-state-inventory-fail-closed-ok"
 

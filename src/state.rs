@@ -18,7 +18,9 @@ use crate::syscalls;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::net::Ipv4Addr;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -674,8 +676,14 @@ impl ContainerState {
             return Ok(None);
         }
         let p = Self::path(store, id);
-        let text = match std::fs::read_to_string(&p) {
-            Ok(text) => text,
+        // Open without following links or blocking on a FIFO. Only an absent
+        // file represents a reservation; any other file type is corruption.
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(&p)
+        {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
                 return Err(crate::zerr!(
@@ -684,6 +692,18 @@ impl ContainerState {
                 ))
             }
         };
+        let metadata = file
+            .metadata()
+            .map_err(|error| crate::zerr!("read container state {}: {error}", p.display()))?;
+        if !metadata.is_file() {
+            return Err(crate::zerr!(
+                "read container state {}: not a regular file",
+                p.display()
+            ));
+        }
+        let mut text = String::new();
+        file.read_to_string(&mut text)
+            .map_err(|error| crate::zerr!("read container state {}: {error}", p.display()))?;
         let mut state: ContainerState = serde_json::from_str(&text)
             .map_err(|error| crate::zerr!("parse container state {}: {error}", p.display()))?;
         // The directory name is the record's identity. Reject a JSON payload
@@ -1493,6 +1513,33 @@ mod tests {
         assert!(resolve(&store, id).unwrap_err().contains(id));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn state_inventory_rejects_special_files_and_symlinks() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-state-inventory-special-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let store = Store::at(root.join("data"), root.join("run"));
+        store.ensure_dirs().unwrap();
+        let id = "abc123";
+        std::fs::create_dir_all(ContainerState::dir(&store, id)).unwrap();
+        let path = ContainerState::path(&store, id);
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        let error = list(&store).unwrap_err().to_string();
+        assert!(error.contains("not a regular file"), "{error}");
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("missing", &path).unwrap();
+        let error = list(&store).unwrap_err().to_string();
+        assert!(error.contains("read container state"), "{error}");
+        assert!(resolve(&store, id).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
