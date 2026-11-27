@@ -517,12 +517,21 @@ impl Drop for TcpProxySlot {
 }
 
 fn try_acquire_tcp_proxy_slot(connections: &Arc<AtomicUsize>) -> Option<TcpProxySlot> {
-    connections
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-            (active < TCP_PROXY_CONNECTION_LIMIT).then_some(active + 1)
-        })
-        .ok()
-        .map(|_| TcpProxySlot(Arc::clone(connections)))
+    let mut active = connections.load(Ordering::Acquire);
+    loop {
+        if active >= TCP_PROXY_CONNECTION_LIMIT {
+            return None;
+        }
+        match connections.compare_exchange_weak(
+            active,
+            active + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(TcpProxySlot(Arc::clone(connections))),
+            Err(current) => active = current,
+        }
+    }
 }
 
 /// Accept connections until the proxy is dropped, then forward each one.
@@ -1297,6 +1306,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tcp_proxy_slots_remain_bounded_under_contention() {
+        use std::sync::{mpsc, Barrier};
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let contenders = TCP_PROXY_CONNECTION_LIMIT + 16;
+        let start = Arc::new(Barrier::new(contenders + 1));
+        let release = Arc::new(Barrier::new(contenders + 1));
+        let (sender, receiver) = mpsc::channel();
+        let workers: Vec<_> = (0..contenders)
+            .map(|_| {
+                let active = Arc::clone(&active);
+                let start = Arc::clone(&start);
+                let release = Arc::clone(&release);
+                let sender = sender.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    let slot = try_acquire_tcp_proxy_slot(&active);
+                    sender.send(slot.is_some()).unwrap();
+                    release.wait();
+                    drop(slot);
+                })
+            })
+            .collect();
+        drop(sender);
+        start.wait();
+        let successes = receiver
+            .iter()
+            .take(contenders)
+            .filter(|success| *success)
+            .count();
+        assert_eq!(successes, TCP_PROXY_CONNECTION_LIMIT);
+        assert_eq!(active.load(Ordering::Acquire), TCP_PROXY_CONNECTION_LIMIT);
+        release.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(active.load(Ordering::Acquire), 0);
     }
 
     #[test]
