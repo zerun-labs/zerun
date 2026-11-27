@@ -637,7 +637,8 @@ Detached state and console logs are stored owner-only because state contains the
 command line and environment. When the workload exits, a final control frame closes the stream
 and the attach command returns the container's exit code without mixing runtime metadata into
 output. If the stream closes without a final frame, `attach` uses a persisted exit code only
-when it belongs to the same completed attempt; otherwise it reports an error. Up to 32 clients
+when it belongs to the same completed attempt; otherwise it reports an error. A failure to
+write or flush attached output also returns an error. Up to 32 clients
 may attach to one container; disconnected clients are pruned as new
 connections arrive so the reaper's descriptor and memory use stay bounded. When a container
 record includes the reaper identity, `attach` verifies the socket peer against that identity

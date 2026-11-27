@@ -1455,6 +1455,22 @@ grep -Fxq attach-restart-second <<<"$attach_restart_output"
 "${zerun[@]}" rm "$attach_restart_id" >/dev/null
 remove_cleanup_path "$rootfs/$attach_restart_marker"
 
+# A partial line can remain buffered until flush; a failed flush must not be
+# mistaken for the workload's successful exit.
+attach_full_id=$("${zerun[@]}" run -d --rootfs "$rootfs" --no-overlay --net none \
+  --pids 16 --init -- /bin/sh -c 'sleep 1; printf attach-partial')
+cleanup_ids+=("$attach_full_id")
+set +e
+attach_full_error=$(timeout 10 "${zerun[@]}" attach "$attach_full_id" 2>&1 >/dev/full)
+attach_full_status=$?
+set -e
+if (( attach_full_status != 1 )) || [[ $attach_full_error != *'zerun attach: write workload output:'* ]]; then
+  echo "attach did not report its output failure" >&2
+  exit 1
+fi
+"${zerun[@]}" wait "$attach_full_id" >/dev/null
+"${zerun[@]}" rm "$attach_full_id" >/dev/null
+
 # The attach control frame must preserve non-zero exit codes even when --rm
 # removes the state record before the attaching CLI performs its fallback read.
 attach_rm_id=$("${zerun[@]}" run -d --rm --rootfs "$rootfs" --no-overlay --net none \

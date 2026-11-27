@@ -7784,11 +7784,10 @@ fn cmd_attach(args: &[String]) -> i32 {
     loop {
         match lifecycle::read_attach_frame(&mut stream) {
             Ok(lifecycle::AttachFrame::Data(chunk)) => {
-                if out.write_all(&chunk).is_err() {
-                    eprintln!("zerun attach: write workload output failed");
+                if let Err(error) = out.write_all(&chunk).and_then(|()| out.flush()) {
+                    eprintln!("zerun attach: write workload output: {error}");
                     return 1;
                 }
-                let _ = out.flush();
             }
             Ok(lifecycle::AttachFrame::Exit(code)) => {
                 final_code = Some(code);
