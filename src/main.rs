@@ -5961,9 +5961,17 @@ fn follow_log(
         if filter.is_some_and(LogTimeFilter::until_reached) {
             break;
         }
-        if !container_observable(store, st) {
-            drain_rotated_logs(path, max_files, &mut seen, timestamps, filter)?;
-            break;
+        if !container_observable(store, st)? {
+            let lock = state::ContainerOperationLock::try_acquire_if_available(store, &st.id)
+                .map_err(std::io::Error::other)?;
+            if let Some(_lock) = lock {
+                // The reaper holds this lock through final log flushing. A
+                // concurrent start may have won it, so inspect state again.
+                if !container_observable(store, st)? {
+                    drain_rotated_logs(path, max_files, &mut seen, timestamps, filter)?;
+                    break;
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(200));
         drain_rotated_logs(path, max_files, &mut seen, timestamps, filter)?;
@@ -6114,15 +6122,13 @@ fn drain_rotated_logs(
     Ok(())
 }
 
-fn container_observable(store: &Store, st: &ContainerState) -> bool {
-    match state::ContainerState::load(store, &st.id) {
-        Some(s) => {
-            (s.status == state::Status::Running && s.pid_alive())
-                // A live reaper can be between a workload exit and its
-                // terminal-state write, or sleeping before the next attempt.
-                || (s.reaper_alive() && (s.restart_pending || s.restart_policy.is_enabled()))
-        }
-        None => false, // --rm removed the record; stop following
+fn container_observable(store: &Store, st: &ContainerState) -> std::io::Result<bool> {
+    match state::ContainerState::load_checked(store, &st.id).map_err(std::io::Error::other)? {
+        Some(s) => Ok((s.status == state::Status::Running && s.pid_alive())
+            // A live reaper can still flush output after the workload exits,
+            // or wait between automatic attempts.
+            || (s.reaper_alive() && (s.status == state::Status::Running || s.restart_pending))),
+        None => Ok(false), // --rm removed the record; stop following
     }
 }
 
@@ -8975,6 +8981,73 @@ mod tests {
         );
         waiter.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_follow_waits_for_terminal_cleanup_and_rechecks_state() {
+        use std::sync::mpsc;
+
+        let root = std::env::temp_dir().join(format!("zerun-follow-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root.join("data"), root.join("run"));
+        store.ensure_dirs().unwrap();
+        let mut container: ContainerState = serde_json::from_value(serde_json::json!({
+            "version": 1, "id": "0123456789ab", "image": "rootfs:test",
+            "status": "exited", "exit_code": 0, "created": "2026-01-01T00:00:00Z",
+            "rootless": false, "net": "none", "ports": [], "cmd": [], "env": [],
+            "log": "", "rootfs": ""
+        }))
+        .unwrap();
+        let dir = ContainerState::dir(&store, &container.id);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("console.log");
+        std::fs::write(&path, b"").unwrap();
+        container.save(&store).unwrap();
+        let lock = state::ContainerOperationLock::try_acquire(&store, &container.id).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_store = store.clone();
+        let worker_container = container.clone();
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx
+                .send(follow_log(
+                    &worker_store,
+                    &worker_container,
+                    &worker_path,
+                    1,
+                    LogCursor::new(),
+                    false,
+                    None,
+                ))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(350)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        container.status = state::Status::Running;
+        container.pid = Some(std::process::id() as i32);
+        container.save(&store).unwrap();
+        drop(lock);
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(350)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        let lock = state::ContainerOperationLock::try_acquire(&store, &container.id).unwrap();
+        container.status = state::Status::Exited;
+        container.save(&store).unwrap();
+        drop(lock);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        std::fs::write(ContainerState::path(&store, &container.id), b"invalid").unwrap();
+        assert!(container_observable(&store, &container).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

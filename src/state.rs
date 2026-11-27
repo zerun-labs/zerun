@@ -251,6 +251,18 @@ impl ContainerOperationLock {
         Ok(Self { file })
     }
 
+    /// Try the lifecycle lock, distinguishing contention from filesystem errors.
+    pub fn try_acquire_if_available(store: &Store, id: &str) -> Result<Option<Self>, String> {
+        let file = Self::open(store, id)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(error) => Err(format!(
+                "lock container {id} for a lifecycle operation: {error}"
+            )),
+        }
+    }
+
     /// Wait for a lifecycle operation to finish without imposing a timeout.
     pub fn acquire_blocking(store: &Store, id: &str) -> Result<Self, String> {
         let file = Self::open(store, id)?;
