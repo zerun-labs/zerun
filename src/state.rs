@@ -997,12 +997,19 @@ pub fn list(store: &Store) -> ZResult<Vec<ContainerState>> {
                 entry.path().display()
             )
         })?;
-        // Symlinks and regular files cannot be authoritative container
-        // records. They may be operator debris and are never followed.
+        let file_name = entry.file_name();
+        // A container ID occupied by anything other than a directory could
+        // conceal a retained record. Unrelated non-directory debris is safe
+        // to ignore, but ID-shaped entries must fail the inventory closed.
         if !file_type.is_dir() {
+            if file_name.to_str().is_some_and(valid_id) {
+                return Err(crate::zerr!(
+                    "container state entry {} is not a directory",
+                    entry.path().display()
+                ));
+            }
             continue;
         }
-        let file_name = entry.file_name();
         let id = file_name.to_str().ok_or_else(|| {
             crate::zerr!(
                 "container state directory has a non-UTF-8 name: {}",
@@ -1539,6 +1546,35 @@ mod tests {
         let error = list(&store).unwrap_err().to_string();
         assert!(error.contains("read container state"), "{error}");
         assert!(resolve(&store, id).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn state_inventory_rejects_non_directory_container_ids() {
+        let root = std::env::temp_dir().join(format!(
+            "zerun-state-inventory-entry-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let store = Store::at(root.join("data"), root.join("run"));
+        store.ensure_dirs().unwrap();
+        let path = ContainerState::dir(&store, "abc123");
+        let debris = store.run_root().join("containers").join("unrelated.txt");
+        std::fs::write(&debris, b"debris").unwrap();
+        assert!(list(&store).unwrap().is_empty());
+        std::fs::write(&path, b"not a directory").unwrap();
+        let error = list(&store).unwrap_err().to_string();
+        assert!(
+            error.contains("not a directory") && error.contains("abc123"),
+            "{error}"
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("missing", &path).unwrap();
+        assert!(list(&store)
+            .unwrap_err()
+            .to_string()
+            .contains("not a directory"));
+        assert!(resolve(&store, "abc123").is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 

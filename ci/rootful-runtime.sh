@@ -175,6 +175,16 @@ if [[ $fifo_status -eq 0 || $fifo_status -eq 124 || $fifo_output != *'not a regu
   exit 1
 fi
 remove_cleanup_dir "$corrupt_state_dir"
+ln -s missing-container "$corrupt_state_dir"
+set +e
+entry_output=$("${zerun[@]}" prune -f --images 2>&1)
+entry_status=$?
+set -e
+if [[ $entry_status -eq 0 || $entry_output != *'not a directory'* ]]; then
+  printf 'invalid container directory result (status %s):\n%s\n' "$entry_status" "$entry_output" >&2
+  exit 1
+fi
+remove_cleanup_path "$corrupt_state_dir"
 echo "rootful-state-inventory-fail-closed-ok"
 
 # Pick a high, currently unused TCP port instead of assuming a shared runner
